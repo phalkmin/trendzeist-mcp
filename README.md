@@ -1,10 +1,10 @@
 # trendzeist-mcp
 
-**Free, local Google Trends MCP server built for content ideation.** One call returns
-ranked breakout / rising / evergreen blog topics; the rest of the toolset covers interest
-over time, related queries, regions, and real-time trends.
+**Turn Google Trends into your next 10 blog posts — in one call.**
 
-No API key. No account. No browser. Runs on your machine over stdio.
+trendzeist-mcp gives your AI assistant ranked **breakout / rising / evergreen** topics,
+interest curves, related searches, regional demand and real-time trends. Free, local,
+private. No API key, no account, no browser.
 
 ```
 You:   Give me blog post ideas about home espresso for US readers.
@@ -37,19 +37,19 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 
 ## Tools
 
-| Tool | Purpose |
+| Tool | What you get |
 |---|---|
-| `discover_topics` | One-shot ideation: rising/top related queries for 1-5 seeds, deduped and ranked breakout > rising > evergreen |
-| `interest_over_time` | 0-100 interest series + summary (mean, peak, direction) |
-| `compare_keywords` | Head-to-head share and leader for 2-5 keywords |
-| `related_queries` | Top & rising related searches (with breakout flag) |
+| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped |
+| `interest_over_time` | 0-100 interest curve with mean, peak and direction |
+| `compare_keywords` | Head-to-head share and winner for 2-5 keywords |
+| `related_queries` | Top & rising related searches with breakout flags |
 | `related_topics` | Top & rising Knowledge-Graph topics (best-effort) |
-| `interest_by_region` | Geographic distribution (COUNTRY / REGION / CITY / DMA) |
-| `suggest_keywords` | Entity disambiguation (title, type, mid) |
-| `trending_now` | Real-time trending searches via RSS with news headlines |
-| `list_categories` | Search Google Trends category ids |
+| `interest_by_region` | Where demand lives: COUNTRY / REGION / CITY / DMA |
+| `suggest_keywords` | Disambiguate a term into Google entities (title, type, mid) |
+| `trending_now` | What's trending right now, with news headlines |
+| `list_categories` | Find Google Trends category ids to narrow any query |
 
-Prompt: `blog_ideas_from_trends(topic, audience, geo)` — a guided workflow using the tools above.
+Prompt: `blog_ideas_from_trends(topic, audience, geo)` — a guided ideation workflow.
 
 ## Why this one?
 
@@ -60,7 +60,8 @@ Prompt: `blog_ideas_from_trends(topic, audience, geo)` — a guided workflow usi
 | Related queries + breakout detection | ✅ | often missing in hosted/paid servers |
 | Cost / auth | free, none | API key, monthly quota |
 | Browser required | no | Chrome for some Python libraries |
-| Cache survives client restarts | ✅ disk cache | usually in-memory or none |
+| Cache survives client restarts | ✅ safe JSON disk cache | usually in-memory or none |
+| Rate-limit friendly | ✅ throttled per HTTP request | ❌ bursts, frequent 429s |
 
 ## Run from source
 
@@ -82,18 +83,19 @@ Point a client at the clone with
 |---|---|---|
 | `TRENDZEIST_HL` | `en-US` | UI language for Google Trends |
 | `TRENDZEIST_TZ` | `360` | Timezone offset in minutes |
-| `TRENDZEIST_MIN_INTERVAL` | `2.0` | Minimum seconds between Google requests |
+| `TRENDZEIST_MIN_INTERVAL` | `2.0` | Minimum seconds between *every* HTTP request to Google (cookie, token, data, RSS) |
 | `TRENDZEIST_RETRIES` | `3` | Retry attempts on transient errors |
 | `TRENDZEIST_BACKOFF` | `1.5` | Exponential backoff factor |
-| `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs for rotation |
-| `TRENDZEIST_CACHE_DIR` | OS user cache dir | Persistent cache location; `off` to disable |
+| `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs (rotated for explore calls; first one used for RSS) |
+| `TRENDZEIST_CACHE_DIR` | OS user cache dir | Persistent JSON cache location (`0700`); `off` to disable |
 | `TRENDZEIST_LOG_LEVEL` | `WARNING` | Python logging level (stderr) |
 
 ## Notes & limitations
 
-- Google rate-limits aggressively (HTTP 429). Requests are serialised, throttled and cached
-  (15 min for explore data, 5 min for RSS, on disk so client restarts don't re-fetch).
-  Errors come back as tool errors with guidance.
+- Google rate-limits aggressively (HTTP 429). Every HTTP request is serialised and
+  throttled; results are cached (15 min explore, 5 min RSS, 24 h categories) as plain JSON
+  on disk so client restarts don't re-fetch. Memory cache is bounded and expired files are
+  swept automatically. Errors come back as tool errors with guidance.
 - Values are Google's relative 0–100 index, not absolute search volume.
 - `related_topics` frequently returns nothing from Google; `related_queries` is reliable.
 - Google's legacy daily `trending_searches` endpoint is gone (404); `trending_now` uses the RSS feed.

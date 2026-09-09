@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.phalkmin/trendzeist-mcp",
   "title": "Trendzeist – Google Trends for content ideation",
-  "description": "Free, local Google Trends MCP: ranked breakout/rising/evergreen topics, interest over time, related queries, regions, real-time trends. No API key or browser.",
-  "version": "0.1.0",
+  "description": "Free Google Trends MCP: ranked breakout/rising/evergreen topics for content ideas. No API key.",
+  "version": "0.2.0",
   "websiteUrl": "https://github.com/phalkmin/trendzeist-mcp",
   "repository": {
     "url": "https://github.com/phalkmin/trendzeist-mcp",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "trendzeist-mcp",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [

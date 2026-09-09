@@ -7,9 +7,11 @@ model receives an actionable error message instead of an opaque HTTP failure.
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Sequence
 
 MAX_KEYWORDS = 5
+_TRENDS_EPOCH = date(2004, 1, 1)  # Google Trends has no data before 2004
 MAX_KEYWORD_LENGTH = 100
 
 VALID_GPROPS: frozenset[str] = frozenset({"", "images", "news", "youtube", "froogle"})
@@ -75,7 +77,21 @@ def validate_timeframe(timeframe: str) -> str:
     if not isinstance(timeframe, str):
         raise ValidationError("timeframe must be a string")
     tf = timeframe.strip()
-    if tf in _RELATIVE_TIMEFRAMES or _DATE_RANGE_RE.match(tf):
+    if tf in _RELATIVE_TIMEFRAMES:
+        return tf
+    if _DATE_RANGE_RE.match(tf):
+        start_raw, end_raw = tf.split(" ")
+        try:
+            start = date.fromisoformat(start_raw)
+            end = date.fromisoformat(end_raw)
+        except ValueError as exc:
+            raise ValidationError(f"invalid calendar date in timeframe: {exc}") from exc
+        if start < _TRENDS_EPOCH:
+            raise ValidationError(f"timeframe start must be on or after {_TRENDS_EPOCH}")
+        if end < start:
+            raise ValidationError("timeframe end date must not be before the start date")
+        if end > date.today():
+            raise ValidationError("timeframe end date must not be in the future")
         return tf
     raise ValidationError(
         "invalid timeframe. Use one of "

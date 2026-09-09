@@ -20,9 +20,19 @@ def test_validate_timeframe_ok(tf):
     assert v.validate_timeframe(tf) == tf
 
 
-def test_validate_timeframe_bad():
+@pytest.mark.parametrize(
+    "tf",
+    [
+        "last week",
+        "2026-02-31 2026-03-01",  # impossible date
+        "2026-09-09 2020-01-01",  # reversed
+        "2003-01-01 2003-06-30",  # before Google Trends data exists
+        "2020-01-01 2999-01-01",  # future
+    ],
+)
+def test_validate_timeframe_bad(tf):
     with pytest.raises(v.ValidationError):
-        v.validate_timeframe("last week")
+        v.validate_timeframe(tf)
 
 
 def test_validate_geo():
@@ -74,6 +84,20 @@ def test_interest_over_time_falling_and_empty():
     assert fmt.interest_over_time(_iot_frame(rising=False), ["kw"])["summary"]["kw"]["direction"] == "falling"
     out = fmt.interest_over_time(pd.DataFrame(), ["kw"])
     assert out["points"] == [] and out["summary"]["kw"]["available"] is False
+    # Same schema as the non-empty case so callers never KeyError.
+    assert out["scale"] and out["original_points"] == 0 and out["downsampled"] is False
+
+
+def test_interest_over_time_keeps_intraday_timestamps():
+    idx = pd.date_range("2026-09-09 12:00", periods=4, freq="15min")
+    out = fmt.interest_over_time(pd.DataFrame({"kw": [10, 20, 30, 40]}, index=idx), ["kw"])
+    assert [p["date"] for p in out["points"]] == [
+        "2026-09-09T12:00",
+        "2026-09-09T12:15",
+        "2026-09-09T12:30",
+        "2026-09-09T12:45",
+    ]
+    assert out["summary"]["kw"]["peak_date"] == "2026-09-09T12:45"
 
 
 def test_related_list_and_breakouts():

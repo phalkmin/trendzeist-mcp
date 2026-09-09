@@ -79,6 +79,17 @@ def test_compare_keywords_ranks():
     assert out["ranking"][0]["share_pct"] + out["ranking"][1]["share_pct"] == pytest.approx(100, abs=0.2)
 
 
+def test_compare_keywords_handles_empty_data():
+    class EmptyClient(FakeClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            return pd.DataFrame()
+
+    out = tools.compare_keywords(EmptyClient(), ["a", "b"])
+    assert out["leader"] is None and out["ranking"] == []
+    assert out["unavailable"] == ["a", "b"] and "note" in out
+    assert out["scale"] and out["points"] == []
+
+
 def test_related_topics_reports_unavailable():
     out = tools.related_topics(FakeClient(), "x")
     assert out["available"] is False and "reason" in out
@@ -104,6 +115,22 @@ def test_discover_topics_ranks_and_dedupes():
     assert shared["popularity"] == 40  # merged from 'top'
     assert out["counts"]["breakout"] == 2 and out["errors"] == []
     assert client.calls[0] == ("iot", ("espresso", "latte"))
+
+
+def test_discover_topics_ranking_is_seed_order_independent():
+    class GrowthClient(FakeClient):
+        growth = {"a": 100, "b": 4000}
+
+        def related_queries(self, kw, tf, geo, cat, gprop):
+            return {
+                "top": None,
+                "rising": pd.DataFrame({"query": ["shared topic"], "value": [self.growth[kw]]}),
+            }
+
+    forward = discover_topics(GrowthClient(), ["a", "b"])["topics"][0]
+    backward = discover_topics(GrowthClient(), ["b", "a"])["topics"][0]
+    assert forward["growth_pct"] == backward["growth_pct"] == 4000
+    assert sorted(forward["source_seeds"]) == ["a", "b"]
 
 
 def test_discover_topics_partial_failure_stops_on_rate_limit():

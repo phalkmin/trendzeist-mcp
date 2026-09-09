@@ -151,11 +151,15 @@ def _merge(candidates: dict[str, dict[str, Any]], cand: dict[str, Any]) -> None:
     for s in cand["source_seeds"]:
         if s not in existing["source_seeds"]:
             existing["source_seeds"].append(s)
-    if _SIGNAL_ORDER[cand["signal"]] < _SIGNAL_ORDER[existing["signal"]]:
-        existing.update(
-            signal=cand["signal"], growth_pct=cand["growth_pct"], momentum=cand["momentum"]
-        )
-    if cand["popularity"] is not None and existing.get("popularity") is None:
-        existing["popularity"] = cand["popularity"]
+    new_rank, old_rank = _SIGNAL_ORDER[cand["signal"]], _SIGNAL_ORDER[existing["signal"]]
+    stronger_signal = new_rank < old_rank
+    same_signal_stronger = new_rank == old_rank and cand["momentum"] > existing["momentum"]
+    if stronger_signal or same_signal_stronger:
+        # Result must not depend on seed order: always keep the strongest evidence.
+        existing.update(signal=cand["signal"], momentum=cand["momentum"])
+        if cand["growth_pct"] is not None:
+            existing["growth_pct"] = cand["growth_pct"]
+    if cand["popularity"] is not None:
+        existing["popularity"] = max(cand["popularity"], existing.get("popularity") or 0)
     if cand["growth_pct"] is not None and existing.get("growth_pct") is None:
         existing["growth_pct"] = cand["growth_pct"]

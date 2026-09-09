@@ -62,22 +62,26 @@ def compare_keywords(
     means = {kw: s.get("mean", 0) or 0 for kw, s in summary.items() if s.get("available")}
     total = sum(means.values()) or 1.0
     ranking = sorted(means.items(), key=lambda kv: kv[1], reverse=True)
-    return {
+    out: dict[str, Any] = {
         "query": data["query"],
         "ranking": [
             {
                 "keyword": kw,
                 "mean_interest": mean,
                 "share_pct": round(100 * mean / total, 1),
-                "direction": summary[kw]["direction"],
-                "latest": summary[kw]["latest"],
+                "direction": summary[kw].get("direction"),
+                "latest": summary[kw].get("latest"),
             }
             for kw, mean in ranking
         ],
         "leader": ranking[0][0] if ranking else None,
+        "unavailable": [kw for kw, s in summary.items() if not s.get("available")],
         "points": data["points"],
-        "scale": data["scale"],
+        "scale": data.get("scale"),
     }
+    if "note" in data:
+        out["note"] = data["note"]
+    return out
 
 
 def related_queries(

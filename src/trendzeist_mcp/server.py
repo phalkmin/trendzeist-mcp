@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from functools import wraps
 from typing import Any, Callable
 
@@ -34,12 +35,16 @@ server = MCPServer(
 )
 
 _client: TrendsClient | None = None
+_client_lock = threading.Lock()
 
 
 def get_client() -> TrendsClient:
+    """Return the process-wide client; MCP runs sync tools on worker threads."""
     global _client
     if _client is None:
-        _client = TrendsClient()
+        with _client_lock:
+            if _client is None:
+                _client = TrendsClient()
     return _client
 
 

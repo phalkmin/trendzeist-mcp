@@ -1,0 +1,11 @@
+# Keeps GitHub Actions majors current so Node-runtime deprecation warnings
+# don't turn into hard failures on release day.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]

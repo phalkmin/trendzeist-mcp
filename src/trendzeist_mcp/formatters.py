@@ -13,6 +13,14 @@ import pandas as pd
 
 MAX_SERIES_POINTS = 60
 BREAKOUT_THRESHOLD = 5000  # Google reports "Breakout" as +5000%
+SCALE_NOTE = "0-100 relative to the peak across all keywords in this query"
+
+
+def _fmt_timestamp(ts: pd.Timestamp) -> str:
+    """Date-only for daily/weekly series, ISO minute precision for intraday."""
+    if ts.hour or ts.minute or ts.second:
+        return ts.strftime("%Y-%m-%dT%H:%M")
+    return ts.strftime("%Y-%m-%d")
 
 
 def _to_native(value: Any) -> Any:
@@ -20,7 +28,7 @@ def _to_native(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, pd.Timestamp):
-        return value.strftime("%Y-%m-%d")
+        return _fmt_timestamp(value)
     if hasattr(value, "item"):
         value = value.item()
     if isinstance(value, float):
@@ -80,6 +88,9 @@ def interest_over_time(df: pd.DataFrame | None, keywords: Iterable[str]) -> dict
         return {
             "points": [],
             "summary": {kw: {"available": False} for kw in kws},
+            "original_points": 0,
+            "downsampled": False,
+            "scale": SCALE_NOTE,
             "note": "Google returned no data for this query (too little search volume?).",
         }
 
@@ -124,7 +135,7 @@ def interest_over_time(df: pd.DataFrame | None, keywords: Iterable[str]) -> dict
         "summary": summary,
         "original_points": int(len(complete)),
         "downsampled": len(sampled) != len(complete),
-        "scale": "0-100 relative to the peak across all keywords in this query",
+        "scale": SCALE_NOTE,
     }
 
 
