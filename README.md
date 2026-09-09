@@ -1,5 +1,7 @@
 # trendzeist-mcp
 
+<!-- mcp-name: io.github.phalkmin/trendzeist-mcp -->
+
 **Turn Google Trends into your next 10 blog posts — in one call.**
 
 trendzeist-mcp gives your AI assistant ranked **breakout / rising / evergreen** topics,

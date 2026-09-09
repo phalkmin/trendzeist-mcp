@@ -3,7 +3,7 @@
   "name": "io.github.phalkmin/trendzeist-mcp",
   "title": "Trendzeist – Google Trends for content ideation",
   "description": "Free Google Trends MCP: ranked breakout/rising/evergreen topics for content ideas. No API key.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "websiteUrl": "https://github.com/phalkmin/trendzeist-mcp",
   "repository": {
     "url": "https://github.com/phalkmin/trendzeist-mcp",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "trendzeist-mcp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [

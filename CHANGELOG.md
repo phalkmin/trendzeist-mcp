@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-09
+
+### Added
+- MCP Registry ownership marker (`mcp-name: io.github.phalkmin/trendzeist-mcp`) in the
+  README so the registry can verify the PyPI package. No functional changes.
+
 ## [0.2.0] - 2026-09-09
 
 Hardening release: the same nine tools, now safer, more accurate and more predictable
