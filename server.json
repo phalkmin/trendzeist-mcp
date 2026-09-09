@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.phalkmin/trendzeist-mcp",
+  "title": "Trendzeist – Google Trends for content ideation",
+  "description": "Free, local Google Trends MCP: ranked breakout/rising/evergreen topics, interest over time, related queries, regions, real-time trends. No API key or browser.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/phalkmin/trendzeist-mcp",
+  "repository": {
+    "url": "https://github.com/phalkmin/trendzeist-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "trendzeist-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "TRENDZEIST_HL",
+          "description": "Google Trends UI language, e.g. en-US or pt-BR.",
+          "isRequired": false,
+          "format": "string",
+          "default": "en-US"
+        },
+        {
+          "name": "TRENDZEIST_MIN_INTERVAL",
+          "description": "Minimum seconds between requests to Google (rate-limit protection).",
+          "isRequired": false,
+          "format": "number",
+          "default": "2.0"
+        },
+        {
+          "name": "TRENDZEIST_PROXIES",
+          "description": "Optional comma-separated proxy URLs for rotation.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

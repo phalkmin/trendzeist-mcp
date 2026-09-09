@@ -1,0 +1,67 @@
+[project]
+name = "trendzeist-mcp"
+version = "0.1.0"
+description = "Free, local Google Trends MCP server for content ideation: ranked breakout/rising/evergreen topics, interest over time, related queries. No API key, no browser."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Paulo H.", email = "phalkmin@gmail.com" }]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "google-trends",
+    "keyword-research",
+    "topic-discovery",
+    "content-ideation",
+    "seo",
+    "blogging",
+    "claude",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mcp>=2.0,<3",
+    "pytrends-modern>=0.2.13,<0.3",
+    "pandas>=2.0",
+    "platformdirs>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/phalkmin/trendzeist-mcp"
+Repository = "https://github.com/phalkmin/trendzeist-mcp"
+Issues = "https://github.com/phalkmin/trendzeist-mcp/issues"
+Changelog = "https://github.com/phalkmin/trendzeist-mcp/blob/main/CHANGELOG.md"
+
+[project.scripts]
+trendzeist-mcp = "trendzeist_mcp.server:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trendzeist_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["live: hits Google Trends over the network (run with -m live)"]
+addopts = "-m 'not live'"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
