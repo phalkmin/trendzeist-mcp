@@ -70,6 +70,34 @@ def test_planted_pickle_is_never_loaded(tmp_path):
     assert _TTLCache(tmp_path).get("k") is None
 
 
+def test_disk_writes_use_unique_temp_files(tmp_path, monkeypatch):
+    """Two writers for the same key must never share a temp file (inode)."""
+    import threading
+
+    seen: list[str] = []
+    real_mkstemp = client_mod.tempfile.mkstemp
+    gate = threading.Barrier(2)
+
+    def recording_mkstemp(*a, **kw):
+        fd, name = real_mkstemp(*a, **kw)
+        seen.append(name)
+        gate.wait(timeout=5)  # both writers hold their temp file open simultaneously
+        return fd, name
+
+    monkeypatch.setattr(client_mod.tempfile, "mkstemp", recording_mkstemp)
+    a, b = _TTLCache(tmp_path), _TTLCache(tmp_path)
+    ta = threading.Thread(target=a.set, args=("k", "x" * 500, 60))
+    tb = threading.Thread(target=b.set, args=("k", "y", 60))
+    ta.start(); tb.start(); ta.join(); tb.join()
+
+    assert len(set(seen)) == 2
+    assert not list(tmp_path.glob("*.tmp"))  # no leftovers
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 1
+    assert json.loads(files[0].read_text())["value"] in ("x" * 500, "y")  # valid JSON, last-writer wins
+    assert _TTLCache(tmp_path).get("k") in ("x" * 500, "y")
+
+
 def test_memory_cache_is_bounded(monkeypatch):
     monkeypatch.setattr(client_mod, "MAX_MEMORY_ENTRIES", 10)
     c = _TTLCache(None)

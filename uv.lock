@@ -1305,13 +1305,14 @@ wheels = [
 
 [[package]]
 name = "trendzeist-mcp"
-version = "0.2.1"
+version = "0.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
     { name = "pandas" },
     { name = "platformdirs" },
     { name = "pytrends-modern" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -1325,6 +1326,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.0" },
     { name = "platformdirs", specifier = ">=4.0" },
     { name = "pytrends-modern", specifier = ">=0.2.13,<0.3" },
+    { name = "requests", specifier = ">=2.31" },
 ]
 
 [package.metadata.requires-dev]

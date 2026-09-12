@@ -16,7 +16,10 @@ pytestmark = pytest.mark.live
 
 @pytest.fixture(scope="module")
 def client():
-    return TrendsClient(Settings(min_interval=3.0), cache_dir=None)
+    # Honour TRENDZEIST_* env (the CI job sets MIN_INTERVAL), but never below 3 s.
+    settings = Settings.from_env()
+    settings.min_interval = max(settings.min_interval, 3.0)
+    return TrendsClient(settings, cache_dir=None)
 
 
 def test_interest_over_time_live(client):

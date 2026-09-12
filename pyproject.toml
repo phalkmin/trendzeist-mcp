@@ -1,6 +1,6 @@
 [project]
 name = "trendzeist-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "Free, local Google Trends MCP server for content ideation: ranked breakout/rising/evergreen topics, interest over time, related queries. No API key, no browser."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,6 +36,7 @@ dependencies = [
     "pytrends-modern>=0.2.13,<0.3",
     "pandas>=2.0",
     "platformdirs>=4.0",
+    "requests>=2.31",
 ]
 
 [project.urls]

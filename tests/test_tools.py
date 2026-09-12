@@ -133,11 +133,68 @@ def test_discover_topics_ranking_is_seed_order_independent():
     assert sorted(forward["source_seeds"]) == ["a", "b"]
 
 
-def test_discover_topics_partial_failure_stops_on_rate_limit():
-    out = discover_topics(FakeClient(fail_seed="espresso"), ["espresso", "latte"])
+def test_discover_topics_rate_limit_skips_uncached_seeds_but_reports_all():
+    client = FakeClient(fail_seed="espresso")
+    out = discover_topics(client, ["espresso", "latte", "mocha"], geo="US")
     assert out["errors"][0]["step"] == "related_queries:espresso"
-    assert len(out["seeds"]) == 1  # aborted before hitting Google again
+    # Every seed gets a report; later ones are marked skipped, not silently dropped.
+    assert [s["seed"] for s in out["seeds"]] == ["espresso", "latte", "mocha"]
+    assert "skipped" in out["seeds"][1] and "skipped" in out["seeds"][2]
+    # No further related_queries calls went to "Google" after the 429.
+    assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso")]
     assert out["topics"] == []
+
+
+def test_discover_topics_rate_limit_still_serves_cached_seeds():
+    class CachingClient(FakeClient):
+        cached = {"latte"}
+
+        def has_cached_related_queries(self, kw, tf, geo, cat, gprop):
+            return kw in self.cached
+
+    client = CachingClient(fail_seed="espresso")
+    out = discover_topics(client, ["espresso", "latte", "mocha"])
+    assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso"), ("rq", "latte")]
+    assert out["seeds"][1].get("rising_count") == 2
+    assert "skipped" in out["seeds"][2]
+    assert any(t["source_seeds"] == ["latte"] for t in out["topics"])
+
+
+def test_discover_topics_iot_rate_limit_stops_further_requests():
+    class IotFails(FakeClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            raise TrendsError("429", retryable=True)
+
+    client = IotFails()
+    out = discover_topics(client, ["espresso", "latte"])
+    assert out["errors"][0]["step"] == "interest_over_time"
+    assert [c for c in client.calls if c[0] == "rq"] == []
+    assert all("skipped" in s for s in out["seeds"])
+
+
+def test_discover_topics_non_retryable_error_continues():
+    class BadSeed(FakeClient):
+        def related_queries(self, kw, tf, geo, cat, gprop):
+            if kw == "espresso":
+                self.calls.append(("rq", kw))
+                raise TrendsError("rejected", retryable=False)
+            return super().related_queries(kw, tf, geo, cat, gprop)
+
+    client = BadSeed()
+    out = discover_topics(client, ["espresso", "latte"])
+    assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso"), ("rq", "latte")]
+    assert "error" in out["seeds"][0] and out["seeds"][1]["rising_count"] == 2
+
+
+def test_interest_by_region_rejects_unsupported_geo_resolution():
+    from trendzeist_mcp.validation import ValidationError
+
+    with pytest.raises(ValidationError, match="REGION"):
+        tools.interest_by_region(FakeClient(), ["x"], geo="BR", resolution="CITY")
+    with pytest.raises(ValidationError, match="COUNTRY"):
+        tools.interest_by_region(FakeClient(), ["x"], geo="US", resolution="COUNTRY")
+    assert tools.interest_by_region(FakeClient(), ["x"], geo="US", resolution="DMA")["query"]["resolution"] == "DMA"
+    assert tools.interest_by_region(FakeClient(), ["x"], geo="BR", resolution="region")["query"]["resolution"] == "REGION"
 
 
 def test_server_registers_tools_and_prompt(monkeypatch):

@@ -6,6 +6,40 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-12
+
+Correctness release driven by an adversarial code review. Same nine tools.
+
+### Fixed
+- **No cross-query data contamination.** The reused upstream session kept the previous
+  query's `interest_over_time` / `interest_by_region` widgets when Google's token
+  response omitted them, so a later query could fetch the *old* keyword's data, label it
+  with the new keywords and cache it under the new key. Widgets are now cleared before
+  every `build_payload`.
+- **Throttle really covers every request in proxy mode.** Upstream refreshes the cookie
+  inside `_get_data` and fires the data request immediately after; the interval is now
+  enforced between the cookie fetch and the data request.
+- **Cookie endpoint 429 is a rate-limit error**, not a silent "continue without cookie";
+  other HTTP errors on the cookie fetch are logged instead of ignored.
+- **Concurrent identical cache misses fetch once.** Callers waiting on the network lock
+  re-check the cache before hitting Google.
+- **Disk cache writes use unique temp files.** Two processes sharing the cache dir could
+  hold the same `.tmp` inode and corrupt the published file after the first rename.
+- **Locale-aware cache keys.** Explore caches now include `hl`/`tz`; two servers with
+  different `TRENDZEIST_HL` sharing the disk cache no longer see each other's results.
+- **`interest_by_region` no longer claims a resolution it did not request.** Google only
+  applies CITY/DMA for `geo='US'` (or worldwide) and REGION within a country; other
+  combinations are now rejected with an actionable message instead of silently
+  returning default-resolution data.
+- **`discover_topics` after a 429:** later seeds are no longer dropped silently. Seeds
+  already in cache are still served; uncached ones are reported as `skipped`. A
+  rate-limited `interest_over_time` step now also stops further requests.
+- Live canary honours `TRENDZEIST_*` env (it hard-coded a 3 s interval before).
+
+### Changed
+- `publish.yml` runs the offline suite and a server-startup check on the tagged commit
+  and verifies `server.json` versions before publishing.
+
 ## [0.2.1] - 2026-09-09
 
 ### Added

@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -186,13 +187,24 @@ class _TTLCache:
         path = self._path(key)
         if path is None:
             return
+        # Unique temp file per write: a shared ``.tmp`` name lets two writers
+        # (e.g. two server processes on the same cache dir) hold the same inode
+        # and corrupt the published file after the first ``os.replace``.
+        tmp_name: str | None = None
         try:
-            tmp = path.with_suffix(".tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
+            fd, tmp_name = tempfile.mkstemp(prefix=path.stem + ".", suffix=".tmp", dir=path.parent)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"expires": expires, "value": _encode(value)}, fh)
-            os.replace(tmp, path)
+            os.replace(tmp_name, path)
+            tmp_name = None
         except (OSError, ValueError, TypeError) as exc:
             logger.debug("disk cache write failed for %s: %s", path, exc)
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
         self._sweep_disk(now)
 
 
@@ -235,11 +247,46 @@ class _QuietTrendReq(TrendReq):
         except requests.RequestException as exc:
             logger.warning("could not fetch Google cookie (%s); continuing without it", exc)
             return {}
+        if response.status_code == 429:
+            raise TooManyRequestsError.from_response(response)
+        if response.status_code >= 400:
+            logger.warning(
+                "Google cookie endpoint returned HTTP %s; continuing without cookie",
+                response.status_code,
+            )
+            return {}
         return {k: v for k, v in response.cookies.items() if k == "NID"}
 
     def _get_data(self, url: str, method: str = TrendReq.GET_METHOD, **kwargs: Any) -> dict:
+        # With proxies, upstream refreshes the cookie *inside* ``_get_data`` and
+        # fires the data request immediately after, so the two HTTP calls are
+        # not spaced. Do the cookie fetch ourselves (throttled), throttle again,
+        # then run the parent with the proxy list hidden so it does not repeat
+        # the cookie fetch. The proxy is passed explicitly and rotated afterwards
+        # to keep upstream's rotation semantics.
+        if self.proxies:
+            self.cookies = self._get_google_cookie()
+            proxy = {"https": self.proxies[self.proxy_index]}
+            self._before_request()
+            proxies_backup, self.proxies = self.proxies, []
+            try:
+                return super()._get_data(url, method, proxies=proxy, **kwargs)
+            finally:
+                self.proxies = proxies_backup
+                self._get_new_proxy()
         self._before_request()
         return super()._get_data(url, method, **kwargs)
+
+    def build_payload(self, *args: Any, **kwargs: Any) -> None:
+        # Upstream ``_get_tokens`` only *overwrites* these widgets when Google
+        # returns them; a response lacking TIMESERIES / GEO_MAP would leave the
+        # previous query's widget in place and mislabel its data with the new
+        # keywords. Always start from a clean slate.
+        self.interest_over_time_widget = {}
+        self.interest_by_region_widget = {}
+        self.related_topics_widget_list = []
+        self.related_queries_widget_list = []
+        super().build_payload(*args, **kwargs)
 
 
 class TrendsClient:
@@ -315,9 +362,25 @@ class TrendsClient:
         if hit is not None:
             logger.debug("cache hit %s", key)
             return hit
-        value = self._guarded(fn)
-        self._cache.set(key, value, ttl)
-        return value
+
+        def fetch_and_store() -> T:
+            # Re-check under the network lock: a concurrent caller with the same
+            # key may have fetched and stored while we were waiting for it.
+            again = self._cache.get(key)
+            if again is not None:
+                logger.debug("cache hit after wait %s", key)
+                return again
+            value = fn()
+            self._cache.set(key, value, ttl)
+            return value
+
+        return self._guarded(fetch_and_store)
+
+    def _explore_key(self, name: str, **params: Any) -> str:
+        # hl/tz change what Google returns (language of related queries,
+        # bucket boundaries); two processes with different env sharing the disk
+        # cache must not see each other's results.
+        return _cache_key(name, hl=self.settings.hl, tz=self.settings.tz, **params)
 
     def _explore(
         self, keywords: list[str], timeframe: str, geo: str, category: int, gprop: str
@@ -346,7 +409,7 @@ class TrendsClient:
     def interest_over_time(
         self, keywords: list[str], timeframe: str, geo: str, category: int, gprop: str
     ) -> pd.DataFrame:
-        key = _cache_key("iot", kw=keywords, tf=timeframe, geo=geo, cat=category, gprop=gprop)
+        key = self._explore_key("iot", kw=keywords, tf=timeframe, geo=geo, cat=category, gprop=gprop)
         return self._cached(
             key,
             EXPLORE_TTL,
@@ -362,7 +425,7 @@ class TrendsClient:
         gprop: str,
         resolution: str,
     ) -> pd.DataFrame:
-        key = _cache_key(
+        key = self._explore_key(
             "region", kw=keywords, tf=timeframe, geo=geo, cat=category, gprop=gprop, res=resolution
         )
         return self._cached(
@@ -373,10 +436,17 @@ class TrendsClient:
             ),
         )
 
+    def has_cached_related_queries(
+        self, keyword: str, timeframe: str, geo: str, category: int, gprop: str
+    ) -> bool:
+        """True when :meth:`related_queries` would be served without hitting Google."""
+        key = self._explore_key("rq", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
+        return self._cache.get(key) is not None
+
     def related_queries(
         self, keyword: str, timeframe: str, geo: str, category: int, gprop: str
     ) -> dict[str, pd.DataFrame | None]:
-        key = _cache_key("rq", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
+        key = self._explore_key("rq", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
 
         def fetch() -> dict[str, pd.DataFrame | None]:
             result = self._explore([keyword], timeframe, geo, category, gprop).related_queries()
@@ -387,7 +457,7 @@ class TrendsClient:
     def related_topics(
         self, keyword: str, timeframe: str, geo: str, category: int, gprop: str
     ) -> dict[str, pd.DataFrame | None]:
-        key = _cache_key("rt", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
+        key = self._explore_key("rt", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
 
         def fetch() -> dict[str, pd.DataFrame | None]:
             result = self._explore([keyword], timeframe, geo, category, gprop).related_topics()

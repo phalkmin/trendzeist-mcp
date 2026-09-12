@@ -17,11 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
-      - name: Verify tag matches pyproject version
+      - name: Verify tag matches pyproject and server.json versions
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           VER="$(uvx --from toml-cli toml get --toml-path pyproject.toml project.version)"
-          test "$TAG" = "$VER" || { echo "tag $TAG != version $VER"; exit 1; }
+          test "$TAG" = "$VER" || { echo "tag $TAG != pyproject version $VER"; exit 1; }
+          SJ="$(python3 -c 'import json;d=json.load(open("server.json"));print(d["version"], d["packages"][0]["version"])')"
+          test "$SJ" = "$TAG $TAG" || { echo "server.json versions ($SJ) != tag $TAG"; exit 1; }
+      # Publishing is gated on the offline suite for the *tagged* commit; CI on
+      # main is a separate workflow and may not have run (or passed) for this ref.
+      - run: uv sync --group dev
+      - run: uv run pytest -q
+      - name: Server starts and answers initialize
+        run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | uv run trendzeist-mcp | grep -q '"serverInfo"'
       - run: uv build
       - uses: actions/upload-artifact@v7
         with:

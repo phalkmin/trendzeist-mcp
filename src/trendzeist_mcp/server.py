@@ -132,8 +132,9 @@ def interest_by_region(
     gprop: str = "",
     limit: int = 20,
 ) -> dict[str, Any]:
-    """Where a keyword is searched most. resolution: COUNTRY (worldwide), REGION
-    (states/provinces within geo), CITY, DMA (US metro areas)."""
+    """Where a keyword is searched most. resolution: COUNTRY (geo='' only), REGION
+    (states/provinces within geo), CITY and DMA (US metro areas; geo='US' or worldwide only).
+    Non-US countries support REGION only."""
     return _tool(tools.interest_by_region)(
         keywords, timeframe, geo, resolution, category, gprop, limit
     )

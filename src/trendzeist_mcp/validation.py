@@ -139,13 +139,26 @@ def validate_category(category: int) -> int:
     return category
 
 
-def validate_resolution(resolution: str) -> str:
-    """Validate an interest_by_region resolution."""
+def validate_resolution(resolution: str, geo: str = "") -> str:
+    """Validate an interest_by_region resolution for the given (validated) geo.
+
+    pytrends-modern only applies a custom resolution when geo is worldwide or
+    ``US``; for any other geo Google's default is used silently, so the tool
+    would claim a granularity it did not request. Reject those combinations.
+    """
     if not isinstance(resolution, str):
         raise ValidationError("resolution must be a string")
     r = resolution.strip().upper()
     if r not in VALID_RESOLUTIONS:
         raise ValidationError(f"resolution must be one of {sorted(VALID_RESOLUTIONS)}")
+    if geo and r == "COUNTRY":
+        raise ValidationError(
+            "resolution COUNTRY only applies to worldwide queries (geo=''); use REGION within a country"
+        )
+    if geo and geo != "US" and r != "REGION":
+        raise ValidationError(
+            f"resolution '{r}' is only supported for geo='US'; for '{geo}' use REGION"
+        )
     return r
 
 

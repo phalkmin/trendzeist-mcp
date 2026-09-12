@@ -50,15 +50,28 @@ def discover_topics(
     errors: list[dict[str, str]] = []
 
     # One interest_over_time call covers up to 5 seeds -> cheap trend context.
+    # Once Google starts refusing (429 / transport failure) we stop sending new
+    # requests, but still serve seeds whose related queries are already cached.
+    cooling_down = False
+    has_cache = getattr(client, "has_cached_related_queries", None)
+
     directions: dict[str, Any] = {}
     try:
         iot = fmt.interest_over_time(client.interest_over_time(seeds, tf, g, cat, gp), seeds)
         directions = iot["summary"]
     except TrendsError as exc:
         errors.append({"step": "interest_over_time", "error": str(exc)})
+        cooling_down = exc.retryable
 
     for seed in seeds:
         report: dict[str, Any] = {"seed": seed, "trend": directions.get(seed, {"available": False})}
+        if cooling_down and not (callable(has_cache) and has_cache(seed, tf, g, cat, gp)):
+            report["skipped"] = (
+                "Not fetched: Google is rate limiting this session. Retry in a minute."
+            )
+            errors.append({"step": f"related_queries:{seed}", "error": "skipped (rate limited)"})
+            seed_reports.append(report)
+            continue
         try:
             res = client.related_queries(seed, tf, g, cat, gp)
         except TrendsError as exc:
@@ -66,8 +79,7 @@ def discover_topics(
             errors.append({"step": f"related_queries:{seed}", "error": str(exc)})
             seed_reports.append(report)
             if exc.retryable:
-                # Stop hammering Google once it starts refusing.
-                break
+                cooling_down = True
             continue
 
         rising = fmt.mark_breakouts(fmt.related_list(res.get("rising"), per_seed, label="query"))

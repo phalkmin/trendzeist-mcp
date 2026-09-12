@@ -152,7 +152,7 @@ def interest_by_region(
 ) -> dict[str, Any]:
     kws = v.validate_keywords(keywords)
     tf, g, cat, gp = _common(timeframe, geo, category, gprop)
-    res = v.validate_resolution(resolution)
+    res = v.validate_resolution(resolution, g)
     lim = v.validate_limit(limit, default=20, maximum=100)
     df = client.interest_by_region(kws, tf, g, cat, gp, res)
     return {

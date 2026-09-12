@@ -16,6 +16,14 @@ Agent: → discover_topics(["espresso", "espresso machine"], geo="US")
        "1. How to Descale Your Espresso Machine (rising +120%, publish now) ..."
 ```
 
+## Built with
+
+trendzeist-mcp is a thin MCP layer over **[pytrends-modern](https://github.com/yiromo/pytrends-modern)**,
+which handles all Google Trends requests. Trendzeist adds the MCP tools and prompt, request
+throttling, a persistent disk cache, strict input validation, LLM-friendly JSON output and the
+ranked `discover_topics` workflow. Other runtime dependencies: [`mcp`](https://github.com/modelcontextprotocol/python-sdk)
+(official MCP Python SDK), `pandas`, `platformdirs` and `requests`. All MIT/BSD/Apache licensed.
+
 ## Quick start
 
 ```bash
@@ -46,7 +54,7 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 | `compare_keywords` | Head-to-head share and winner for 2-5 keywords |
 | `related_queries` | Top & rising related searches with breakout flags |
 | `related_topics` | Top & rising Knowledge-Graph topics (best-effort) |
-| `interest_by_region` | Where demand lives: COUNTRY / REGION / CITY / DMA |
+| `interest_by_region` | Where demand lives: COUNTRY (worldwide), REGION (within a country), CITY / DMA (US or worldwide) |
 | `suggest_keywords` | Disambiguate a term into Google entities (title, type, mid) |
 | `trending_now` | What's trending right now, with news headlines |
 | `list_categories` | Find Google Trends category ids to narrow any query |
@@ -120,4 +128,4 @@ change are the most valuable contribution — include the call you made and what
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Built on [pytrends-modern](https://pypi.org/project/pytrends-modern/) (MIT).
+MIT — see [LICENSE](LICENSE). Built on [pytrends-modern](https://github.com/yiromo/pytrends-modern) (MIT).
