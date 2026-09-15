@@ -7,6 +7,7 @@ time series are downsampled, floats are rounded and lists are capped.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Iterable
 
 import pandas as pd
@@ -14,6 +15,114 @@ import pandas as pd
 MAX_SERIES_POINTS = 60
 BREAKOUT_THRESHOLD = 5000  # Google reports "Breakout" as +5000%
 SCALE_NOTE = "0-100 relative to the peak across all keywords in this query"
+
+# Title angles (roadmap N6). Order matters: the first matching rule wins, so the
+# more specific intents (comparison, definition) are checked before "how-to".
+ANGLES: tuple[str, ...] = ("how-to", "comparison", "listicle", "definition", "news")
+_ANGLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "comparison",
+        re.compile(
+            r"\b(vs\.?|versus|compared?\s+to|comparison|difference\s+between|alternatives?\s+to"
+            r"|better\s+than|or)\b",
+            re.I,
+        ),
+    ),
+    (
+        "definition",
+        re.compile(
+            r"^(what\s+(is|are|does|do)|who\s+(is|are|was))\b|\b(meaning|definition|explained)\b",
+            re.I,
+        ),
+    ),
+    (
+        "how-to",
+        re.compile(
+            r"^(how\s+(to|do|does|can|long|much|many|often)|why|when|where|can|should|is|does|do"
+            r"|will|would|could)\b|\b(tutorial|guide|steps?|diy|recipe)\b",
+            re.I,
+        ),
+    ),
+    (
+        "listicle",
+        re.compile(r"\b(best|top(\s+\d+)?|ideas|examples|tips|types\s+of|list\s+of|cheap(est)?)\b", re.I),
+    ),
+    (
+        "news",
+        re.compile(
+            r"\b(news|update[sd]?|release[sd]?|launch(ed|es)?|announce[sd]?|leak(ed|s)?|recall"
+            r"|lawsuit|20\d\d)\b",
+            re.I,
+        ),
+    ),
+)
+
+# Interrogative prefixes that make a search query a question (roadmap N2).
+QUESTION_RE = re.compile(
+    r"^(how|why|what|when|where|which|who|whom|whose|can|could|should|would|will|is|are|was"
+    r"|were|does|do|did|has|have)\b",
+    re.I,
+)
+
+
+def classify_angle(text: str | None) -> str | None:
+    """Tag a query/title with a content angle, or ``None`` when no rule matches."""
+    if not text:
+        return None
+    for angle, rule in _ANGLE_RULES:
+        if rule.search(text):
+            return angle
+    return None
+
+
+def tag_angles(items: list[dict[str, Any]], key: str = "name") -> list[dict[str, Any]]:
+    """Add ``angle`` to every item in place (from ``item[key]``)."""
+    for it in items:
+        it["angle"] = classify_angle(it.get(key))
+    return items
+
+
+def is_question(text: str | None) -> bool:
+    return bool(text) and QUESTION_RE.match(text.strip()) is not None
+
+
+def normalise_query(text: str) -> str:
+    """Canonical form for de-duplication: lowercase, no punctuation, single spaces."""
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
+def extract_questions(
+    *sources: tuple[str, list[dict[str, Any]]], limit: int
+) -> list[dict[str, Any]]:
+    """Collect question-shaped queries from related lists.
+
+    ``sources`` are ``(label, items)`` pairs in priority order (e.g. rising
+    before top). Duplicates are removed by normalised form; the first source
+    that mentions a question keeps it.
+    """
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for source, items in sources:
+        for it in items:
+            name = (it.get("name") or "").strip()
+            if not is_question(name):
+                continue
+            norm = normalise_query(name)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            entry: dict[str, Any] = {
+                "question": name,
+                "angle": classify_angle(name) or "how-to",
+                "source": source,
+                "value": it.get("value"),
+            }
+            if it.get("is_breakout"):
+                entry["is_breakout"] = True
+            out.append(entry)
+            if len(out) >= limit:
+                return out
+    return out
 
 
 def _fmt_timestamp(ts: pd.Timestamp) -> str:
@@ -81,6 +190,63 @@ def _direction(values: list[float]) -> str:
     return "stable"
 
 
+_GROWTH_WINDOWS: dict[str, int] = {"growth_3m": 91, "growth_12m": 365}
+
+
+def _pct_change(before: float, after: float) -> float | None:
+    if before <= 0:
+        return None  # growth from zero is undefined
+    return round(100.0 * (after - before) / before, 1)
+
+
+def _growth_windows(series: pd.Series) -> dict[str, float | None]:
+    """% change of the mean over the last N days vs. the N days before that.
+
+    ``None`` when the series does not span the two windows (roadmap C16) or
+    when the index is not time-based.
+    """
+    out: dict[str, float | None] = {name: None for name in _GROWTH_WINDOWS}
+    if len(series) < 4 or not isinstance(series.index, pd.DatetimeIndex):
+        return out
+    end = series.index.max()
+    start = series.index.min()
+    # Google buckets series (daily / weekly / monthly): each point covers one
+    # ``step``, and the earliest bucket may start up to one step late, so the
+    # covered span is (end - start + step) with one bucket of tolerance.
+    step = pd.Series(series.index).diff().dropna().median()
+    covered = end - start + step
+    for name, days in _GROWTH_WINDOWS.items():
+        window = pd.Timedelta(days=days)
+        if covered < 2 * window - step:
+            continue
+        recent = series[series.index > end - window]
+        previous = series[(series.index <= end - window) & (series.index > end - 2 * window)]
+        if len(recent) < 2 or len(previous) < 2:
+            continue
+        out[name] = _pct_change(float(previous.mean()), float(recent.mean()))
+    return out
+
+
+def _insight(kw: str, vals: list[float], direction: str, peak: Any, peak_date: Any) -> str:
+    """One plain-English sentence per keyword so the model needs no arithmetic."""
+    if direction == "insufficient_data":
+        return f"Too few data points to judge the trend for '{kw}'."
+    if direction == "no_interest":
+        return f"'{kw}' shows no measurable search interest in this period."
+    third = max(1, len(vals) // 3)
+    first = sum(vals[:third]) / third
+    last = sum(vals[-third:]) / third
+    if first > 0:
+        change = round(100.0 * (last - first) / first)
+        verb = "rose" if change > 0 else "fell" if change < 0 else "held flat"
+        magnitude = f" {abs(change)}%" if change else ""
+        head = f"Interest in '{kw}' {verb}{magnitude} between the first and last third of the period"
+    else:
+        head = f"Interest in '{kw}' appeared from zero during the period"
+    tail = f", peaking at {peak} on {peak_date}" if peak is not None and peak_date else ""
+    return f"{head}{tail} ({direction})."
+
+
 def interest_over_time(df: pd.DataFrame | None, keywords: Iterable[str]) -> dict[str, Any]:
     """Shape an interest_over_time frame into points + per-keyword summary."""
     kws = list(keywords)
@@ -111,13 +277,18 @@ def interest_over_time(df: pd.DataFrame | None, keywords: Iterable[str]) -> dict
             stats_series = series[~partial_flags]
         vals = [float(v) for v in stats_series.tolist()]
         peak_idx = stats_series.idxmax() if len(stats_series) else None
+        direction = _direction(vals)
+        peak = _to_native(stats_series.max()) if len(stats_series) else None
+        peak_date = _to_native(peak_idx) if peak_idx is not None else None
         summary[kw] = {
             "available": True,
             "mean": round(sum(vals) / len(vals), 1) if vals else 0,
             "latest": _to_native(stats_series.iloc[-1]) if len(stats_series) else None,
-            "peak": _to_native(stats_series.max()) if len(stats_series) else None,
-            "peak_date": _to_native(peak_idx) if peak_idx is not None else None,
-            "direction": _direction(vals),
+            "peak": peak,
+            "peak_date": peak_date,
+            "direction": direction,
+            **_growth_windows(stats_series),
+            "insight": _insight(kw, vals, direction, peak, peak_date),
         }
 
     sampled = _downsample(complete, MAX_SERIES_POINTS)

@@ -43,6 +43,29 @@ MAX_MEMORY_ENTRIES = 256
 DISK_SWEEP_INTERVAL = 5 * 60
 _DF_TAG = "__dataframe__"
 _COOKIE_URL = "https://trends.google.com/?geo={geo}"
+_AUTOCOMPLETE_URL = "https://suggestqueries.google.com/complete/search"
+_AUTOCOMPLETE_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+# geo -> hl when TRENDZEIST_HL is unset (roadmap N9): related queries and
+# autocomplete come back in the market's language. Unlisted geos keep en-US.
+GEO_TO_HL: dict[str, str] = {
+    "AR": "es-AR", "AT": "de-AT", "AU": "en-AU", "BE": "nl-BE", "BR": "pt-BR",
+    "CA": "en-CA", "CH": "de-CH", "CL": "es-CL", "CN": "zh-CN", "CO": "es-CO",
+    "CZ": "cs-CZ", "DE": "de-DE", "DK": "da-DK", "EG": "ar-EG", "ES": "es-ES",
+    "FI": "fi-FI", "FR": "fr-FR", "GB": "en-GB", "GR": "el-GR", "HK": "zh-HK",
+    "HU": "hu-HU", "ID": "id-ID", "IE": "en-IE", "IL": "he-IL", "IN": "en-IN",
+    "IT": "it-IT", "JP": "ja-JP", "KR": "ko-KR", "MX": "es-MX", "MY": "ms-MY",
+    "NG": "en-NG", "NL": "nl-NL", "NO": "no-NO", "NZ": "en-NZ", "PE": "es-PE",
+    "PH": "en-PH", "PL": "pl-PL", "PT": "pt-PT", "RO": "ro-RO", "RU": "ru-RU",
+    "SA": "ar-SA", "SE": "sv-SE", "SG": "en-SG", "TH": "th-TH", "TR": "tr-TR",
+    "TW": "zh-TW", "UA": "uk-UA", "US": "en-US", "VN": "vi-VN", "ZA": "en-ZA",
+}
+
+
+def hl_for_geo(geo: str, default: str = "en-US") -> str:
+    """Language for a geo ('BR' or 'BR-SP' -> 'pt-BR'); ``default`` when unknown."""
+    country = (geo or "").split("-")[0].upper()
+    return GEO_TO_HL.get(country, default)
 
 
 class TrendsError(RuntimeError):
@@ -63,19 +86,27 @@ class Settings:
     retries: int = 3
     backoff_factor: float = 1.5
     proxies: list[str] = field(default_factory=list)
+    # When True (TRENDZEIST_HL unset) the language follows the request's geo.
+    auto_hl: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
         proxies_raw = os.environ.get("TRENDZEIST_PROXIES", "").strip()
         proxies = [p.strip() for p in proxies_raw.split(",") if p.strip()]
+        hl_env = os.environ.get("TRENDZEIST_HL", "").strip()
         return cls(
-            hl=os.environ.get("TRENDZEIST_HL", "en-US"),
+            hl=hl_env or "en-US",
             tz=int(os.environ.get("TRENDZEIST_TZ", "360")),
             min_interval=float(os.environ.get("TRENDZEIST_MIN_INTERVAL", "2.0")),
             retries=int(os.environ.get("TRENDZEIST_RETRIES", "3")),
             backoff_factor=float(os.environ.get("TRENDZEIST_BACKOFF", "1.5")),
             proxies=proxies,
+            auto_hl=not hl_env,
         )
+
+    def hl_for(self, geo: str) -> str:
+        """Effective UI language for a request targeting ``geo``."""
+        return hl_for_geo(geo, self.hl) if self.auto_hl else self.hl
 
 
 def _encode(value: Any) -> Any:
@@ -242,19 +273,17 @@ class _QuietTrendReq(TrendReq):
         headers.update(kwargs.pop("headers", None) or {})
         if self.proxies:
             kwargs["proxies"] = {"https": self.proxies[self.proxy_index]}
+        # Fail fast: continuing without a cookie yields confusing downstream
+        # errors (empty widgets, 4xx on the data call). ``_guarded`` maps these
+        # to a retryable TrendsError with an actionable message.
         try:
             response = requests.get(_COOKIE_URL.format(geo=self.hl[-2:]), headers=headers, **kwargs)
         except requests.RequestException as exc:
-            logger.warning("could not fetch Google cookie (%s); continuing without it", exc)
-            return {}
+            raise DownloadError(f"could not reach Google Trends to fetch a session cookie: {exc}") from exc
         if response.status_code == 429:
             raise TooManyRequestsError.from_response(response)
         if response.status_code >= 400:
-            logger.warning(
-                "Google cookie endpoint returned HTTP %s; continuing without cookie",
-                response.status_code,
-            )
-            return {}
+            raise ResponseError.from_response(response)
         return {k: v for k, v in response.cookies.items() if k == "NID"}
 
     def _get_data(self, url: str, method: str = TrendReq.GET_METHOD, **kwargs: Any) -> dict:
@@ -302,6 +331,30 @@ class TrendsClient:
         self._last_request = 0.0
         self._trend_req: TrendReq | None = None
         self._rss = TrendsRSS()
+        # Per-thread counters for the tool call in flight (MCP runs each sync
+        # tool on its own worker thread). See :meth:`begin_call` / :meth:`call_meta`.
+        self._stats = threading.local()
+
+    # ------------------------------------------------------------------ call metadata
+    def begin_call(self) -> None:
+        """Reset request/cache counters for the tool call starting on this thread."""
+        self._stats.requests = 0
+        self._stats.cache_hits = 0
+        self._stats.cache_misses = 0
+
+    def call_meta(self) -> dict[str, Any]:
+        """Counters since :meth:`begin_call` (roadmap N15)."""
+        hits = getattr(self._stats, "cache_hits", 0)
+        misses = getattr(self._stats, "cache_misses", 0)
+        return {
+            "requests_made": getattr(self._stats, "requests", 0),
+            "cache_hit": hits > 0 and misses == 0,
+            "cache_hits": hits,
+            "cache_misses": misses,
+        }
+
+    def _count(self, attr: str) -> None:
+        setattr(self._stats, attr, getattr(self._stats, attr, 0) + 1)
 
     # ------------------------------------------------------------------ internals
     def _req(self) -> TrendReq:
@@ -328,6 +381,7 @@ class TrendsClient:
 
     def _throttle(self) -> None:
         """Enforce ``min_interval`` between consecutive HTTP requests to Google."""
+        self._count("requests")
         wait = self.settings.min_interval - (time.monotonic() - self._last_request)
         if wait > 0:
             time.sleep(wait)
@@ -361,6 +415,7 @@ class TrendsClient:
         hit = self._cache.get(key)
         if hit is not None:
             logger.debug("cache hit %s", key)
+            self._count("cache_hits")
             return hit
 
         def fetch_and_store() -> T:
@@ -369,18 +424,22 @@ class TrendsClient:
             again = self._cache.get(key)
             if again is not None:
                 logger.debug("cache hit after wait %s", key)
+                self._count("cache_hits")
                 return again
+            self._count("cache_misses")
             value = fn()
             self._cache.set(key, value, ttl)
             return value
 
         return self._guarded(fetch_and_store)
 
-    def _explore_key(self, name: str, **params: Any) -> str:
+    def _explore_key(self, name: str, geo: str = "", **params: Any) -> str:
         # hl/tz change what Google returns (language of related queries,
         # bucket boundaries); two processes with different env sharing the disk
         # cache must not see each other's results.
-        return _cache_key(name, hl=self.settings.hl, tz=self.settings.tz, **params)
+        return _cache_key(
+            name, hl=self.settings.hl_for(geo), tz=self.settings.tz, geo=geo, **params
+        )
 
     def _explore(
         self, keywords: list[str], timeframe: str, geo: str, category: int, gprop: str
@@ -389,8 +448,31 @@ class TrendsClient:
         # build_payload does ``self.geo = geo or self.geo``, so a worldwide ('')
         # request would silently inherit the previous call's country. Reset first.
         req.geo = ""
+        # ``hl`` is read from the instance at payload-build time, so switching it
+        # per request is safe; the cookie geo is derived from the constructor hl.
+        req.hl = self.settings.hl_for(geo)
+        req.headers["accept-language"] = req.hl
         req.build_payload(kw_list=keywords, cat=category, timeframe=timeframe, geo=geo, gprop=gprop)
         return req
+
+    def _fetch_autocomplete(self, query: str, hl: str, gl: str) -> list[str]:
+        """One Google Autocomplete request (throttled, proxied)."""
+        self._throttle()
+        response = requests.get(
+            _AUTOCOMPLETE_URL,
+            params={"client": "firefox", "q": query, "hl": hl, "gl": gl or "us"},
+            headers={"User-Agent": _AUTOCOMPLETE_UA},
+            timeout=self._rss.timeout,
+            proxies=self._proxies(),
+        )
+        if response.status_code == 429:
+            raise TooManyRequestsError.from_response(response)
+        response.raise_for_status()
+        payload = response.json()
+        # Firefox client format: ["query", ["suggestion", ...], ...]
+        if not isinstance(payload, list) or len(payload) < 2 or not isinstance(payload[1], list):
+            raise ValueError("unexpected autocomplete payload shape")
+        return [str(s) for s in payload[1] if isinstance(s, str)]
 
     def _fetch_rss(self, geo: str, max_articles: int) -> list[dict[str, Any]]:
         """Fetch the trending RSS feed honouring proxies and throttling."""
@@ -476,4 +558,14 @@ class TrendsClient:
     def trending_rss(self, geo: str, max_articles: int) -> list[dict[str, Any]]:
         key = _cache_key("rss", geo=geo, art=max_articles)
         return self._cached(key, RSS_TTL, lambda: self._fetch_rss(geo, max_articles))
+
+    def autocomplete(self, query: str, geo: str = "") -> list[str]:
+        """Google Autocomplete suggestions for ``query`` in the market's language.
+
+        Results are stable for days, so they share the 24 h static tier.
+        """
+        hl = self.settings.hl_for(geo)
+        gl = (geo or "").split("-")[0].lower()
+        key = _cache_key("ac", q=query.lower(), hl=hl, gl=gl)
+        return self._cached(key, STATIC_TTL, lambda: self._fetch_autocomplete(query, hl, gl))
 

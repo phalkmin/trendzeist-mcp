@@ -5,15 +5,23 @@
 **Turn Google Trends into your next 10 blog posts — in one call.**
 
 trendzeist-mcp gives your AI assistant ranked **breakout / rising / evergreen** topics,
-interest curves, related searches, regional demand and real-time trends. Free, local,
-private. No API key, no account, no browser.
+the **questions people actually ask**, a title angle per idea, plain-English trend
+insights, interest curves, regional demand and real-time trends. Free, local, private.
+No API key, no account, no browser.
+
+*SEO and AEO:* find the questions people ask — and answer engines answer — then make your
+site the source they cite. Measuring your own visibility inside ChatGPT / Perplexity /
+AI Overviews is **out of scope**; this server tells you *what to write*, not *who cites you*.
 
 ```
 You:   Give me blog post ideas about home espresso for US readers.
 Agent: → discover_topics(["espresso", "espresso machine"], geo="US")
-       ← 1 breakout, 14 rising, 14 evergreen candidates with growth %
+       ← 1 breakout, 14 rising, 14 evergreen candidates with growth %, angles and 6 questions
+       → mine_questions("espresso machine", geo="US")
+       ← 30 long-tail questions: how-to 18, comparison 6, definition 4, listicle 2
        → compare_keywords(["how to descale espresso machine", "best coffee beans for espresso"])
-       "1. How to Descale Your Espresso Machine (rising +120%, publish now) ..."
+       ← "Interest in 'how to descale espresso machine' rose 120% ... peaking 2026-08-30 (rising)."
+       "1. How to Descale Your Espresso Machine (how-to, rising +120%, publish now) ..."
 ```
 
 ## Built with
@@ -49,10 +57,11 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 
 | Tool | What you get |
 |---|---|
-| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped |
-| `interest_over_time` | 0-100 interest curve with mean, peak and direction |
+| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle`; plus `questions[]` people ask |
+| `mine_questions` | Long-tail questions about a seed from Google Autocomplete (`how to`, `why`, `what is`, `vs` …), deduped and angle-tagged — FAQ / AEO fuel |
+| `interest_over_time` | 0-100 interest curve with mean, peak, direction, `growth_3m` / `growth_12m` and a plain-English `insight` |
 | `compare_keywords` | Head-to-head share and winner for 2-5 keywords |
-| `related_queries` | Top & rising related searches with breakout flags |
+| `related_queries` | Top & rising related searches with breakout flags, angles and `questions[]` |
 | `related_topics` | Top & rising Knowledge-Graph topics (best-effort) |
 | `interest_by_region` | Where demand lives: COUNTRY (worldwide), REGION (within a country), CITY / DMA (US or worldwide) |
 | `suggest_keywords` | Disambiguate a term into Google entities (title, type, mid) |
@@ -60,6 +69,23 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 | `list_categories` | Find Google Trends category ids to narrow any query |
 
 Prompt: `blog_ideas_from_trends(topic, audience, geo)` — a guided ideation workflow.
+
+**Output conventions (since 0.3.0)**
+
+- Every result carries `schema_version` (currently `1`; bumped only when a field is removed
+  or changes meaning) and `_meta` with `requests_made`, `cache_hit`, `cache_hits`,
+  `cache_misses` for that call — so the model knows when to slow down.
+- `angle` is one of `how-to | comparison | listicle | definition | news` (or `null`) —
+  the title format the query suggests. Pair it with evidence: how-to → steps + numbers,
+  comparison → table + quotes, definition → cite a primary source, news → dated publisher quotes.
+- Anything silently adjusted is reported: clamped limits add a `note`, empty results add a
+  `reason`.
+- **Language follows the market.** With `TRENDZEIST_HL` unset, `geo="BR"` queries Google
+  with `hl=pt-BR` (≈50 countries mapped), so related queries come back in Portuguese. The
+  effective language is echoed as `query.hl`.
+- **Authority channels:** pass `gprop="news"` or `gprop="youtube"` to any explore tool to see
+  what news outlets and video audiences are searching for — the sources answer engines cite
+  most. `gprop="images"` and `"froogle"` (Shopping) also work.
 
 ## Why this one?
 
@@ -91,30 +117,38 @@ Point a client at the clone with
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TRENDZEIST_HL` | `en-US` | UI language for Google Trends |
+| `TRENDZEIST_HL` | *(unset → follows `geo`)* | Pin the UI language for every query (e.g. `en-US`). When unset, the language is derived from each request's `geo` (`BR` → `pt-BR`, unknown → `en-US`) |
 | `TRENDZEIST_TZ` | `360` | Timezone offset in minutes |
-| `TRENDZEIST_MIN_INTERVAL` | `2.0` | Minimum seconds between *every* HTTP request to Google (cookie, token, data, RSS) |
+| `TRENDZEIST_MIN_INTERVAL` | `2.0` | Minimum seconds between *every* HTTP request to Google (cookie, token, data, RSS, Autocomplete) |
 | `TRENDZEIST_RETRIES` | `3` | Retry attempts on transient errors |
 | `TRENDZEIST_BACKOFF` | `1.5` | Exponential backoff factor |
-| `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs (rotated for explore calls; first one used for RSS) |
+| `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs. Rotated per request for explore calls; **RSS and Autocomplete always use the first one** |
 | `TRENDZEIST_CACHE_DIR` | OS user cache dir | Persistent JSON cache location (`0700`); `off` to disable |
 | `TRENDZEIST_LOG_LEVEL` | `WARNING` | Python logging level (stderr) |
 
 ## Notes & limitations
 
 - Google rate-limits aggressively (HTTP 429). Every HTTP request is serialised and
-  throttled; results are cached (15 min explore, 5 min RSS, 24 h categories) as plain JSON
-  on disk so client restarts don't re-fetch. Memory cache is bounded and expired files are
-  swept automatically. Errors come back as tool errors with guidance.
-- Values are Google's relative 0–100 index, not absolute search volume.
+  throttled; results are cached (15 min explore, 5 min RSS, 24 h categories / Autocomplete)
+  as plain JSON on disk so client restarts don't re-fetch. Memory cache is bounded and
+  expired files are swept automatically. Errors come back as tool errors with guidance.
+- `mine_questions` issues up to 16 Autocomplete requests per uncached call (one per
+  question prefix); at the default 2 s interval that is ~30 s worst case. It stops as soon
+  as `limit` is met and returns partial results if Google starts refusing.
+- Values are Google's relative 0–100 index, not absolute search volume. `growth_3m` /
+  `growth_12m` compare the mean of the last window with the window before it and are
+  `null` when the timeframe is too short (use `today 12-m` / `today 5-y`).
+- Question prefixes in `mine_questions` are English; for native-language questions in a
+  non-English market, pass a seed already phrased in that language.
 - `related_topics` frequently returns nothing from Google; `related_queries` is reliable.
 - Google's legacy daily `trending_searches` endpoint is gone (404); `trending_now` uses the RSS feed.
 - Camoufox/browser mode from pytrends-modern is intentionally not used.
 
 ## Disclaimer
 
-This server talks to the same undocumented endpoints the trends.google.com frontend uses.
-They are unofficial and may change, rate-limit or disappear without notice. A weekly
+This server talks to the same undocumented endpoints the trends.google.com frontend uses
+(plus Google Autocomplete for `mine_questions`). They are unofficial and may change,
+rate-limit or disappear without notice. A weekly
 [live canary](.github/workflows/live-canary.yml) runs in CI to catch breakage early.
 This project is not affiliated with, endorsed by, or sponsored by Google LLC.
 "Google Trends" is a trademark of Google LLC. You are responsible for complying with

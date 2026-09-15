@@ -48,6 +48,8 @@ def discover_topics(
     candidates: dict[str, dict[str, Any]] = {}
     seed_reports: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    questions: list[dict[str, Any]] = []
+    question_keys: set[str] = set()
 
     # One interest_over_time call covers up to 5 seeds -> cheap trend context.
     # Once Google starts refusing (429 / transport failure) we stop sending new
@@ -86,6 +88,11 @@ def discover_topics(
         top = fmt.related_list(res.get("top"), per_seed, label="query")
         report["rising_count"] = len(rising)
         report["top_count"] = len(top)
+        for q in fmt.extract_questions(("rising", rising), ("top", top), limit=per_seed):
+            norm = fmt.normalise_query(q["question"])
+            if norm not in question_keys:
+                question_keys.add(norm)
+                questions.append({**q, "seed": seed})
         if not rising and not top:
             report["hint"] = (
                 "No related queries: search volume is too low for this seed. Try a "
@@ -128,29 +135,42 @@ def discover_topics(
     )
     for c in ranked:
         c.pop("momentum", None)
+        c["angle"] = fmt.classify_angle(c["topic"]) or ("news" if c["signal"] == "breakout" else None)
 
-    return {
+    settings = getattr(client, "settings", None)
+    hl_for = getattr(settings, "hl_for", None)
+
+    out: dict[str, Any] = {
         "query": {
             "seed_keywords": seeds,
             "timeframe": tf,
             "geo": g or "worldwide",
+            "hl": hl_for(g) if callable(hl_for) else "en-US",
             "category": cat,
             "gprop": gp or "web",
         },
         "seeds": seed_reports,
         "topics": ranked,
+        "questions": questions,
         "counts": {
             "breakout": sum(1 for c in ranked if c["signal"] == "breakout"),
             "rising": sum(1 for c in ranked if c["signal"] == "rising"),
             "evergreen": sum(1 for c in ranked if c["signal"] == "evergreen"),
+            "questions": len(questions),
         },
         "errors": errors,
         "guidance": (
             "breakout = brand-new/exploding demand (time-sensitive, low competition); "
             "rising = growing interest (good near-term posts); evergreen = consistently "
-            "popular (pillar content). Cross-check finalists with interest_over_time."
+            "popular (pillar content). angle = suggested title format. questions = "
+            "question-shaped searches (FAQ / answer-engine candidates); expand them with "
+            "mine_questions. Cross-check finalists with interest_over_time."
         ),
     }
+    note = v.limit_note(max_per_seed, per_seed, name="max_per_seed")
+    if note:
+        out["note"] = note
+    return out
 
 
 def _merge(candidates: dict[str, dict[str, Any]], cand: dict[str, Any]) -> None:

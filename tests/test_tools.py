@@ -6,16 +6,38 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from trendzeist_mcp import server, tools
-from trendzeist_mcp.client import TrendsError
+from trendzeist_mcp.client import Settings, TrendsError
 from trendzeist_mcp.discovery import discover_topics
 
 
 class FakeClient:
     """Stand-in for TrendsClient that never touches the network."""
 
+    settings = Settings(min_interval=0)
+
     def __init__(self, fail_seed: str | None = None):
         self.calls: list[tuple] = []
         self.fail_seed = fail_seed
+        self.autocomplete_fail: set[str] = set()
+
+    def begin_call(self):
+        self.calls.append(("begin",))
+
+    def call_meta(self):
+        return {"requests_made": 2, "cache_hit": False, "cache_hits": 0, "cache_misses": 2}
+
+    def autocomplete(self, query, geo=""):
+        self.calls.append(("ac", query, geo))
+        if query in self.autocomplete_fail:
+            raise TrendsError("429", retryable=True)
+        if query == "espresso":  # bare seed: mixed suggestions
+            return ["espresso machine", "how to make espresso", "what is espresso"]
+        return [
+            f"{query} at home",
+            f"{query} at home",  # duplicate
+            f"{query} without a machine",
+            "espresso machine sale",  # not a question
+        ]
 
     def interest_over_time(self, keywords, tf, geo, cat, gprop):
         self.calls.append(("iot", tuple(keywords)))
@@ -67,10 +89,15 @@ def test_interest_over_time_tool():
         "keywords": ["Espresso"],
         "timeframe": "today 3-m",
         "geo": "US",
+        "hl": "en-US",
         "category": 0,
         "gprop": "web",
     }
-    assert out["summary"]["Espresso"]["direction"] == "rising"
+    s = out["summary"]["Espresso"]
+    assert s["direction"] == "rising"
+    assert s["growth_3m"] is None and s["growth_12m"] is None  # 12 weeks: too short
+    assert s["insight"].startswith("Interest in 'Espresso' rose") and "(rising)" in s["insight"]
+    assert tools.interest_over_time(FakeClient(), ["x"], geo="BR")["query"]["hl"] == "pt-BR"
 
 
 def test_compare_keywords_ranks():
@@ -95,6 +122,119 @@ def test_related_topics_reports_unavailable():
     assert out["available"] is False and "reason" in out
 
 
+def test_growth_windows_and_insight_on_long_series():
+    class LongClient(FakeClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            idx = pd.date_range("2024-01-07", periods=104, freq="W")  # two years, weekly
+            vals = [20] * 52 + [40] * 39 + [60] * 13  # step up in the last year, again in the last 3 m
+            return pd.DataFrame({keywords[0]: vals}, index=idx)
+
+    s = tools.interest_over_time(LongClient(), ["k"], "today 5-y")["summary"]["k"]
+    assert s["growth_12m"] == pytest.approx(122.1, abs=1)  # ~44.6 vs 20
+    assert s["growth_3m"] == pytest.approx(50.0, abs=1)  # 60 vs 40
+    assert "peaking at 60" in s["insight"] and "(rising)" in s["insight"]
+
+
+def test_related_queries_questions_angles_and_limit_note():
+    class QClient(FakeClient):
+        def related_queries(self, kw, tf, geo, cat, gprop):
+            return {
+                "top": pd.DataFrame(
+                    {"query": ["how to make espresso", "best espresso machine", "What is espresso?"],
+                     "value": [100, 80, 60]}
+                ),
+                "rising": pd.DataFrame(
+                    {"query": ["How to make espresso", "espresso vs coffee", "espresso recall 2026"],
+                     "value": [9000, 300, 120]}
+                ),
+            }
+
+    out = tools.related_queries(QClient(), "espresso", limit=500)
+    assert out["note"] == "limit 500 exceeds the maximum; clamped to 50."
+    assert [t["angle"] for t in out["top"]] == ["how-to", "listicle", "definition"]
+    assert [t["angle"] for t in out["rising"]] == ["how-to", "comparison", "news"]
+    # Question extracted once (rising wins over top), breakout flag carried over.
+    qs = out["questions"]
+    assert [q["question"] for q in qs] == ["How to make espresso", "What is espresso?"]
+    assert qs[0]["source"] == "rising" and qs[0]["is_breakout"] is True
+    assert qs[1]["source"] == "top" and qs[1]["angle"] == "definition"
+    assert "note" not in tools.related_queries(QClient(), "espresso", limit=10)
+
+
+def test_interest_by_region_explains_empty_results():
+    class ZeroClient(FakeClient):
+        def interest_by_region(self, keywords, tf, geo, cat, gprop, res):
+            return pd.DataFrame({keywords[0]: [0, 0]}, index=pd.Index(["A", "B"], name="geoName"))
+
+    class NoneClient(FakeClient):
+        def interest_by_region(self, keywords, tf, geo, cat, gprop, res):
+            return pd.DataFrame()
+
+    zero = tools.interest_by_region(ZeroClient(), ["x"], resolution="COUNTRY")
+    assert zero["available"] is False and "zero interest" in zero["reason"]
+    none = tools.interest_by_region(NoneClient(), ["x"], resolution="COUNTRY", limit=999)
+    assert none["available"] is False and "no regional data" in none["reason"]
+    assert none["note"].startswith("limit 999")
+    ok = tools.interest_by_region(FakeClient(), ["x"], resolution="COUNTRY")
+    assert ok["available"] is True and "reason" not in ok
+
+
+def test_mine_questions_expands_dedupes_and_tags():
+    client = FakeClient()
+    out = tools.mine_questions(client, "espresso", geo="br", limit=6)
+    assert out["query"] == {"seed": "espresso", "geo": "BR", "hl": "pt-BR"}
+    assert client.calls[0] == ("ac", "espresso", "BR")
+    assert client.calls[1] == ("ac", "how to espresso", "BR")
+    assert out["count"] == 6 and len(out["questions"]) == 6
+    texts = [q["question"] for q in out["questions"]]
+    assert texts[0] == "how to make espresso" and "what is espresso" in texts
+    assert len(set(texts)) == 6  # duplicates removed
+    assert "espresso machine sale" not in texts  # non-question dropped
+    assert out["questions"][0]["angle"] == "how-to" and out["questions"][0]["prefix"] is None
+    assert out["by_angle"] == {"how-to": 5, "definition": 1}
+    assert out["errors"] == [] and "partial" not in out
+    # Budget is spread across prefixes (max 3 each) and stops once the limit is met.
+    assert out["prefixes_queried"] == ["(seed)", "how to", "how do"]
+    assert [q["prefix"] for q in out["questions"]] == [None, None, "how to", "how to", "how do", "how do"]
+    assert "hl=pt-BR" in out["language_note"]
+    assert "language_note" not in tools.mine_questions(FakeClient(), "espresso", geo="US", limit=3)
+
+
+def test_mine_questions_vs_prefix_and_rate_limit_partial():
+    client = FakeClient()
+    client.autocomplete_fail = {"why espresso"}
+    out = tools.mine_questions(client, "espresso", limit=100)
+    assert out["errors"] == [{"prefix": "why", "error": "429"}]
+    assert "partial" in out and out["prefixes_queried"] == ["(seed)", "how to", "how do", "how much", "how long"]
+    assert out["count"] > 0  # earlier prefixes still returned
+
+    client = FakeClient()
+    client.autocomplete_fail = {"how to espresso"}  # non-fatal? it's retryable -> stops
+    out = tools.mine_questions(client, "espresso", limit=100)
+    assert out["prefixes_queried"] == ["(seed)"]
+
+
+def test_mine_questions_reports_empty():
+    class Silent(FakeClient):
+        def autocomplete(self, query, geo=""):
+            return []
+
+    out = tools.mine_questions(Silent(), "zzz")
+    assert out["count"] == 0 and "reason" in out
+    assert tools.mine_questions(Silent(), "zzz", limit=101)["note"].startswith("limit 101")
+
+
+def test_trending_now_tags_angle_and_explains_empty():
+    class Empty(FakeClient):
+        def trending_rss(self, geo, arts):
+            return []
+
+    out = tools.trending_now(FakeClient(), "US", 20)
+    assert out["trends"][0]["angle"] == "news"
+    assert out["note"] == "max_articles 20 exceeds the maximum; clamped to 10."
+    assert "reason" in tools.trending_now(Empty(), "US", 0)
+
+
 def test_region_suggest_trending_categories():
     assert tools.interest_by_region(FakeClient(), ["x"], resolution="region")["regions"][0]["region"] == "Wyoming"
     assert tools.suggest_keywords(FakeClient(), "coffee")["suggestions"][0]["mid"] == "/m/1"
@@ -115,6 +255,40 @@ def test_discover_topics_ranks_and_dedupes():
     assert shared["popularity"] == 40  # merged from 'top'
     assert out["counts"]["breakout"] == 2 and out["errors"] == []
     assert client.calls[0] == ("iot", ("espresso", "latte"))
+
+
+def test_discover_topics_collects_questions_and_angles():
+    class QClient(FakeClient):
+        def related_queries(self, kw, tf, geo, cat, gprop):
+            return {
+                "top": pd.DataFrame({"query": [f"how to clean {kw}", "best beans"], "value": [90, 50]}),
+                "rising": pd.DataFrame({"query": ["How to clean espresso", f"{kw} vs pod"], "value": [8000, 200]}),
+            }
+
+    out = discover_topics(QClient(), ["espresso", "latte"], geo="BR")
+    assert out["query"]["hl"] == "pt-BR"
+    # Cross-seed dedupe by normalised form: "how to clean espresso" appears once.
+    qs = [q["question"].lower() for q in out["questions"]]
+    assert qs == ["how to clean espresso", "how to clean latte"]
+    assert out["questions"][0]["seed"] == "espresso" and out["questions"][0]["is_breakout"] is True
+    assert out["counts"]["questions"] == 2
+    angles = {t["topic"]: t["angle"] for t in out["topics"]}
+    assert angles["best beans"] == "listicle" and angles["espresso vs pod"] == "comparison"
+    assert "note" not in out
+    assert discover_topics(QClient(), ["x"], max_per_seed=99)["note"].startswith("max_per_seed 99")
+
+
+def test_discover_topics_iot_non_retryable_failure_still_fetches_related():
+    class IotBroken(FakeClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            raise TrendsError("rejected", retryable=False)
+
+    client = IotBroken()
+    out = discover_topics(client, ["espresso", "latte"])
+    assert out["errors"] == [{"step": "interest_over_time", "error": "rejected"}]
+    assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso"), ("rq", "latte")]
+    assert all(s["trend"] == {"available": False} and s["rising_count"] == 2 for s in out["seeds"])
+    assert out["counts"]["breakout"] == 2
 
 
 def test_discover_topics_ranking_is_seed_order_independent():
@@ -210,6 +384,7 @@ def test_server_registers_tools_and_prompt(monkeypatch):
         "trending_now",
         "list_categories",
         "discover_topics",
+        "mine_questions",
     }
     assert [p.name for p in asyncio.run(server.server.list_prompts())] == ["blog_ideas_from_trends"]
 
@@ -217,6 +392,14 @@ def test_server_registers_tools_and_prompt(monkeypatch):
     assert res.is_error is False
     payload = json.loads(res.content[0].text)
     assert payload["rising"][0]["is_breakout"] is True
+    # Every result carries the schema version and per-call meta (C11 / N15).
+    assert payload["schema_version"] == tools.SCHEMA_VERSION == 1
+    assert payload["_meta"]["requests_made"] == 2 and payload["_meta"]["cache_hit"] is False
+    assert server._client.calls[0] == ("begin",)
+
+    mq = asyncio.run(server.server.call_tool("mine_questions", {"seed": "espresso", "limit": 3}))
+    mq_payload = json.loads(mq.content[0].text)
+    assert mq_payload["count"] == 3 and mq_payload["schema_version"] == 1
 
     # Validation failures surface as ToolError with an actionable message.
     with pytest.raises(ToolError, match="Invalid argument"):

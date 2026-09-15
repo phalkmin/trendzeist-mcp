@@ -48,3 +48,11 @@ def test_discover_topics_live(client):
     out = discover_topics(client, ["espresso"], geo="US")
     assert out["errors"] == []
     assert out["topics"], "discover_topics produced no candidates"
+
+
+def test_mine_questions_live(client):
+    # Autocomplete is a separate unofficial endpoint; keep the probe cheap (3 requests).
+    out = tools.mine_questions(client, "espresso", geo="US", limit=5)
+    assert out["errors"] == [], out["errors"]
+    assert out["count"] > 0, "Autocomplete returned no question-shaped suggestions"
+    assert out["questions"][0]["angle"] in {"how-to", "comparison", "listicle", "definition", "news"}

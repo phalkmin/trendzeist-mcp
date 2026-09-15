@@ -6,6 +6,55 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-15
+
+"From data to ideas": the same nine tools plus one, and the output now does the
+editorial thinking — questions people ask, title angles, plain-English trend insights,
+growth windows, results in the market's language.
+
+### Added
+- **`mine_questions(seed, geo, limit)`** — new tool. Expands a seed through Google
+  Autocomplete with 15 question prefixes (`how to`, `why`, `what is`, `vs`, …), dedupes
+  by normalised form, tags each question with a title angle and reports `by_angle`
+  counts. Budget is spread across prefixes, stops as soon as `limit` is met, returns
+  partial results (`partial`, `errors`) when Google starts refusing. Throttled through
+  the shared client, 24 h cache, honours proxies. Default 30, max 100.
+- **`questions[]`** on `related_queries` and `discover_topics`: question-shaped related
+  searches (rising first, deduplicated across seeds, breakout flag carried over).
+- **Title angle** (`angle`: `how-to | comparison | listicle | definition | news | null`)
+  on every related query, discovered topic, mined question and trending item.
+- **`growth_3m` / `growth_12m`** in every `interest_over_time` / `compare_keywords`
+  summary: % change of the last window vs. the window before; `null` when the
+  timeframe is too short.
+- **`insight`** per keyword: one plain-English sentence ("Interest in 'x' rose 40%
+  between the first and last third of the period, peaking at 100 on 2026-09-05
+  (rising).") so the model does not have to do arithmetic.
+- **Language follows the market.** When `TRENDZEIST_HL` is unset, `hl` is derived
+  from the request's `geo` (`BR` → `pt-BR`, ~50 countries; unknown → `en-US`) for
+  explore and Autocomplete calls, and echoed as `query.hl`. Set `TRENDZEIST_HL` to pin
+  one language as before.
+- **`schema_version`** (`1`) on every tool result.
+- **`_meta`** on every tool result: `requests_made`, `cache_hit`, `cache_hits`,
+  `cache_misses` for that call.
+- Live canary probes `mine_questions`.
+
+### Changed
+- Silent behaviours are now reported: clamped `limit` / `max_articles` / `max_per_seed`
+  add a `note`; empty `interest_by_region` and `trending_now` results add a `reason`
+  (`interest_by_region` also gains `available`).
+- Cookie fetch failures (network error or HTTP ≥ 400) now raise a clear, retryable
+  tool error instead of continuing cookieless and failing confusingly later. (0.2.2
+  only did this for HTTP 429.)
+- Server instructions and the `blog_ideas_from_trends` prompt cover the new fields,
+  `mine_questions`, and `gprop='news' | 'youtube'` as authority channels.
+- README: AEO positioning (AI-visibility *measurement* is explicitly out of scope),
+  output conventions, `gprop` channels, RSS/Autocomplete use `proxies[0]`.
+
+### Tests
+- Coverage for every `_guarded` error branch, the empty RSS feed, discovery when
+  `interest_over_time` fails non-retryably, the geo→hl mapping, Autocomplete
+  fetch/cache/429, and per-call meta counters. 101 offline tests.
+
 ## [0.2.2] - 2026-09-12
 
 Correctness release driven by an adversarial code review. Same nine tools.

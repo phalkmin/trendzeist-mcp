@@ -24,6 +24,8 @@ jobs:
           test "$TAG" = "$VER" || { echo "tag $TAG != pyproject version $VER"; exit 1; }
           SJ="$(python3 -c 'import json;d=json.load(open("server.json"));print(d["version"], d["packages"][0]["version"])')"
           test "$SJ" = "$TAG $TAG" || { echo "server.json versions ($SJ) != tag $TAG"; exit 1; }
+          PKG="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/trendzeist_mcp/__init__.py)"
+          test "$PKG" = "$TAG" || { echo "__init__.__version__ $PKG != tag $TAG"; exit 1; }
       # Publishing is gated on the offline suite for the *tagged* commit; CI on
       # main is a separate workflow and may not have run (or passed) for this ref.
       - run: uv sync --group dev

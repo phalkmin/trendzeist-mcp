@@ -21,8 +21,15 @@ tests/           Offline by default. tests/test_live_canary.py is `-m live` only
   Any other exception is hidden as an opaque "crash". `server._tool` does the translation.
 - Every new tool: validate in `validation.py` → implement in `tools.py` → register in
   `server.py` → fake-client test in `tests/test_tools.py` → README table row.
-- Google traffic goes only through `TrendsClient._guarded`; never call `TrendReq` directly.
+- Google traffic (Trends, RSS, Autocomplete) goes only through `TrendsClient._guarded` /
+  `_cached`, with `_throttle()` before every HTTP request; never call `TrendReq` or
+  `requests` directly from tools.
 - Keep outputs JSON-native (no numpy scalars, no Timestamps) — use `formatters._to_native`.
+- Every tool result gets `schema_version` + `_meta` via `tools.finalize` (called by
+  `server._tool`). Bump `tools.SCHEMA_VERSION` only when a field is removed or changes
+  meaning; adding fields is compatible.
+- Report silent adjustments: clamped limits → `note` (`validation.limit_note`), empty
+  results → `reason`.
 - No new runtime deps without a reason; the target is `uvx trendzeist-mcp` starting in <2 s.
 
 ## Commands
@@ -36,6 +43,7 @@ uv build && uvx twine check dist/*                        # packaging check
 ```
 
 ## Release
-Bump `version` in `pyproject.toml` **and** `server.json`, update `CHANGELOG.md`,
-`git tag vX.Y.Z && git push --tags`. `publish.yml` handles PyPI (Trusted
-Publishing), GHCR image and the GitHub release.
+Bump `version` in **three** places — `pyproject.toml`, `server.json` (two fields) and
+`src/trendzeist_mcp/__init__.py` (`__version__`, reported to MCP clients) — update
+`CHANGELOG.md`, `git tag vX.Y.Z && git push --tags`. `publish.yml` verifies the first two
+against the tag and handles PyPI (Trusted Publishing), GHCR image and the GitHub release.

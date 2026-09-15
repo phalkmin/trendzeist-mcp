@@ -118,6 +118,80 @@ def test_region_list_sorted_and_filtered():
     assert out[0]["geo_code"] == "US-C"
 
 
+@pytest.mark.parametrize(
+    "text, angle",
+    [
+        ("how to descale an espresso machine", "how-to"),
+        ("why is my espresso bitter", "how-to"),
+        ("can you froth oat milk", "how-to"),
+        ("espresso vs drip coffee", "comparison"),
+        ("breville or delonghi", "comparison"),
+        ("what is a ristretto", "definition"),
+        ("crema meaning", "definition"),
+        ("best espresso beans", "listicle"),
+        ("top 10 coffee gadgets", "listicle"),
+        ("nespresso recall", "news"),
+        ("new espresso machine 2026", "news"),
+        ("espresso", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_classify_angle(text, angle):
+    assert fmt.classify_angle(text) == angle
+
+
+def test_is_question_and_normalise():
+    assert fmt.is_question("How to make espresso") and fmt.is_question("  does espresso stain")
+    assert not fmt.is_question("espresso how to") and not fmt.is_question("") and not fmt.is_question(None)
+    assert fmt.normalise_query("  How-To  make Espresso?! ") == "how to make espresso"
+
+
+def test_extract_questions_prioritises_and_dedupes():
+    rising = fmt.mark_breakouts([{"name": "How to make espresso", "value": 9000}, {"name": "espresso beans", "value": 50}])
+    top = [{"name": "how to make espresso?", "value": 100}, {"name": "what is crema", "value": 80}, {"name": "why espresso", "value": 10}]
+    out = fmt.extract_questions(("rising", rising), ("top", top), limit=2)
+    assert [q["question"] for q in out] == ["How to make espresso", "what is crema"]
+    assert out[0]["source"] == "rising" and out[0]["is_breakout"] is True and out[0]["value"] == 9000
+    assert out[1]["angle"] == "definition" and "is_breakout" not in out[1]
+
+
+def test_tag_angles_in_place():
+    items = [{"name": "best beans"}, {"name": "beans"}]
+    assert fmt.tag_angles(items) is items
+    assert [i["angle"] for i in items] == ["listicle", None]
+
+
+def test_limit_note():
+    assert v.limit_note(None, 25) is None
+    assert v.limit_note(25, 25) is None
+    assert v.limit_note(99, 50) == "limit 99 exceeds the maximum; clamped to 50."
+    assert v.limit_note(99, 50, name="max_per_seed").startswith("max_per_seed 99")
+
+
+def test_growth_windows_need_time_index_and_span():
+    short = pd.Series([1.0, 2.0, 3.0, 4.0], index=pd.date_range("2026-01-01", periods=4, freq="W"))
+    assert fmt._growth_windows(short) == {"growth_3m": None, "growth_12m": None}
+    no_time = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert fmt._growth_windows(no_time) == {"growth_3m": None, "growth_12m": None}
+    daily = pd.Series([10.0] * 100 + [20.0] * 91, index=pd.date_range("2026-01-01", periods=191, freq="D"))
+    out = fmt._growth_windows(daily)
+    assert out["growth_3m"] == 100.0 and out["growth_12m"] is None
+    zero_base = pd.Series([0.0] * 100 + [5.0] * 91, index=pd.date_range("2026-01-01", periods=191, freq="D"))
+    assert fmt._growth_windows(zero_base)["growth_3m"] is None
+
+
+def test_insight_sentences():
+    assert fmt._insight("k", [1.0], "insufficient_data", None, None).startswith("Too few")
+    assert "no measurable" in fmt._insight("k", [0.0, 0.0, 0.0], "no_interest", 0, "2026-01-01")
+    assert fmt._insight("k", [10.0, 10.0, 10.0], "stable", 10, "2026-01-01") == (
+        "Interest in 'k' held flat between the first and last third of the period, "
+        "peaking at 10 on 2026-01-01 (stable)."
+    )
+    assert "fell 50%" in fmt._insight("k", [20.0, 15.0, 10.0], "falling", 20, "d")
+    assert "appeared from zero" in fmt._insight("k", [0.0, 5.0, 10.0], "rising", 10, "d")
+
+
 def test_flatten_categories():
     tree = {
         "name": "All categories",

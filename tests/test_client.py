@@ -12,6 +12,12 @@ from unittest.mock import Mock, patch
 import pytest
 import requests
 from pytrends_modern import TrendReq
+from pytrends_modern.exceptions import (
+    DownloadError,
+    InvalidParameterError,
+    ResponseError,
+    TooManyRequestsError,
+)
 
 from trendzeist_mcp import server
 from trendzeist_mcp.client import Settings, TrendsClient, TrendsError
@@ -35,11 +41,21 @@ def _cookie_response() -> Mock:
     return resp
 
 
-def test_cookie_failure_never_prints_to_stdout(capsys):
+def test_cookie_network_failure_is_a_clear_retryable_error(capsys):
     with patch("requests.get", side_effect=requests.ConnectionError("offline")):
-        req = _client()._req()
-    assert req.cookies == {}
+        with pytest.raises(TrendsError) as exc:
+            _client().categories()
+    assert exc.value.retryable is True and "session cookie" in str(exc.value)
     assert capsys.readouterr().out == ""
+
+
+def test_cookie_http_error_fails_fast():
+    resp = Mock(status_code=503, url="u", text="")
+    resp.cookies = requests.cookies.RequestsCookieJar()
+    with patch("requests.get", return_value=resp):
+        with pytest.raises(TrendsError) as exc:
+            _client().categories()
+    assert exc.value.retryable is True and "503" in str(exc.value)
 
 
 def test_cookie_success_is_kept():
@@ -186,6 +202,124 @@ def test_rss_network_error_maps_to_retryable_trends_error():
         with pytest.raises(TrendsError) as exc:
             _client().trending_rss("US", 0)
     assert exc.value.retryable is True
+
+
+def test_rss_empty_feed_returns_no_items():
+    resp = Mock(text="<rss><channel></channel></rss>")
+    resp.raise_for_status = Mock()
+    with patch("requests.get", return_value=resp):
+        assert _client().trending_rss("US", 0) == []
+
+
+@pytest.mark.parametrize(
+    "raised, retryable, fragment",
+    [
+        (InvalidParameterError("bad geo"), False, "rejected the request parameters"),
+        (ResponseError("500"), True, "request failed"),
+        (DownloadError("dl"), True, "request failed"),
+        (requests.ConnectionError("net"), True, "request failed"),
+        (KeyError("widgets"), False, "Unexpected response"),
+        (ValueError("json"), False, "Unexpected response"),
+    ],
+)
+def test_guarded_maps_every_error_branch(raised, retryable, fragment):
+    c = _client()
+
+    def boom():
+        raise raised
+
+    with pytest.raises(TrendsError) as exc:
+        c._guarded(boom)
+    assert exc.value.retryable is retryable
+    assert fragment in str(exc.value)
+
+
+def test_guarded_rate_limit_resets_session():
+    c = _client()
+    c._trend_req = object()  # pretend a session exists
+
+    def boom():
+        raise TooManyRequestsError("quota")
+
+    with pytest.raises(TrendsError) as exc:
+        c._guarded(boom)
+    assert exc.value.retryable is True and c._trend_req is None
+
+
+def test_hl_follows_geo_unless_env_pins_it(monkeypatch):
+    monkeypatch.delenv("TRENDZEIST_HL", raising=False)
+    auto = Settings.from_env()
+    assert auto.auto_hl is True
+    assert auto.hl_for("BR") == "pt-BR" and auto.hl_for("BR-SP") == "pt-BR"
+    assert auto.hl_for("") == "en-US" and auto.hl_for("XX") == "en-US"
+
+    monkeypatch.setenv("TRENDZEIST_HL", "fr-FR")
+    pinned = Settings.from_env()
+    assert pinned.auto_hl is False and pinned.hl_for("BR") == "fr-FR"
+
+
+def test_explore_uses_geo_language_and_cache_key_reflects_it():
+    c = _client()
+    with patch("requests.get", return_value=_cookie_response()), patch.object(
+        TrendReq, "_get_tokens"
+    ):
+        req = c._explore(["cafe"], "today 3-m", "BR", 0, "")
+    assert req.hl == "pt-BR" and req.headers["accept-language"] == "pt-BR"
+    assert json.loads(req.token_payload["req"])["comparisonItem"][0]["geo"] == "BR"
+    assert req.token_payload["hl"] == "pt-BR"
+    assert "pt-BR" in c._explore_key("rq", geo="BR", kw="cafe")
+    assert "en-US" in c._explore_key("rq", geo="", kw="cafe")
+
+
+def _autocomplete_response(suggestions):
+    resp = Mock(status_code=200)
+    resp.raise_for_status = Mock()
+    resp.json = Mock(return_value=["q", suggestions])
+    return resp
+
+
+def test_autocomplete_is_throttled_localised_and_cached():
+    c = _client(proxies=["http://127.0.0.1:9999"])
+    throttled = []
+    c._throttle = lambda: throttled.append(1)  # type: ignore[method-assign]
+    with patch("requests.get", return_value=_autocomplete_response(["how to brew cafe"])) as get:
+        first = c.autocomplete("how to cafe", "BR")
+        second = c.autocomplete("How To Cafe", "BR")  # case-insensitive cache key
+    assert first == second == ["how to brew cafe"]
+    assert get.call_count == 1 and throttled == [1]
+    params = get.call_args.kwargs["params"]
+    assert params["hl"] == "pt-BR" and params["gl"] == "br" and params["client"] == "firefox"
+    assert get.call_args.kwargs["proxies"]["https"] == "http://127.0.0.1:9999"
+
+
+def test_autocomplete_429_and_bad_payload_map_to_trends_error():
+    resp = Mock(status_code=429, url="u", text="")
+    with patch("requests.get", return_value=resp):
+        with pytest.raises(TrendsError) as exc:
+            _client().autocomplete("x")
+    assert exc.value.retryable is True
+
+    with patch("requests.get", return_value=_autocomplete_response("not-a-list")):
+        with pytest.raises(TrendsError, match="Unexpected response"):
+            _client().autocomplete("y")
+
+
+def test_call_meta_counts_requests_and_cache_hits():
+    c = _client()
+    c.begin_call()
+    with patch("requests.get", return_value=_autocomplete_response(["a"])):
+        c.autocomplete("x")
+    meta = c.call_meta()
+    assert meta == {"requests_made": 1, "cache_hit": False, "cache_hits": 0, "cache_misses": 1}
+
+    c.begin_call()
+    c.autocomplete("x")
+    assert c.call_meta() == {
+        "requests_made": 0,
+        "cache_hit": True,
+        "cache_hits": 1,
+        "cache_misses": 0,
+    }
 
 
 def test_get_client_is_a_thread_safe_singleton(monkeypatch):

@@ -171,3 +171,10 @@ def validate_limit(limit: int, *, default: int, maximum: int) -> int:
     if limit < 1:
         raise ValidationError("limit must be >= 1")
     return min(limit, maximum)
+
+
+def limit_note(requested: int | None, effective: int, *, name: str = "limit") -> str | None:
+    """Explain a silent clamp to the model, or ``None`` when nothing was clamped."""
+    if requested is None or requested == effective:
+        return None
+    return f"{name} {requested} exceeds the maximum; clamped to {effective}."
