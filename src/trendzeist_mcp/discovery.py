@@ -6,7 +6,8 @@ from typing import Any
 
 from . import formatters as fmt
 from . import validation as v
-from .client import TrendsClient, TrendsError
+from .client import TrendsError
+from .sources import Hub
 
 _SIGNAL_ORDER = {"breakout": 0, "rising": 1, "evergreen": 2}
 
@@ -22,7 +23,7 @@ def _momentum(signal: str, value: float | int | None) -> float:
 
 
 def discover_topics(
-    client: TrendsClient,
+    hub: Hub,
     seed_keywords: list[str],
     geo: str = "",
     timeframe: str = "today 3-m",
@@ -55,11 +56,11 @@ def discover_topics(
     # Once Google starts refusing (429 / transport failure) we stop sending new
     # requests, but still serve seeds whose related queries are already cached.
     cooling_down = False
-    has_cache = getattr(client, "has_cached_related_queries", None)
+    has_cache = getattr(hub.trends, "has_cached_related_queries", None)
 
     directions: dict[str, Any] = {}
     try:
-        iot = fmt.interest_over_time(client.interest_over_time(seeds, tf, g, cat, gp), seeds)
+        iot = fmt.interest_over_time(hub.trends.interest_over_time(seeds, tf, g, cat, gp), seeds)
         directions = iot["summary"]
     except TrendsError as exc:
         errors.append({"step": "interest_over_time", "error": str(exc)})
@@ -75,7 +76,7 @@ def discover_topics(
             seed_reports.append(report)
             continue
         try:
-            res = client.related_queries(seed, tf, g, cat, gp)
+            res = hub.trends.related_queries(seed, tf, g, cat, gp)
         except TrendsError as exc:
             report["error"] = str(exc)
             errors.append({"step": f"related_queries:{seed}", "error": str(exc)})
@@ -137,7 +138,7 @@ def discover_topics(
         c.pop("momentum", None)
         c["angle"] = fmt.classify_angle(c["topic"]) or ("news" if c["signal"] == "breakout" else None)
 
-    settings = getattr(client, "settings", None)
+    settings = getattr(hub, "settings", None)
     hl_for = getattr(settings, "hl_for", None)
 
     out: dict[str, Any] = {

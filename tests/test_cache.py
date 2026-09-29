@@ -98,13 +98,28 @@ def test_disk_writes_use_unique_temp_files(tmp_path, monkeypatch):
     assert _TTLCache(tmp_path).get("k") in ("x" * 500, "y")
 
 
-def test_memory_cache_is_bounded(monkeypatch):
-    monkeypatch.setattr(client_mod, "MAX_MEMORY_ENTRIES", 10)
-    c = _TTLCache(None)
+def test_memory_cache_is_bounded():
+    c = _TTLCache(None, max_entries=10)
     for i in range(50):
         c.set(str(i), i, ttl=60)
     assert len(c._data) == 10
     assert c.get("49") == 49 and c.get("0") is None
+    assert _TTLCache(None)._max_entries == client_mod.MAX_MEMORY_ENTRIES
+
+
+def test_cache_stats(tmp_path):
+    c = _TTLCache(tmp_path, max_entries=5)
+    c.set("a", 1, ttl=60)
+    st = c.stats()
+    assert st == {
+        "dir": str(tmp_path),
+        "disk_enabled": True,
+        "memory_entries": 1,
+        "max_memory_entries": 5,
+        "disk_files": 1,
+    }
+    assert _TTLCache(None).stats()["disk_enabled"] is False
+    assert _TTLCache(None).stats()["disk_files"] is None
 
 
 def test_expired_disk_files_are_swept(tmp_path, monkeypatch):

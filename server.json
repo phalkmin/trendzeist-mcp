@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.phalkmin/trendzeist-mcp",
   "title": "Trendzeist – Google Trends for content ideation",
-  "description": "Free Google Trends MCP: ranked breakout/rising/evergreen topics for content ideas. No API key.",
-  "version": "0.3.0",
+  "description": "Free, keyless MCP for content ideation and AEO: Google Trends topics and questions, Google News coverage, Wikipedia attention, an AEO opportunity finder and citable-answer briefs. No API key.",
+  "version": "0.4.0",
   "websiteUrl": "https://github.com/phalkmin/trendzeist-mcp",
   "repository": {
     "url": "https://github.com/phalkmin/trendzeist-mcp",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "trendzeist-mcp",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [
@@ -30,6 +30,13 @@
           "isRequired": false,
           "format": "number",
           "default": "2.0"
+        },
+        {
+          "name": "TRENDZEIST_WIKI_MIN_INTERVAL",
+          "description": "Minimum seconds between requests to Wikimedia (separate lane from Google).",
+          "isRequired": false,
+          "format": "number",
+          "default": "0.5"
         },
         {
           "name": "TRENDZEIST_PROXIES",

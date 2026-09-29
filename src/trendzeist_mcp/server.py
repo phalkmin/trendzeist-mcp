@@ -12,8 +12,11 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__, tools
-from .client import TrendsClient, TrendsError
+from . import formatters as fmt
+from .aeo import aeo_opportunities as _aeo_opportunities
+from .client import TrendsError
 from .discovery import discover_topics as _discover_topics
+from .sources import Hub
 from .validation import ValidationError
 
 logging.basicConfig(
@@ -25,38 +28,41 @@ server = MCPServer(
     name="trendzeist",
     version=__version__,
     instructions=(
-        "Google Trends data for topic discovery, blog ideation and answer-engine (AEO) "
-        "content. Start with discover_topics for candidate ideas (it also returns "
-        "question-shaped searches and a title angle per topic), expand questions with "
-        "mine_questions, then validate finalists with interest_over_time / "
-        "compare_keywords (summary includes growth_3m/growth_12m and a plain-English "
-        "insight). gprop='news' or 'youtube' shows what news outlets and video "
-        "audiences care about - the channels answer engines cite most. Timeframes: "
+        "Free, keyless content-ideation and answer-engine (AEO) data from Google Trends, "
+        "Google Autocomplete, Google News and Wikipedia. Workflow: discover_topics for "
+        "ranked ideas (with question-shaped searches and a title angle each) -> "
+        "mine_questions to expand questions -> aeo_opportunities to cluster questions by "
+        "seed and angle with trend, news coverage, Wikipedia presence and citability hints "
+        "-> validate finalists with interest_over_time / compare_keywords (use the summary's "
+        "insight and growth_3m/growth_12m) -> news_coverage for who to quote or pitch and "
+        "wiki_attention for the definition anchor (or the gap to fill). gprop='news' or "
+        "'youtube' shows what outlets and video audiences care about. Timeframes: "
         "'now 7-d', 'today 1-m', 'today 3-m', 'today 12-m', 'today 5-y', 'all' or "
-        "'YYYY-MM-DD YYYY-MM-DD'. Geo: '' (worldwide), ISO country ('US', 'BR') or "
-        "region ('US-CA'); results come back in the market's language unless "
-        "TRENDZEIST_HL is set. Every result carries schema_version and _meta "
-        "(requests_made, cache_hit). Google rate-limits aggressively: prefer few, "
-        "well-targeted calls, and slow down when _meta.requests_made is high."
+        "'YYYY-MM-DD YYYY-MM-DD'. Geo: '' (worldwide), ISO country ('US', 'BR') or region "
+        "('US-CA'); results come back in the market's language unless TRENDZEIST_HL is set. "
+        "Every result carries schema_version and _meta (requests_made, cache_hit). Google "
+        "rate-limits aggressively: prefer few, well-targeted calls, slow down when "
+        "_meta.requests_made is high, and check trendzeist_status (free) when a source "
+        "misbehaves."
     ),
 )
 
-_client: TrendsClient | None = None
-_client_lock = threading.Lock()
+_hub: Hub | None = None
+_hub_lock = threading.Lock()
 
 
-def get_client() -> TrendsClient:
-    """Return the process-wide client; MCP runs sync tools on worker threads."""
-    global _client
-    if _client is None:
-        with _client_lock:
-            if _client is None:
-                _client = TrendsClient()
-    return _client
+def get_hub() -> Hub:
+    """Return the process-wide hub; MCP runs sync tools on worker threads."""
+    global _hub
+    if _hub is None:
+        with _hub_lock:
+            if _hub is None:
+                _hub = Hub()
+    return _hub
 
 
 def _tool(fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
-    """Inject the shared client and convert domain errors into tool errors.
+    """Inject the shared hub and convert domain errors into tool errors.
 
     mcp 2.x only forwards ``ToolError`` messages to the model; any other
     exception is reported as an opaque crash, so we translate explicitly.
@@ -64,12 +70,12 @@ def _tool(fn: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
 
     @wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        client = get_client()
-        begin = getattr(client, "begin_call", None)
-        if callable(begin):
-            begin()
         try:
-            return tools.finalize(client, fn(client, *args, **kwargs))
+            hub = get_hub()
+            begin = getattr(hub, "begin_call", None)
+            if callable(begin):
+                begin()
+            return tools.finalize(hub, fn(hub, *args, **kwargs))
         except ValidationError as exc:
             raise ToolError(f"Invalid argument: {exc}") from exc
         except TrendsError as exc:
@@ -200,6 +206,44 @@ def mine_questions(seed: str, geo: str = "", limit: int = 30) -> dict[str, Any]:
     return _tool(tools.mine_questions)(seed, geo, limit)
 
 
+@server.tool()
+def aeo_opportunities(
+    seeds: list[str], geo: str = "", timeframe: str = "today 3-m", limit: int = 10
+) -> dict[str, Any]:
+    """AEO opportunity finder. For 1-5 seeds: question-shaped searches (Trends + a
+    capped Autocomplete pass) clustered by seed and title angle, each scored with
+    seed trend direction, Google News coverage (who to quote / pitch), Wikipedia
+    presence and the evidence type that makes the answer citable. Up to ~1+10
+    requests per seed; partial failures per source in `errors`. limit: clusters (1-25)."""
+    return _tool(_aeo_opportunities)(seeds, geo, timeframe, limit)
+
+
+@server.tool()
+def news_coverage(topic: str, geo: str = "US", limit: int = 10) -> dict[str, Any]:
+    """Who is covering a topic in Google News: recent headlines, a publisher
+    frequency table (mention / pitch targets) and a recency histogram with a
+    coverage label. One request, cached 15 min. limit = headlines returned (1-50)."""
+    return _tool(tools.news_coverage)(topic, geo, limit)
+
+
+@server.tool()
+def wiki_attention(topic: str, lang: str = "en", days: int = 30) -> dict[str, Any]:
+    """Does Wikipedia have an exact-title article for a topic, and is attention growing?
+    Exact article (title, encoded URL, wordcount), daily pageviews for `days` (7-90)
+    with direction / growth / insight, or has_article=false with a related_article
+    suggestion (when search finds a different title); verify gaps before citing.
+    lang = Wikipedia edition ('en', 'pt', 'de'). Own rate lane; cached 24 h."""
+    return _tool(tools.wiki_attention)(topic, lang, days)
+
+
+@server.tool()
+def trendzeist_status() -> dict[str, Any]:
+    """Health of every data source (google_trends, google_autocomplete, google_news,
+    wikipedia: live / error / idle with the last error), cache usage and effective
+    settings. Free: makes no network requests."""
+    return _tool(tools.trendzeist_status)()
+
+
 @server.prompt()
 def blog_ideas_from_trends(topic: str, audience: str = "general readers", geo: str = "") -> str:
     """Guided workflow: turn Google Trends data into a prioritised list of blog post ideas."""
@@ -225,6 +269,73 @@ def blog_ideas_from_trends(topic: str, audience: str = "general readers", geo: s
         "(breakout/rising/evergreen with numbers), suggested publish timing, and a "
         "one-line rationale. Rank by opportunity. Be explicit when data was "
         "unavailable rather than guessing."
+    )
+
+
+@server.prompt()
+def answer_brief(question: str, geo: str = "") -> str:
+    """Citable-answer brief for one question: direct answer, statistic, quote, sources, FAQ, schema (GEO structure)."""
+    angle = fmt.classify_angle(question) or "how-to"
+    hints = fmt.citability_hints(angle)
+    where = geo or "worldwide"
+    news_geo = geo or "US"
+    return (
+        f"You are writing the answer that answer engines will cite for: '{question}' "
+        f"(market: {where}; angle: {angle}).\n\n"
+        "Research (few calls, reuse results):\n"
+        f"1. mine_questions(seed=<the 2-3 word topic inside the question>, geo='{geo}', limit=15) "
+        "to confirm the phrasing people use and collect 3 FAQ follow-ups.\n"
+        f"2. news_coverage(topic=<same>, geo='{news_geo}') to take one dated headline and "
+        "publisher to quote, and to see who covers the topic.\n"
+        "3. wiki_attention(topic=<same>) - if has_article, cite the exact-title article "
+        "as a definition anchor; otherwise verify the related hit or possible gap.\n"
+        "4. Optional: interest_over_time([<topic>], 'today 12-m') for a growth statistic; use "
+        "the summary's insight sentence verbatim.\n\n"
+        "Write, in this order:\n"
+        "- Direct answer: 40-60 words; the first sentence answers the question outright.\n"
+        f"- Evidence for a {angle} answer: {', '.join(hints['evidence'])}. "
+        f"Structure: {hints['structure']}.\n"
+        "- One statistic with its source and date.\n"
+        "- One quotation (expert, publisher or primary source) with attribution.\n"
+        f"- Sources to cite (3-5): {hints['cite']}.\n"
+        "- FAQ: 3 follow-up questions from mine_questions, each answered in 1-2 sentences.\n"
+        "- Schema: the FAQPage (and HowTo, if there are steps) JSON-LD fields to add.\n\n"
+        "Rules: never invent statistics or quotes - if research returned none, say exactly what "
+        "to look up. Plain, fluent language; no keyword stuffing (it does not help answer engines)."
+    )
+
+
+@server.prompt()
+def content_brief(topic: str, audience: str = "general readers", geo: str = "") -> str:
+    """Full content brief for a topic: titles, H2 outline, FAQ, regions, evidence checklist, publishers to pitch."""
+    where = geo or "worldwide"
+    news_geo = geo or "US"
+    resolution = "COUNTRY" if not geo else "REGION"
+    return (
+        f"You are a content strategist preparing a brief on '{topic}' for {audience} "
+        f"(market: {where}).\n\n"
+        "Research:\n"
+        f"1. discover_topics(seed_keywords=[1-3 seeds from '{topic}'], geo='{geo}', "
+        "timeframe='today 3-m'): the ranked topics become H2 candidates; note angle and signal.\n"
+        f"2. mine_questions(seed=<strongest seed>, geo='{geo}', limit=20): FAQ candidates.\n"
+        f"3. interest_by_region([<strongest seed>], geo='{geo}', resolution='{resolution}'): "
+        "where demand lives.\n"
+        f"4. news_coverage(topic=<strongest seed>, geo='{news_geo}'): publishers to quote or "
+        "pitch, and a dated headline if the angle is news.\n"
+        "5. wiki_attention(topic=<strongest seed>): cite a confirmed article, or verify "
+        "a related hit or possible gap.\n"
+        "6. Validate the 2-3 headline angles with compare_keywords (timeframe 'today 12-m'); "
+        "quote the insight sentences rather than computing numbers.\n\n"
+        "Output:\n"
+        "- 3 title options, each with its angle and the keyword it targets.\n"
+        "- H2 outline (6-10 sections) built from the discovered topics, ordered breakout > "
+        "rising > evergreen, one line on what each section must answer.\n"
+        "- FAQ block: 5-8 questions from mine_questions with one-sentence answers to draft.\n"
+        "- Evidence checklist per angle (steps + numbers for how-to, table + quotes for "
+        "comparison, cited definition for definition, dated publisher quotes for news).\n"
+        "- Target regions and the language to write in.\n"
+        "- Publishers / outlets to quote or pitch, from news_coverage.\n"
+        "- Publish timing from the trend signals, and what data was unavailable."
     )
 
 

@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 import pytest
 
@@ -203,3 +205,75 @@ def test_flatten_categories():
     rows = fmt.flatten_categories(tree)
     assert {"id": 916, "name": "Coffee & Tea", "path": "Food & Drink > Coffee & Tea"} in rows
     assert rows[0]["id"] == 0
+
+
+def test_interest_over_time_respects_max_points():
+    idx = pd.date_range("2025-01-01", periods=200, freq="D")
+    df = pd.DataFrame({"x": range(200)}, index=idx)
+    assert len(fmt.interest_over_time(df, ["x"])["points"]) <= fmt.MAX_SERIES_POINTS
+    out = fmt.interest_over_time(df, ["x"], max_points=10)
+    assert len(out["points"]) == 10 and out["downsampled"] is True
+
+
+def _articles(now):
+    def ts(hours):
+        return (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return [
+        {"title": "a", "publisher": "The Manual", "url": None, "published": ts(2)},
+        {"title": "b", "publisher": "The Manual", "url": None, "published": ts(50)},
+        {"title": "c", "publisher": "TechRadar", "url": None, "published": ts(24 * 20)},
+        {"title": "d", "publisher": "Tribune", "url": None, "published": ts(24 * 45)},
+        {"title": "e", "publisher": None, "url": None, "published": None},
+    ]
+
+
+def test_publisher_table_and_recency_and_coverage():
+    now = datetime(2026, 9, 19, 12, 0, tzinfo=timezone.utc)
+    arts = _articles(now)
+    table = fmt.publisher_table(arts, limit=2)
+    assert table == [
+        {"publisher": "The Manual", "articles": 2, "share_pct": 40.0},
+        {"publisher": "TechRadar", "articles": 1, "share_pct": 20.0},
+    ]
+    rec = fmt.recency_histogram(arts, now=now)
+    assert (rec["last_24h"], rec["last_7d"], rec["last_30d"], rec["older"], rec["undated"]) == (
+        1, 2, 3, 1, 1,
+    )
+    assert rec["newest"] == "2026-09-19T10:00:00Z" and rec["oldest"] == "2026-08-05T12:00:00Z"
+    assert fmt.coverage_level(rec) == "low"
+    assert fmt.coverage_level({"last_30d": 0}) == "none"
+    assert fmt.coverage_level({"last_30d": 12}) == "moderate"
+    assert fmt.coverage_level({"last_30d": 20}) == "high"
+    assert fmt.recency_histogram([])["newest"] is None
+
+
+def test_validate_lang():
+    assert v.validate_lang(" EN ") == "en" and v.validate_lang("pt") == "pt"
+    assert v.validate_lang("zh-yue") == "zh-yue"
+    assert v.validate_lang("simple") == "simple"
+    for bad in ("", "e", "en_US", "en.wikipedia.org", "x" * 20):
+        with pytest.raises(v.ValidationError):
+            v.validate_lang(bad)
+
+
+def test_pageview_summary():
+    pts = [{"date": f"2026-09-{d:02d}", "views": 100 + 10 * d} for d in range(1, 10)]
+    s = fmt.pageview_summary(pts, "Espresso")
+    assert s["days"] == 9 and s["total"] == 1350 and s["daily_mean"] == 150.0
+    assert s["peak"] == 190 and s["peak_date"] == "2026-09-09"
+    assert s["direction"] == "rising" and s["growth_pct"] == pytest.approx(50.0, abs=0.1)
+    assert s["insight"].startswith("Interest in 'Espresso' rose")
+    empty = fmt.pageview_summary([], "x")
+    assert empty["days"] == 0 and empty["direction"] == "insufficient_data"
+    assert empty["growth_pct"] is None
+
+
+def test_citability_hints_cover_every_angle_and_copy():
+    for angle in fmt.ANGLES:
+        h = fmt.citability_hints(angle)
+        assert set(h) == {"evidence", "structure", "cite"} and len(h["evidence"]) == 3
+    assert fmt.citability_hints(None) == fmt.citability_hints("how-to")
+    fmt.citability_hints("news")["evidence"].append("x")
+    assert len(fmt.CITABILITY_HINTS["news"]["evidence"]) == 3  # returned a copy
+

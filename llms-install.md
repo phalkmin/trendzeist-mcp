@@ -58,15 +58,23 @@ Add an `"env"` object next to `args` only if the user asks:
 | `TRENDZEIST_TZ` | `360` | Timezone offset in minutes |
 | `TRENDZEIST_MIN_INTERVAL` | `2.0` | Seconds between Google requests; raise if 429s occur |
 | `TRENDZEIST_CACHE_DIR` | OS cache dir | Persistent cache location; `off` disables |
+| `TRENDZEIST_WIKI_MIN_INTERVAL` | `0.5` | Seconds between Wikimedia requests (own lane) |
+| `TRENDZEIST_EXPLORE_TTL` | `900` | Cache seconds for Trends explore and News search |
+| `TRENDZEIST_RSS_TTL` | `300` | Cache seconds for the trending RSS feed |
+| `TRENDZEIST_STATIC_TTL` | `86400` | Cache seconds for categories, Autocomplete, Wikipedia |
+| `TRENDZEIST_MAX_MEMORY_ENTRIES` | `256` | In-memory cache entries |
+| `TRENDZEIST_MAX_SERIES_POINTS` | `60` | Max points per interest curve |
 | `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs |
 | `TRENDZEIST_LOG_LEVEL` | `WARNING` | Logging to stderr |
 
 ## 4. Verify
 
-Restart the client. The server exposes 9 tools (`discover_topics`,
+Restart the client. The server exposes 14 tools (`discover_topics`, `mine_questions`,
+`aeo_opportunities`, `news_coverage`, `wiki_attention`, `trendzeist_status`,
 `interest_over_time`, `compare_keywords`, `related_queries`, `related_topics`,
-`interest_by_region`, `suggest_keywords`, `trending_now`, `list_categories`) and
-one prompt (`blog_ideas_from_trends`). A good first call:
+`interest_by_region`, `suggest_keywords`, `trending_now`, `list_categories`) and three
+prompts (`blog_ideas_from_trends`, `content_brief`, `answer_brief`).
+`trendzeist_status` makes no network calls and is a good smoke test. A good first call:
 
 ```
 discover_topics(seed_keywords=["espresso"], geo="US")

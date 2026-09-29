@@ -5,12 +5,14 @@ HTTP is mocked at the ``requests`` level so the dependency's own code paths
 """
 
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 import pytest
 import requests
+from mcp.server.mcpserver.exceptions import ToolError
 from pytrends_modern import TrendReq
 from pytrends_modern.exceptions import (
     DownloadError,
@@ -20,7 +22,8 @@ from pytrends_modern.exceptions import (
 )
 
 from trendzeist_mcp import server
-from trendzeist_mcp.client import Settings, TrendsClient, TrendsError
+from trendzeist_mcp.client import CallStats, Lane, Settings, Source, TrendsClient, TrendsError, _TTLCache
+from trendzeist_mcp.sources import Hub
 
 RSS_XML = (
     '<rss><channel><item><title>espresso</title><ht:approx_traffic '
@@ -29,9 +32,13 @@ RSS_XML = (
 )
 
 
-def _client(**kw) -> TrendsClient:
+def _hub(**kw) -> Hub:
     settings = Settings(min_interval=kw.pop("min_interval", 0), **kw)
-    return TrendsClient(settings, cache_dir=None)
+    return Hub(settings, cache_dir=None)
+
+
+def _client(**kw) -> TrendsClient:
+    return _hub(**kw).trends
 
 
 def _cookie_response() -> Mock:
@@ -279,12 +286,13 @@ def _autocomplete_response(suggestions):
 
 
 def test_autocomplete_is_throttled_localised_and_cached():
-    c = _client(proxies=["http://127.0.0.1:9999"])
+    hub = _hub(proxies=["http://127.0.0.1:9999"])
+    ac = hub.autocomplete
     throttled = []
-    c._throttle = lambda: throttled.append(1)  # type: ignore[method-assign]
+    ac._throttle = lambda: throttled.append(1)  # type: ignore[method-assign]
     with patch("requests.get", return_value=_autocomplete_response(["how to brew cafe"])) as get:
-        first = c.autocomplete("how to cafe", "BR")
-        second = c.autocomplete("How To Cafe", "BR")  # case-insensitive cache key
+        first = ac.suggest("how to cafe", "BR")
+        second = ac.suggest("How To Cafe", "BR")  # case-insensitive cache key
     assert first == second == ["how to brew cafe"]
     assert get.call_count == 1 and throttled == [1]
     params = get.call_args.kwargs["params"]
@@ -295,26 +303,27 @@ def test_autocomplete_is_throttled_localised_and_cached():
 def test_autocomplete_429_and_bad_payload_map_to_trends_error():
     resp = Mock(status_code=429, url="u", text="")
     with patch("requests.get", return_value=resp):
-        with pytest.raises(TrendsError) as exc:
-            _client().autocomplete("x")
+        with pytest.raises(TrendsError, match="Google Autocomplete rate limit") as exc:
+            _hub().autocomplete.suggest("x")
     assert exc.value.retryable is True
 
     with patch("requests.get", return_value=_autocomplete_response("not-a-list")):
-        with pytest.raises(TrendsError, match="Unexpected response"):
-            _client().autocomplete("y")
+        with pytest.raises(TrendsError, match="Unexpected response from Google Autocomplete"):
+            _hub().autocomplete.suggest("y")
 
 
 def test_call_meta_counts_requests_and_cache_hits():
-    c = _client()
-    c.begin_call()
+    hub = _hub()
+    ac = hub.autocomplete
+    hub.begin_call()
     with patch("requests.get", return_value=_autocomplete_response(["a"])):
-        c.autocomplete("x")
-    meta = c.call_meta()
+        ac.suggest("x")
+    meta = hub.call_meta()
     assert meta == {"requests_made": 1, "cache_hit": False, "cache_hits": 0, "cache_misses": 1}
 
-    c.begin_call()
-    c.autocomplete("x")
-    assert c.call_meta() == {
+    hub.begin_call()
+    ac.suggest("x")
+    assert hub.call_meta() == {
         "requests_made": 0,
         "cache_hit": True,
         "cache_hits": 1,
@@ -322,7 +331,18 @@ def test_call_meta_counts_requests_and_cache_hits():
     }
 
 
-def test_get_client_is_a_thread_safe_singleton(monkeypatch):
+def test_hub_lanes_and_source_names():
+    hub = _hub()
+    assert hub.autocomplete._lane is hub.trends._lane  # both Google
+    assert hub.news._lane is hub.trends._lane
+    assert hub.wikipedia._lane is not hub.trends._lane
+    assert [s["name"] for s in hub.statuses()] == [
+        "google_trends", "google_autocomplete", "google_news", "wikipedia"
+    ]
+    assert not hasattr(hub.trends, "autocomplete")
+
+
+def test_get_hub_is_a_thread_safe_singleton(monkeypatch):
     created: list[object] = []
 
     def slow_construct() -> object:
@@ -330,9 +350,128 @@ def test_get_client_is_a_thread_safe_singleton(monkeypatch):
         created.append(object())
         return created[-1]
 
-    monkeypatch.setattr(server, "_client", None)
-    monkeypatch.setattr(server, "TrendsClient", slow_construct)
+    monkeypatch.setattr(server, "_hub", None)
+    monkeypatch.setattr(server, "Hub", slow_construct)
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda _: server.get_client(), range(4)))
+        results = list(pool.map(lambda _: server.get_hub(), range(4)))
     assert len(created) == 1
     assert all(r is results[0] for r in results)
+
+
+_TUNABLE_ENV = (
+    "TRENDZEIST_EXPLORE_TTL", "TRENDZEIST_RSS_TTL", "TRENDZEIST_STATIC_TTL",
+    "TRENDZEIST_MAX_MEMORY_ENTRIES", "TRENDZEIST_MAX_SERIES_POINTS", "TRENDZEIST_WIKI_MIN_INTERVAL",
+)
+
+
+def test_settings_env_tunables(monkeypatch):
+    for name in _TUNABLE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    d = Settings.from_env()
+    assert (d.explore_ttl, d.rss_ttl, d.static_ttl) == (900, 300, 86400)
+    assert d.max_memory_entries == 256 and d.max_series_points == 60
+    assert d.wiki_min_interval == 0.5
+
+    monkeypatch.setenv("TRENDZEIST_EXPLORE_TTL", "60")
+    monkeypatch.setenv("TRENDZEIST_RSS_TTL", "30")
+    monkeypatch.setenv("TRENDZEIST_STATIC_TTL", "120")
+    monkeypatch.setenv("TRENDZEIST_MAX_MEMORY_ENTRIES", "12")
+    monkeypatch.setenv("TRENDZEIST_MAX_SERIES_POINTS", "24")
+    monkeypatch.setenv("TRENDZEIST_WIKI_MIN_INTERVAL", "1.5")
+    s = Settings.from_env()
+    assert (s.explore_ttl, s.rss_ttl, s.static_ttl) == (60, 30, 120)
+    assert s.max_memory_entries == 12 and s.max_series_points == 24 and s.wiki_min_interval == 1.5
+
+
+@pytest.mark.parametrize("name", [
+    "TRENDZEIST_EXPLORE_TTL", "TRENDZEIST_RSS_TTL", "TRENDZEIST_STATIC_TTL",
+    "TRENDZEIST_MAX_MEMORY_ENTRIES", "TRENDZEIST_MAX_SERIES_POINTS",
+])
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_positive_env_tunables_fail_with_actionable_error(monkeypatch, name, value):
+    for setting in _TUNABLE_ENV:
+        monkeypatch.delenv(setting, raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(TrendsError, match=f"{name} must be a positive integer"):
+        Settings.from_env()
+
+
+def test_bad_env_is_exposed_as_tool_error(monkeypatch):
+    monkeypatch.setenv("TRENDZEIST_MAX_SERIES_POINTS", "0")
+    monkeypatch.setattr(server, "_hub", None)
+    with pytest.raises(ToolError, match="TRENDZEIST_MAX_SERIES_POINTS must be a positive integer"):
+        server.trendzeist_status()
+
+
+def test_lane_spaces_requests():
+    lane = Lane(0.05)
+    t0 = time.monotonic()
+    lane.wait()
+    lane.wait()
+    assert time.monotonic() - t0 >= 0.05
+
+
+def test_lanes_are_independent_locks():
+    settings = Settings(min_interval=0)
+    cache, stats = _TTLCache(None), CallStats()
+    a = Source(settings, cache, Lane(0), stats)
+    b = Source(settings, cache, Lane(0), stats)
+    started, release = threading.Event(), threading.Event()
+
+    def slow():
+        started.set()
+        release.wait(2)
+        return 1
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(a._guarded, slow)
+        assert started.wait(1)
+        assert b._guarded(lambda: 2) == 2  # b's lane is free while a holds its lock
+        release.set()
+        assert fut.result() == 1
+
+
+def test_source_health_tracks_last_outcome():
+    s = Source(Settings(min_interval=0), _TTLCache(None), Lane(0), CallStats())
+    s.name, s.label = "probe", "Probe"
+    assert s.status()["state"] == "idle"
+    assert s._guarded(lambda: 1) == 1
+    assert s.status()["state"] == "live" and s.status()["last_success"].endswith("Z")
+
+    def boom():
+        raise requests.ConnectionError("down")
+
+    with pytest.raises(TrendsError):
+        s._guarded(boom)
+    st = s.status()
+    assert st["state"] == "error" and "Probe request failed" in st["last_error"]
+    time.sleep(0.01)
+    s._guarded(lambda: 1)
+    assert s.status()["state"] == "live" and s.status()["last_error"] is not None
+
+
+def test_hub_shares_cache_and_stats_and_uses_one_google_lane():
+    hub = _hub()
+    assert hub.trends._cache is hub.cache and hub.trends._stats is hub.stats
+    assert hub.trends.name == "google_trends"
+    assert hub.news._cache is hub.cache and hub.wikipedia._stats is hub.stats
+
+
+def test_source_get_maps_429_and_http_errors():
+    s = Source(Settings(min_interval=0), _TTLCache(None), Lane(0), CallStats())
+    with patch("requests.get", return_value=Mock(status_code=429, url="u", text="")):
+        with pytest.raises(TrendsError, match="429"):
+            s._guarded(lambda: s._get("https://x"))
+    not_found = Mock(status_code=404)
+    not_found.raise_for_status.side_effect = requests.HTTPError("404")
+    with patch("requests.get", return_value=not_found):
+        with pytest.raises(TrendsError, match="request failed"):
+            s._guarded(lambda: s._get("https://x"))
+        assert s._guarded(lambda: s._get("https://x", allow=(404,))).status_code == 404
+
+
+def test_rss_429_is_a_rate_limit_error():
+    resp = Mock(status_code=429, url="u", text="")
+    with patch("requests.get", return_value=resp):
+        with pytest.raises(TrendsError, match="Google Trends rate limit"):
+            _client().trending_rss("US", 0)

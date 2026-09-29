@@ -2,16 +2,21 @@
 
 ## What this is
 A Python MCP server (`mcp` SDK **2.x**, `MCPServer` API — not the 1.x `FastMCP`)
-wrapping `pytrends-modern` to expose Google Trends for content ideation.
+wrapping `pytrends-modern` (Google Trends) plus keyless Google Autocomplete, Google News RSS
+and Wikimedia sources for content ideation and AEO.
 
 ## Layout
 ```
 src/trendzeist_mcp/
-  server.py      MCP registration only (tools + prompt). Thin; delegates to tools.py.
-  tools.py       Tool logic. Pure functions taking a TrendsClient first. Unit-tested with a fake client.
+  server.py      MCP registration only (tools + prompts). Thin; delegates to tools.py / discovery.py / aeo.py.
+  tools.py       Tool logic. Pure functions taking a Hub first. Unit-tested with a fake hub.
   discovery.py   discover_topics composite (rank breakout > rising > evergreen).
-  client.py      TrendsClient: global lock, throttle, disk+memory TTL cache, error mapping -> TrendsError.
-  formatters.py  DataFrame -> compact JSON. Keep payloads small (LLM context).
+  aeo.py         aeo_opportunities composite (questions x trend x news x Wikipedia x citability).
+  client.py      Shared plumbing: Settings, TrendsError, _TTLCache, Lane (per-host lock+interval),
+                 CallStats, Source base (_get/_cached/_guarded/status) and TrendsClient (Google Trends).
+  sources.py     AutocompleteSource, GoogleNewsSource, WikipediaSource and Hub (composes all sources;
+                 hub.trends / hub.autocomplete / hub.news / hub.wikipedia).
+  formatters.py  DataFrame/list -> compact JSON; citability hints. Keep payloads small (LLM context).
   validation.py  Strict whitelists. Raise ValidationError with actionable text.
 tests/           Offline by default. tests/test_live_canary.py is `-m live` only.
 ```
@@ -19,11 +24,14 @@ tests/           Offline by default. tests/test_live_canary.py is `-m live` only
 ## Rules
 - **Errors to the model must be `ToolError`** (`mcp.server.mcpserver.exceptions`).
   Any other exception is hidden as an opaque "crash". `server._tool` does the translation.
-- Every new tool: validate in `validation.py` → implement in `tools.py` → register in
-  `server.py` → fake-client test in `tests/test_tools.py` → README table row.
-- Google traffic (Trends, RSS, Autocomplete) goes only through `TrendsClient._guarded` /
-  `_cached`, with `_throttle()` before every HTTP request; never call `TrendReq` or
-  `requests` directly from tools.
+- Every new tool: validate in `validation.py` → implement in `tools.py` (or a composite
+  module) → register in `server.py` → fake-hub test in `tests/test_tools.py` (extend
+  `FakeClient`, which stands in for every source) → README table row.
+- Upstream traffic (Google Trends, RSS, Autocomplete, News, Wikimedia) goes only through a
+  `Source` subclass: `Source._get` (or `_throttle()` before any other HTTP call) inside
+  `_cached` / `_guarded`; never call `TrendReq` or `requests` from tools. New upstream =
+  new `Source` subclass in `sources.py` + attribute on `Hub`; Google hosts share
+  `Hub._google`, others get their own `Lane`.
 - Keep outputs JSON-native (no numpy scalars, no Timestamps) — use `formatters._to_native`.
 - Every tool result gets `schema_version` + `_meta` via `tools.finalize` (called by
   `server._tool`). Bump `tools.SCHEMA_VERSION` only when a field is removed or changes

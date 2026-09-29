@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import pandas as pd
@@ -247,7 +249,9 @@ def _insight(kw: str, vals: list[float], direction: str, peak: Any, peak_date: A
     return f"{head}{tail} ({direction})."
 
 
-def interest_over_time(df: pd.DataFrame | None, keywords: Iterable[str]) -> dict[str, Any]:
+def interest_over_time(
+    df: pd.DataFrame | None, keywords: Iterable[str], max_points: int = MAX_SERIES_POINTS
+) -> dict[str, Any]:
     """Shape an interest_over_time frame into points + per-keyword summary."""
     kws = list(keywords)
     if df is None or df.empty:
@@ -291,7 +295,7 @@ def interest_over_time(df: pd.DataFrame | None, keywords: Iterable[str]) -> dict
             "insight": _insight(kw, vals, direction, peak, peak_date),
         }
 
-    sampled = _downsample(complete, MAX_SERIES_POINTS)
+    sampled = _downsample(complete, max_points)
     points: list[dict[str, Any]] = []
     for idx, row in sampled.iterrows():
         points.append(
@@ -376,3 +380,160 @@ def flatten_categories(tree: dict[str, Any] | None) -> list[dict[str, Any]]:
 
     walk(tree, [])
     return result
+
+
+# ---------------------------------------------------------------- Google News (A5)
+def publisher_table(articles: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Publisher frequency (mention / pitch targets) with share of all fetched articles."""
+    counts = Counter((a.get("publisher") or "unknown") for a in articles)
+    total = sum(counts.values()) or 1
+    return [
+        {"publisher": name, "articles": n, "share_pct": round(100.0 * n / total, 1)}
+        for name, n in counts.most_common(limit)
+    ]
+
+
+def recency_histogram(
+    articles: list[dict[str, Any]], now: datetime | None = None
+) -> dict[str, Any]:
+    """Cumulative age buckets (an article <24 h old counts in all three) plus range."""
+    now = now or datetime.now(timezone.utc)
+    out: dict[str, Any] = {
+        "last_24h": 0,
+        "last_7d": 0,
+        "last_30d": 0,
+        "older": 0,
+        "undated": 0,
+        "newest": None,
+        "oldest": None,
+    }
+    dated: list[str] = []
+    for a in articles:
+        raw = a.get("published")
+        if not raw:
+            out["undated"] += 1
+            continue
+        ts = datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        dated.append(raw)
+        age_days = (now - ts).total_seconds() / 86400.0
+        if age_days <= 1:
+            out["last_24h"] += 1
+        if age_days <= 7:
+            out["last_7d"] += 1
+        if age_days <= 30:
+            out["last_30d"] += 1
+        else:
+            out["older"] += 1
+    if dated:
+        out["newest"], out["oldest"] = max(dated), min(dated)
+    return out
+
+
+def coverage_level(recency: dict[str, Any]) -> str:
+    """Heuristic label from the 30-day count: none | low (<5) | moderate (<20) | high."""
+    n = int(recency.get("last_30d", 0) or 0)
+    if n == 0:
+        return "none"
+    if n < 5:
+        return "low"
+    if n < 20:
+        return "moderate"
+    return "high"
+
+
+# ---------------------------------------------------------------- Wikipedia (A6)
+def pageview_summary(points: list[dict[str, Any]], title: str) -> dict[str, Any]:
+    """Summarise daily Wikimedia pageviews: totals, peak, direction, growth, insight."""
+    views = [int(p["views"]) for p in points]
+    if not views:
+        return {
+            "days": 0,
+            "total": 0,
+            "daily_mean": None,
+            "peak": None,
+            "peak_date": None,
+            "direction": "insufficient_data",
+            "growth_pct": None,
+            "insight": f"No pageview data for '{title}' in this window.",
+        }
+    peak_i = max(range(len(views)), key=views.__getitem__)
+    direction = _direction([float(x) for x in views])
+    growth: float | None = None
+    third = max(1, len(views) // 3)
+    if len(views) >= 3:
+        first = sum(views[:third]) / third
+        last = sum(views[-third:]) / third
+        growth = _pct_change(first, last)
+    return {
+        "days": len(views),
+        "total": sum(views),
+        "daily_mean": round(sum(views) / len(views), 1),
+        "peak": views[peak_i],
+        "peak_date": points[peak_i]["date"],
+        "direction": direction,
+        "growth_pct": growth,
+        "insight": _insight(
+            title, [float(x) for x in views], direction, views[peak_i], points[peak_i]["date"]
+        ),
+    }
+
+
+# ---------------------------------------------------------------- citability (A12)
+# Roadmap A12: which evidence makes an answer citable, by title angle. From Aggarwal
+# et al., "GEO: Generative Engine Optimization" (KDD 2024): citing sources, adding
+# quotations and adding statistics each lifted visibility 30-40%, and the best evidence
+# type depends on the question type. Keyword stuffing and authoritative tone did nothing.
+CITABILITY_HINTS: dict[str, dict[str, Any]] = {
+    "how-to": {
+        "evidence": [
+            "numbered steps",
+            "a statistic per step (time, cost, yield)",
+            "one expert or manufacturer quote",
+        ],
+        "structure": "direct 40-60-word answer first, then the steps",
+        "cite": "primary sources: manuals, standards, peer-reviewed or manufacturer guidance",
+    },
+    "comparison": {
+        "evidence": [
+            "a side-by-side data table",
+            "quotes from reviews or users on both sides",
+            "a clear verdict with the deciding metric",
+        ],
+        "structure": "verdict first, then the table, then when each option wins",
+        "cite": "spec sheets, independent tests, dated price sources",
+    },
+    "listicle": {
+        "evidence": [
+            "the selection criterion stated up front",
+            "one statistic per item",
+            "one source per item",
+        ],
+        "structure": "numbered list, best first, one line of why per item",
+        "cite": "reviews, sales or usage data, expert round-ups",
+    },
+    "definition": {
+        "evidence": [
+            "a one-sentence definition",
+            "an origin or first-use fact",
+            "one authoritative quote",
+        ],
+        "structure": "definition first, then context, then examples",
+        "cite": "Wikipedia, dictionaries, standards bodies, the primary source",
+    },
+    "news": {
+        "evidence": [
+            "dated publisher quotes",
+            "the primary announcement or filing",
+            "numbers from the announcement",
+        ],
+        "structure": "what changed, when, who said so, what it means for the reader",
+        "cite": "the original announcement plus two independent outlets, with dates",
+    },
+}
+
+
+def citability_hints(angle: str | None) -> dict[str, Any]:
+    """Evidence recipe for an angle (falls back to how-to); returns a copy."""
+    hints = CITABILITY_HINTS.get(angle or "how-to", CITABILITY_HINTS["how-to"])
+    return {"evidence": list(hints["evidence"]), "structure": hints["structure"], "cite": hints["cite"]}
+

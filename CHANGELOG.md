@@ -4,7 +4,70 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0] - 2026-09-29
+
+"The AEO release": multi-source and still keyless. Find the questions people ask — and
+LLMs answer — then make your site the source they cite.
+
+### Added
+- **`aeo_opportunities(seeds, geo, timeframe, limit)`** — composite. Question-shaped
+  searches from Trends related queries plus a capped 5-prefix Autocomplete pass,
+  deduplicated and clustered by seed × title angle; each cluster scored (transparent
+  heuristic with `score_breakdown`) using the seed's trend direction, Google News coverage
+  (`top_publishers` to quote or pitch), Wikipedia presence and `citability_hints`. Partial
+  failures per source; Google requests stop at the first 429 while Wikipedia continues.
+- **`news_coverage(topic, geo, limit)`** — Google News search RSS: headlines, publisher
+  frequency table with shares, cumulative recency histogram, `coverage` label.
+- **`wiki_attention(topic, lang, days)`** — Wikipedia search + Wikimedia pageviews: best
+  article, daily views (7-90 days), direction, growth, insight, `has_article` gap flag.
+- **`trendzeist_status()`** — per-source health (live / error / idle with last error), cache
+  usage and effective settings. Makes no requests.
+- **Prompts** `answer_brief(question, geo)` (GEO-paper structure: 40-60-word answer,
+  statistic, quote, sources, FAQ, schema; evidence recipe picked from the question's angle)
+  and `content_brief(topic, audience, geo)` (titles, H2 outline, FAQ, regions, publishers).
+- **`SKILL.md`** — agent skill describing the discover → mine → opportunities → validate →
+  brief workflow and the rate-limit budget rules.
+- **Citability hints** table (`formatters.CITABILITY_HINTS`) — angle → evidence type,
+  structure and what to cite, from Aggarwal et al., *GEO* (KDD 2024).
+- **Env-tunable** `TRENDZEIST_EXPLORE_TTL`, `TRENDZEIST_RSS_TTL`, `TRENDZEIST_STATIC_TTL`,
+  `TRENDZEIST_MAX_MEMORY_ENTRIES`, `TRENDZEIST_MAX_SERIES_POINTS`,
+  `TRENDZEIST_WIKI_MIN_INTERVAL`.
+- `mine_questions` accepts a `prefixes` subset (library use; the MCP tool is unchanged).
+- Live canary probes Google News, Wikipedia and `trendzeist_status`.
+
+### Fixed
+- Wikipedia search results with a different title no longer count as confirmed topic
+  articles or citation anchors in `wiki_attention` / `aeo_opportunities`; surface them
+  as related suggestions instead. Inspect up to five search hits for an exact title,
+  and encode reserved characters in article URLs. `schema_version` is now `2` because
+  `has_article` has a stricter meaning; the package release version is unchanged.
+- Google News keeps its country edition (`hl`, `gl`, `ceid`) consistent when
+  `TRENDZEIST_HL` pins a different Trends UI language.
+- Reject non-positive or non-integer cache TTL, memory-entry and series-point env values
+  with actionable tool errors instead of crashing (including during hub startup).
+
+
+### Changed
+- **Source seam (internal).** `client.py` now holds the shared plumbing (`Source` base
+  class with per-host `Lane` throttling, shared cache, error mapping and health) and the
+  Google Trends implementation; `sources.py` adds `AutocompleteSource`, `GoogleNewsSource`,
+  `WikipediaSource` and the `Hub` that tools receive. Google hosts share one rate lane;
+  Wikimedia has its own. Error messages now name the failing source ("Google News request
+  failed", "Wikipedia rate limit reached").
+- Trending RSS and Autocomplete 429s are reported as rate-limit errors (previously a
+  generic request failure).
+- Server instructions and README describe the multi-source workflow; `schema_version`
+  remained `1` at initial 0.4.0 implementation (fields were only added; see Unreleased fix).
+
+### Library API (Python callers only)
+- `TrendsClient(settings, cache_dir)` → `Hub(settings, cache_dir)`; tools take a `Hub` and
+  read `hub.trends`, `hub.autocomplete`, `hub.news`, `hub.wikipedia`.
+  `TrendsClient.autocomplete()` → `hub.autocomplete.suggest()`.
+
+### Tests
+- `tests/test_sources.py` (News RSS parsing, Wikipedia search/pageviews/404, lanes, UA);
+  seam tests (lane independence, health states, `_get` mapping); fake-hub tests for every
+  new tool and both prompts. 134 offline tests.
 
 ## [0.3.0] - 2026-09-15
 

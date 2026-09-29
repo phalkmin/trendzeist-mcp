@@ -1,7 +1,7 @@
 [project]
 name = "trendzeist-mcp"
-version = "0.3.0"
-description = "Free, local Google Trends MCP server for content ideation: ranked breakout/rising/evergreen topics, interest over time, related queries. No API key, no browser."
+version = "0.4.0"
+description = "Free, local MCP server for content ideation and AEO: Google Trends topics and questions, Google News coverage, Wikipedia attention, an AEO opportunity finder. No API key, no browser."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -15,6 +15,10 @@ keywords = [
     "topic-discovery",
     "content-ideation",
     "seo",
+    "aeo",
+    "generative-engine-optimization",
+    "google-news",
+    "wikipedia",
     "blogging",
     "claude",
 ]
