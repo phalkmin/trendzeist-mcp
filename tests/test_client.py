@@ -405,10 +405,10 @@ def test_bad_env_is_exposed_as_tool_error(monkeypatch):
 
 def test_lane_spaces_requests():
     lane = Lane(0.05)
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
     lane.wait()
     lane.wait()
-    assert time.monotonic() - t0 >= 0.05
+    assert time.perf_counter() - t0 >= 0.05
 
 
 def test_lanes_are_independent_locks():
@@ -445,7 +445,6 @@ def test_source_health_tracks_last_outcome():
         s._guarded(boom)
     st = s.status()
     assert st["state"] == "error" and "Probe request failed" in st["last_error"]
-    time.sleep(0.01)
     s._guarded(lambda: 1)
     assert s.status()["state"] == "live" and s.status()["last_error"] is not None
 

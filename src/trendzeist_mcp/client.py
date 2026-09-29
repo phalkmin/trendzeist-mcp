@@ -313,14 +313,17 @@ class Lane:
     def __init__(self, min_interval: float) -> None:
         self.min_interval = min_interval
         self.lock = threading.Lock()
-        self._last_request = 0.0
+        self._last_request = float("-inf")
 
     def wait(self) -> None:
-        """Sleep until ``min_interval`` has passed since the previous request."""
-        wait = self.min_interval - (time.monotonic() - self._last_request)
+        """Sleep until ``min_interval`` has passed since the previous request.
+
+        ``perf_counter``, not ``monotonic``: on Windows before Python 3.13 the
+        latter ticks every ~15.6 ms, which lets the spacing fall short."""
+        wait = self.min_interval - (time.perf_counter() - self._last_request)
         if wait > 0:
             time.sleep(wait)
-        self._last_request = time.monotonic()
+        self._last_request = time.perf_counter()
 
 
 class CallStats:
@@ -373,6 +376,7 @@ class Source:
         self._last_success: float | None = None
         self._last_error: str | None = None
         self._last_error_at: float | None = None
+        self._last_ok: bool | None = None  # outcome order, not wall-clock order
 
     # ------------------------------------------------------------------ transport
     def _proxies(self) -> dict[str, str] | None:
@@ -412,6 +416,7 @@ class Source:
     # ------------------------------------------------------------------ health
     def _record(self, error: str | None) -> None:
         with self._health_lock:
+            self._last_ok = error is None
             if error is None:
                 self._last_success = time.time()
             else:
@@ -421,12 +426,10 @@ class Source:
         """live = last network call succeeded; error = it failed; idle = none yet."""
         with self._health_lock:
             ok_at, err, err_at = self._last_success, self._last_error, self._last_error_at
-        if ok_at is None and err_at is None:
-            state = "idle"
-        elif err_at is not None and (ok_at is None or err_at > ok_at):
-            state = "error"
-        else:
-            state = "live"
+            last_ok = self._last_ok
+        # Timestamps can tie (coarse Windows clocks), so the state comes from
+        # the last recorded outcome rather than comparing them.
+        state = "idle" if last_ok is None else "live" if last_ok else "error"
         return {
             "name": self.name,
             "label": self.label,
