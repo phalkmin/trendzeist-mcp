@@ -38,6 +38,8 @@ class FakeClient:
         self.calls: list[tuple] = []
         self.fail_seed = fail_seed
         self.autocomplete_fail: set[str] = set()
+        self.iot_timeframes: list[str] = []
+        self.raw_autocomplete_queries: list[str] = []
         self.trends = self
         self.autocomplete = self
         self.news = self
@@ -85,6 +87,8 @@ class FakeClient:
 
     # ---- Google Trends / Autocomplete fakes
     def suggest(self, query, geo=""):
+        self.raw_autocomplete_queries.append(query)
+        query = query.strip()  # the tool sends a trailing space (10.3); the fake ignores it
         self.calls.append(("ac", query, geo))
         if query in self.autocomplete_fail:
             raise TrendsError("429", retryable=True)
@@ -99,6 +103,7 @@ class FakeClient:
 
     def interest_over_time(self, keywords, tf, geo, cat, gprop):
         self.calls.append(("iot", tuple(keywords)))
+        self.iot_timeframes.append(tf)
         idx = pd.date_range("2026-01-04", periods=12, freq="W")
         data = {kw: [10 * (i + 1) * (n + 1) for i in range(12)] for n, kw in enumerate(keywords)}
         data["isPartial"] = [False] * 11 + [True]
@@ -153,8 +158,11 @@ def test_interest_over_time_tool():
     }
     s = out["summary"]["Espresso"]
     assert s["direction"] == "rising"
+    assert s["direction_now"] == "stable"  # linear ramp: last quarter is only +24%
     assert s["growth_3m"] is None and s["growth_12m"] is None  # 12 weeks: too short
-    assert s["insight"].startswith("Interest in 'Espresso' rose") and "(rising)" in s["insight"]
+    assert s["growth_note"] == fmt.GROWTH_NOTE
+    assert s["insight"].startswith("Interest in 'Espresso' rose")
+    assert s["insight"].endswith("and rose 24% in the last quarter of the period (stable).")
     assert tools.interest_over_time(FakeClient(), ["x"], geo="BR")["query"]["hl"] == "pt-BR"
 
 
@@ -272,6 +280,33 @@ def test_mine_questions_vs_prefix_and_rate_limit_partial():
     assert out["prefixes_queried"] == ["(seed)"]
 
 
+def test_mine_questions_drops_partial_word_completions():
+    """10.3: 'wordpress ai' must not yield 'wordpress airplay' / 'ain't' questions."""
+
+    class Completing(FakeClient):
+        def suggest(self, query, geo=""):
+            self.raw_autocomplete_queries.append(query)
+            return [
+                "why wordpress airplay not working",
+                "why wordpress ain't working",
+                "what is wordpress airtable",
+                "why wordpress ai is bad",
+                "what is wordpress AI, really",
+                "how to use wordpress ai plugins",
+            ]
+
+    client = Completing()
+    out = tools.mine_questions(client, "wordpress ai", limit=100, prefixes=("why", "vs"))
+    texts = [q["question"] for q in out["questions"]]
+    assert texts == [
+        "why wordpress ai is bad",
+        "what is wordpress AI, really",
+        "how to use wordpress ai plugins",
+    ]
+    # Every request ends with a space so Google suggests the next word.
+    assert client.raw_autocomplete_queries == ["wordpress ai ", "why wordpress ai ", "wordpress ai vs "]
+
+
 def test_mine_questions_reports_empty():
     class Silent(FakeClient):
         def suggest(self, query, geo=""):
@@ -336,6 +371,71 @@ def test_discover_topics_collects_questions_and_angles():
     assert discover_topics(QClient(), ["x"], max_per_seed=99)["note"].startswith("max_per_seed 99")
 
 
+class SpamClient(FakeClient):
+    """Rising list with an injected personal name (run-data 10.2) plus one real question."""
+
+    def related_queries(self, kw, tf, geo, cat, gprop):
+        self.calls.append(("rq", kw))
+        return {
+            "top": pd.DataFrame({"query": [f"{kw} cursor", f"install {kw}"], "value": [100, 40]}),
+            "rising": pd.DataFrame(
+                {
+                    "query": [
+                        f"codex vs {kw} abraham quiros villalba",
+                        "apple smartring abraham quiros villalba",
+                        "solar shingles vs solar panels abraham quiros villalba",
+                        "abrahamquirosvillalba .com",
+                        f"how to install {kw}",
+                        f"{kw} vs cursor",
+                    ],
+                    "value": [13400, 4550, 4500, 4250, 9000, 300],
+                }
+            ),
+        }
+
+
+def test_discover_topics_keeps_suspect_breakouts_out_of_ranking():
+    out = discover_topics(SpamClient(), ["claude code"])
+    topics = [t["topic"] for t in out["topics"]]
+    assert "codex vs claude code abraham quiros villalba" not in topics
+    assert "abrahamquirosvillalba .com" not in topics
+    assert out["topics"][0] == {
+        "topic": "how to install claude code", "signal": "breakout", "growth_pct": 9000,
+        "popularity": None, "source_seeds": ["claude code"], "angle": "how-to",
+    }
+    assert out["counts"] == {"breakout": 1, "rising": 1, "evergreen": 2, "questions": 1, "suspect": 4}
+    assert [s["topic"] for s in out["suspect"]][:1] == ["codex vs claude code abraham quiros villalba"]
+    assert out["suspect"][0]["is_breakout"] is True and "abraham quiros villalba" in out["suspect"][0]["reason"]
+    assert out["seeds"][0]["suspect_count"] == 4 and out["seeds"][0]["rising_count"] == 2
+    assert "suspect" in out["guidance"]
+    # A clean run has the key too (empty), so callers never KeyError.
+    clean = discover_topics(FakeClient(), ["espresso"])
+    assert clean["suspect"] == [] and clean["counts"]["suspect"] == 0
+
+
+def test_related_queries_flags_suspects_and_excludes_them_from_questions():
+    out = tools.related_queries(SpamClient(), "claude code")
+    flagged = [r["name"] for r in out["rising"] if r.get("suspect")]
+    assert len(flagged) == 4 and "abrahamquirosvillalba .com" in flagged
+    assert out["suspect_count"] == 4 and "suspect" in out["notes"]
+    assert [q["question"] for q in out["questions"]] == ["how to install claude code"]
+    assert "suspect_count" not in tools.related_queries(FakeClient(), "espresso")
+
+
+def test_aeo_opportunities_ignores_suspect_breakouts():
+    class SpamAeo(SpamClient):
+        def related_queries(self, kw, tf, geo, cat, gprop):
+            res = super().related_queries(kw, tf, geo, cat, gprop)
+            # make the spam item question-shaped so only the suspect filter can stop it
+            res["rising"].loc[0, "query"] = f"why {kw} abraham quiros villalba"
+            return res
+
+    out = aeo_opportunities(SpamAeo(), ["claude code"])
+    all_qs = [q for op in out["opportunities"] for q in op["questions"]]
+    assert not any("abraham" in q for q in all_qs)
+    assert any(q == "how to install claude code" for q in all_qs)
+
+
 def test_discover_topics_iot_non_retryable_failure_still_fetches_related():
     class IotBroken(FakeClient):
         def interest_over_time(self, keywords, tf, geo, cat, gprop):
@@ -392,16 +492,40 @@ def test_discover_topics_rate_limit_still_serves_cached_seeds():
     assert any(t["source_seeds"] == ["latte"] for t in out["topics"])
 
 
-def test_discover_topics_iot_rate_limit_stops_further_requests():
+def test_discover_topics_iot_rate_limit_still_tries_related_queries():
+    """10.5: the trend step is enrichment; its 429 must not kill the main output."""
+
     class IotFails(FakeClient):
         def interest_over_time(self, keywords, tf, geo, cat, gprop):
             raise TrendsError("429", retryable=True)
 
     client = IotFails()
     out = discover_topics(client, ["espresso", "latte"])
-    assert out["errors"][0]["step"] == "interest_over_time"
-    assert [c for c in client.calls if c[0] == "rq"] == []
-    assert all("skipped" in s for s in out["seeds"])
+    assert out["errors"] == [{"step": "interest_over_time", "error": "429"}]
+    assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso"), ("rq", "latte")]
+    assert all(s["trend"] == {"available": False} and "skipped" not in s for s in out["seeds"])
+    assert out["counts"]["breakout"] == 2
+
+
+def test_discover_topics_iot_then_related_429_enters_cooldown():
+    class BothFail(FakeClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            raise TrendsError("429", retryable=True)
+
+    client = BothFail(fail_seed="espresso")
+    out = discover_topics(client, ["espresso", "latte", "mocha"])
+    assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso")]
+    assert out["seeds"][1]["skipped"].endswith("Retry in ~60 s with 1-2 seeds.")
+    assert "skipped" in out["seeds"][2] and out["topics"] == []
+
+
+def test_discover_topics_trend_context_uses_12_months():
+    client = FakeClient()
+    out = discover_topics(client, ["espresso"], timeframe="today 3-m")
+    assert out["query"]["timeframe"] == "today 3-m"
+    assert out["query"]["trend_timeframe"] == "today 12-m"
+    assert client.iot_timeframes == ["today 12-m"]
+    assert "direction_now" in out["seeds"][0]["trend"]
 
 
 def test_discover_topics_non_retryable_error_continues():
@@ -593,9 +717,10 @@ def test_aeo_opportunities_clusters_scores_and_ranks():
     client = AeoClient()
     out = aeo_opportunities(client, ["espresso", "zzz"], geo="BR", limit=3)
     assert out["query"] == {
-        "seeds": ["espresso", "zzz"], "timeframe": "today 3-m", "geo": "BR", "hl": "pt-BR",
-        "news_geo": "BR", "wikipedia_lang": "pt",
+        "seeds": ["espresso", "zzz"], "timeframe": "today 3-m", "trend_timeframe": "today 12-m",
+        "geo": "BR", "hl": "pt-BR", "news_geo": "BR", "wikipedia_lang": "pt",
     }
+    assert client.iot_timeframes == ["today 12-m"]
     # 1 IOT, then per seed: rq, seed + 5 prefixes of autocomplete, news, wiki search (+ views when found)
     kinds = [c[0] for c in client.calls]
     assert kinds[0] == "iot" and kinds.count("rq") == 2 and kinds.count("news") == 2
@@ -625,6 +750,49 @@ def test_aeo_opportunities_clusters_scores_and_ranks():
     assert zzz["wikipedia"] == {"has_article": False, "title": None}
     assert out["errors"] == [] and "partial" not in out and "note" not in out
     assert aeo_opportunities(AeoClient(), ["x"], limit=99)["note"].startswith("limit 99")
+
+
+def test_aeo_opportunities_trend_block_short_series_explains_null_growth():
+    out = aeo_opportunities(AeoClient(), ["espresso"])
+    trend = out["opportunities"][0]["trend"]
+    assert trend["direction"] == "rising" and trend["direction_now"] == "stable"
+    assert trend["growth_3m"] is None and "6 months" in trend["growth_note"]
+    assert out["opportunities"][0]["score_breakdown"]["trend"] in (10, 25)  # stable now
+
+
+def test_aeo_opportunities_scores_recent_slope_not_whole_window():
+    """10.1: born-then-collapsed topic (openclaw shape) gets no 'rising' points."""
+
+    class Peaked(AeoClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            self.calls.append(("iot", tuple(keywords)))
+            self.iot_timeframes.append(tf)
+            idx = pd.date_range("2025-10-05", periods=52, freq="W")
+            vals = [0] * 17 + [50, 80, 100, 90, 70, 50, 40, 30, 20, 15, 10, 8, 6, 5] + [4] * 21
+            return pd.DataFrame({kw: vals for kw in keywords}, index=idx)
+
+    out = aeo_opportunities(Peaked(), ["espresso"])
+    trend = out["opportunities"][0]["trend"]
+    assert trend["direction"] == "new" and trend["direction_now"] == "falling"
+    assert isinstance(trend["growth_3m"], float) and trend["growth_3m"] < 0
+    assert "growth_note" not in trend
+    assert "fell" in trend["insight"] and "(falling)" in trend["insight"]
+    for op in out["opportunities"]:
+        assert op["score_breakdown"]["trend"] in (0, 15)  # only the breakout bonus survives
+
+
+def test_aeo_opportunities_iot_429_does_not_skip_seed_requests():
+    class IotFails(AeoClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            raise TrendsError("429", retryable=True)
+
+    client = IotFails()
+    out = aeo_opportunities(client, ["espresso"])
+    kinds = [c[0] for c in client.calls]
+    assert kinds.count("rq") == 1 and "ac" in kinds and "news" in kinds
+    assert out["errors"] == [{"step": "interest_over_time", "error": "429"}]
+    assert "partial" not in out and "skipped" not in out["seeds"][0]
+    assert out["opportunities"][0]["trend"] == {"available": False}
 
 
 def test_aeo_opportunities_google_cooldown_keeps_wikipedia():

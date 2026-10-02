@@ -130,6 +130,18 @@ def test_expired_disk_files_are_swept(tmp_path, monkeypatch):
     c.set("fresh", 1, ttl=60)
     assert len(list(tmp_path.glob("*.json"))) == 1
 
+def test_legacy_pickle_files_are_swept(tmp_path, monkeypatch):
+    """Pre-0.2 .pkl cache litter is removed on sweep; JSON entries are untouched (10.8)."""
+    monkeypatch.setattr(client_mod, "DISK_SWEEP_INTERVAL", 0)
+    (tmp_path / "abc.pkl").write_bytes(b"\x80\x04N.")
+    (tmp_path / "def.pkl").write_bytes(b"")
+    c = _TTLCache(tmp_path)
+    c.set("fresh", 1, ttl=60)  # triggers a sweep
+    assert list(tmp_path.glob("*.pkl")) == []
+    assert len(list(tmp_path.glob("*.json"))) == 1 and c.get("fresh") == 1
+
+
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permissions")
 def test_cache_dir_is_private(tmp_path):

@@ -59,6 +59,14 @@ def test_mine_questions_live(client):
     assert out["questions"][0]["angle"] in {"how-to", "comparison", "listicle", "definition", "news"}
 
 
+def test_autocomplete_trailing_space_still_suggests_live(client):
+    # 10.3: queries are sent with a trailing space so Google completes the *next* word.
+    # Confirms the firefox client honours it (one request).
+    suggestions = client.autocomplete.suggest("how to espresso ", "US")
+    assert suggestions, "Autocomplete returned nothing for a trailing-space query"
+    assert all("espresso" in s.lower() for s in suggestions[:3])
+
+
 def test_news_coverage_live(client):
     out = tools.news_coverage(client, "espresso machine", geo="US", limit=3)
     assert out["available"] is True, out.get("reason")

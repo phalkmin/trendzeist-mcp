@@ -19,9 +19,19 @@ BREAKOUT_THRESHOLD = 5000  # Google reports "Breakout" as +5000%
 SCALE_NOTE = "0-100 relative to the peak across all keywords in this query"
 
 # Title angles (roadmap N6). Order matters: the first matching rule wins, so the
-# more specific intents (comparison, definition) are checked before "how-to".
+# more specific intents (comparison, definition, release questions) are checked
+# before the broad "how-to" catch-all; the generic news rule stays last.
 ANGLES: tuple[str, ...] = ("how-to", "comparison", "listicle", "definition", "news")
 _ANGLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        # "when X released / launched / comes out" is a date question, not a how-to.
+        "news",
+        re.compile(
+            r"^when\b.*\b(release[sd]?|launch(ed|es)?|come[s]?\s+out|came\s+out|announce[sd]?"
+            r"|available|drop(ped|s)?)\b",
+            re.I,
+        ),
+    ),
     (
         "comparison",
         re.compile(
@@ -174,17 +184,31 @@ def _downsample(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
     return agg
 
 
-def _direction(values: list[float]) -> str:
-    """Classify a series as rising / falling / stable using first vs. last third means."""
-    if len(values) < 3:
-        return "insufficient_data"
+def _thirds(values: list[float]) -> tuple[float, float]:
+    """Means of the first and last third of a series (len >= 3)."""
     third = max(1, len(values) // 3)
-    first = sum(values[:third]) / third
-    last = sum(values[-third:]) / third
-    if first == 0 and last == 0:
+    return sum(values[:third]) / third, sum(values[-third:]) / third
+
+
+def _recent_quarters(values: list[float]) -> tuple[float, float]:
+    """Means of the second-to-last and last quarter of a series (len >= 4).
+
+    On a 12-month series this is the same window as ``growth_3m``, so the
+    recent label and the growth figure always agree in sign.
+    """
+    quarter = max(1, len(values) // 4)
+    recent = values[-quarter:]
+    previous = values[-2 * quarter : -quarter]
+    return sum(previous) / len(previous), sum(recent) / len(recent)
+
+
+def _label(before: float, after: float) -> str:
+    """rising / falling / stable from two window means; 'new' when before is zero."""
+    if before == 0 and after == 0:
         return "no_interest"
-    base = first if first > 0 else 1.0
-    change = (last - first) / base
+    if before == 0:
+        return "new"  # born inside the window; growth from zero is undefined
+    change = (after - before) / before
     if change >= 0.25:
         return "rising"
     if change <= -0.25:
@@ -192,7 +216,35 @@ def _direction(values: list[float]) -> str:
     return "stable"
 
 
+def _direction(values: list[float]) -> str:
+    """Whole-window label: first third vs. last third means.
+
+    ``new`` means the topic had no interest in the first third; use
+    :func:`_direction_now` to know whether it is still growing.
+    """
+    if len(values) < 3:
+        return "insufficient_data"
+    return _label(*_thirds(values))
+
+
+def _direction_now(values: list[float]) -> str:
+    """Recent-slope label: last quarter vs. the quarter before it.
+
+    Answers "should I write about this *now*": a topic that peaked mid-window and
+    has been falling since reads ``falling`` here even when ``_direction`` is
+    ``rising`` (or ``new``) for the whole period.
+    """
+    if len(values) < 4:
+        return "insufficient_data"
+    return _label(*_recent_quarters(values))
+
+
 _GROWTH_WINDOWS: dict[str, int] = {"growth_3m": 91, "growth_12m": 365}
+GROWTH_NOTE = (
+    "growth_3m needs at least 6 months of data (timeframe 'today 12-m'); "
+    "growth_12m needs 'today 5-y'. Both compare the mean of the last window with the "
+    "window before it."
+)
 
 
 def _pct_change(before: float, after: float) -> float | None:
@@ -229,24 +281,51 @@ def _growth_windows(series: pd.Series) -> dict[str, float | None]:
     return out
 
 
-def _insight(kw: str, vals: list[float], direction: str, peak: Any, peak_date: Any) -> str:
-    """One plain-English sentence per keyword so the model needs no arithmetic."""
+def _growth_note(growth: dict[str, float | None]) -> str | None:
+    """Explain null growth fields instead of leaving them silent."""
+    return GROWTH_NOTE if any(val is None for val in growth.values()) else None
+
+
+def _change_phrase(before: float, after: float) -> str:
+    change = round(100.0 * (after - before) / before)
+    verb = "rose" if change > 0 else "fell" if change < 0 else "held flat"
+    return f"{verb} {abs(change)}%" if change else verb
+
+
+def _insight(
+    kw: str,
+    vals: list[float],
+    direction: str,
+    peak: Any,
+    peak_date: Any,
+    direction_now: str | None = None,
+) -> str:
+    """One plain-English sentence per keyword so the model needs no arithmetic.
+
+    When the whole-window and recent labels disagree the sentence says so, e.g.
+    "rose 182% ... but fell 45% in the last third (falling)".
+    """
     if direction == "insufficient_data":
         return f"Too few data points to judge the trend for '{kw}'."
     if direction == "no_interest":
         return f"'{kw}' shows no measurable search interest in this period."
-    third = max(1, len(vals) // 3)
-    first = sum(vals[:third]) / third
-    last = sum(vals[-third:]) / third
+    first, last = _thirds(vals)
     if first > 0:
-        change = round(100.0 * (last - first) / first)
-        verb = "rose" if change > 0 else "fell" if change < 0 else "held flat"
-        magnitude = f" {abs(change)}%" if change else ""
-        head = f"Interest in '{kw}' {verb}{magnitude} between the first and last third of the period"
+        head = (
+            f"Interest in '{kw}' {_change_phrase(first, last)} between the first and "
+            "last third of the period"
+        )
     else:
         head = f"Interest in '{kw}' appeared from zero during the period"
     tail = f", peaking at {peak} on {peak_date}" if peak is not None and peak_date else ""
-    return f"{head}{tail} ({direction})."
+    now = direction_now if direction_now is not None else _direction_now(vals)
+    if now in (direction, "insufficient_data", "no_interest", "new"):
+        return f"{head}{tail} ({direction})."
+    previous, recent = _recent_quarters(vals)
+    move = _change_phrase(previous, recent) if previous > 0 else "moved from zero"
+    reversal = now == "falling" or (now == "rising" and direction == "falling")
+    joiner = "but" if reversal else "and"
+    return f"{head}{tail}, {joiner} {move} in the last quarter of the period ({now})."
 
 
 def interest_over_time(
@@ -282,8 +361,10 @@ def interest_over_time(
         vals = [float(v) for v in stats_series.tolist()]
         peak_idx = stats_series.idxmax() if len(stats_series) else None
         direction = _direction(vals)
+        direction_now = _direction_now(vals)
         peak = _to_native(stats_series.max()) if len(stats_series) else None
         peak_date = _to_native(peak_idx) if peak_idx is not None else None
+        growth = _growth_windows(stats_series)
         summary[kw] = {
             "available": True,
             "mean": round(sum(vals) / len(vals), 1) if vals else 0,
@@ -291,9 +372,13 @@ def interest_over_time(
             "peak": peak,
             "peak_date": peak_date,
             "direction": direction,
-            **_growth_windows(stats_series),
-            "insight": _insight(kw, vals, direction, peak, peak_date),
+            "direction_now": direction_now,
+            **growth,
+            "insight": _insight(kw, vals, direction, peak, peak_date, direction_now),
         }
+        growth_note = _growth_note(growth)
+        if growth_note:
+            summary[kw]["growth_note"] = growth_note
 
     sampled = _downsample(complete, max_points)
     points: list[dict[str, Any]] = []
@@ -341,6 +426,97 @@ def mark_breakouts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         it["growth_pct"] = v
         it["is_breakout"] = bool(isinstance(v, (int, float)) and v >= BREAKOUT_THRESHOLD)
     return items
+
+
+# Suspect rising queries (run-data 10.2). Search-manipulation campaigns attach one
+# name / brand to many unrelated queries so each shows up as a "Breakout" under
+# popular seeds. Google's number is kept (is_breakout), but composites keep these
+# out of the breakout bucket, the question lists and the score.
+_SUSPECT_MIN_ITEMS = 3
+_SUSPECT_MAX_OVERLAP = 0.34  # residual token Jaccard above this = genuinely related items
+_DOMAIN_RE = re.compile(r"(^|\s)[\w-]+\s?\.\s?(com|net|org|io|co|app|ai|dev|xyz|info)(\s|$)")
+_STOPWORDS = frozenset(
+    "a an the and or of in on for to with vs versus is are how what why when where who "
+    "can do does best top new free near me my your its it this that from by at as be".split()
+)
+
+
+def _shingles(tokens: list[str]) -> set[tuple[str, ...]]:
+    """Bigrams and trigrams. Single tokens are deliberately not markers: one brand
+    word across several product queries (``breville ...``) is normal, whereas the
+    injection pattern seen in the wild is a full personal name."""
+    out: set[tuple[str, ...]] = set()
+    for n in (2, 3):
+        out.update(tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1))
+    return out
+
+
+def flag_suspects(
+    rising: list[dict[str, Any]], top: list[dict[str, Any]], seed: str
+) -> list[dict[str, Any]]:
+    """Mark rising items that look like injected spam with ``suspect`` / ``suspect_reason``.
+
+    A marker (2-3-token shingle) is suspicious when it is not part of the seed,
+    appears in at least three rising items, never appears in the top list, and the
+    items carrying it have little else in common. Domain-like items (``brand .com``)
+    are flagged on their own.
+    """
+    seed_tokens = set(normalise_query(seed).split())
+    top_text = " ".join(normalise_query(t.get("name") or "") for t in top)
+    tokens_by_idx: list[list[str]] = []
+    carriers: dict[tuple[str, ...], list[int]] = {}
+    for i, it in enumerate(rising):
+        toks = normalise_query(it.get("name") or "").split()
+        tokens_by_idx.append(toks)
+        for sh in _shingles(toks):
+            # A marker needs at least one content word that is not the seed itself;
+            # "best <seed>" or "<seed> machine" are ordinary query shapes.
+            if not (set(sh) - seed_tokens - _STOPWORDS):
+                continue
+            carriers.setdefault(sh, []).append(i)
+
+    reasons: dict[int, str] = {}
+    for sh in sorted(carriers, key=lambda s: (-len(s), s)):
+        idxs = carriers[sh]
+        if len(idxs) < _SUSPECT_MIN_ITEMS:
+            continue
+        if all(i in reasons for i in idxs):
+            continue  # already explained by a longer shingle
+        phrase = " ".join(sh)
+        if re.search(rf"\b{re.escape(phrase)}\b", top_text):
+            continue  # also a top query: a real sub-topic, not an injection
+        residuals = [
+            set(tokens_by_idx[i]) - set(sh) - seed_tokens - _STOPWORDS for i in idxs
+        ]
+        pairs = [(a, b) for n, a in enumerate(residuals) for b in residuals[n + 1 :]]
+        overlap = (
+            sum(len(a & b) / len(a | b) for a, b in pairs if a | b) / len(pairs) if pairs else 0.0
+        )
+        if overlap > _SUSPECT_MAX_OVERLAP:
+            continue
+        for i in idxs:
+            reasons.setdefault(
+                i,
+                f"repeated token '{phrase}' across {len(idxs)} unrelated rising queries, "
+                "absent from top queries",
+            )
+
+    for i, it in enumerate(rising):
+        if i not in reasons and _DOMAIN_RE.search((it.get("name") or "").lower()):
+            reasons[i] = "domain-like rising query (looks like a site promoting itself)"
+        if i in reasons:
+            it["suspect"] = True
+            it["suspect_reason"] = reasons[i]
+    return rising
+
+
+def split_suspects(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(clean, suspect) partition of a flagged rising list."""
+    clean = [it for it in items if not it.get("suspect")]
+    suspect = [it for it in items if it.get("suspect")]
+    return clean, suspect
 
 
 def region_list(df: pd.DataFrame | None, keywords: list[str], limit: int) -> list[dict[str, Any]]:
@@ -457,13 +633,12 @@ def pageview_summary(points: list[dict[str, Any]], title: str) -> dict[str, Any]
             "insight": f"No pageview data for '{title}' in this window.",
         }
     peak_i = max(range(len(views)), key=views.__getitem__)
-    direction = _direction([float(x) for x in views])
+    fvals = [float(x) for x in views]
+    direction = _direction(fvals)
+    direction_now = _direction_now(fvals)
     growth: float | None = None
-    third = max(1, len(views) // 3)
     if len(views) >= 3:
-        first = sum(views[:third]) / third
-        last = sum(views[-third:]) / third
-        growth = _pct_change(first, last)
+        growth = _pct_change(*_thirds(fvals))
     return {
         "days": len(views),
         "total": sum(views),
@@ -471,9 +646,10 @@ def pageview_summary(points: list[dict[str, Any]], title: str) -> dict[str, Any]
         "peak": views[peak_i],
         "peak_date": points[peak_i]["date"],
         "direction": direction,
+        "direction_now": direction_now,
         "growth_pct": growth,
         "insight": _insight(
-            title, [float(x) for x in views], direction, views[peak_i], points[peak_i]["date"]
+            title, fvals, direction, views[peak_i], points[peak_i]["date"], direction_now
         ),
     }
 

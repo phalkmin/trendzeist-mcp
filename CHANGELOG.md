@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-10-02
+
+Hotfix for errors found while writing posts from 0.4.0 output (an agent quoted "rising"
+for topics that had collapsed, and spam reached the breakout bucket). All changes are
+additive: `schema_version` stays `2`.
+
+### Fixed
+- **`direction` no longer says "rising" for topics in steep decline.** The zero-base
+  fallback (`base = 1.0`) is gone: a keyword with no interest in the first third of the
+  window is now `new`, never `rising`. The `insight` sentence mentions the recent move when
+  it disagrees with the whole-window label ("rose 108% …, but fell 59% in the last quarter
+  of the period (falling)").
+- **`aeo_opportunities` scores the recent slope** (`direction_now`, below) instead of the
+  whole-window `direction`, so a topic that fell 70% since its peak no longer collects
+  +20 "rising" points. `score_note` updated.
+- **Spam no longer passes as breakout.** Rising queries that carry the same 2-3-word
+  marker across ≥ 3 unrelated items (absent from the top list) or that look like a domain
+  are flagged `suspect: true` / `suspect_reason`. `related_queries` keeps them in `rising`
+  but out of `questions`; `discover_topics` moves them to `suspect[]` (plus
+  `counts.suspect`, `seeds[].suspect_count`); `aeo_opportunities` ignores them entirely.
+  `is_breakout` still reports Google's number.
+- **`mine_questions` no longer returns completions of a partial word** ("wordpress ai" →
+  "wordpress airplay"). Autocomplete queries are sent with a trailing space, and a
+  suggestion is kept only if the seed survives as whole words.
+- **`growth_3m` is now a number in composites.** `discover_topics` and `aeo_opportunities`
+  fetch the seed trend on `today 12-m` regardless of the related-queries `timeframe`
+  (echoed as `query.trend_timeframe`; same single request). Elsewhere a `null` growth
+  field for coverage reasons carries a `growth_note` naming the timeframe to use.
+- **A 429 on the trend-context step no longer aborts `discover_topics` /
+  `aeo_opportunities`.** Related queries for the seeds are still attempted; cooling-down
+  (skipping uncached seeds) only starts when a seed's own request is refused. The skip
+  message now says "Retry in ~60 s with 1-2 seeds."
+- **Error strings no longer carry the full Trends URL and session token.** Upstream
+  exceptions are reduced to "HTTP 429 from trends.google.com after retries" (or a
+  ≤ 200-char message with query strings stripped); the raw exception is logged at debug.
+- "when … released / launched / comes out" is tagged `news` instead of `how-to`.
+- Legacy pre-0.2 `*.pkl` cache files are deleted on the next disk sweep.
+
+### Added
+- `direction_now` on every per-keyword summary (`interest_over_time`,
+  `compare_keywords.ranking[]`, `aeo_opportunities[].trend`, `discover_topics.seeds[].trend`,
+  `wiki_attention.pageviews`): last quarter of the window vs. the quarter before it, same
+  labels as `direction`. `new` is a new `direction` value (born inside the window).
+- `growth_note`, `suspect`, `suspect_reason`, `suspect[]`, `suspect_count`,
+  `query.trend_timeframe` fields as described above.
+- README "Two trend labels" / "Suspect rising queries" conventions; SKILL.md tells agents to
+  decide on `direction_now`, to ignore `suspect[]` and to open a session with 1-2 seeds.
+- AGENTS.md: git (branches, commits, tags) is the maintainer's job, never the agent's.
+
 ## [0.4.0] - 2026-09-29
 
 "The AEO release": multi-source and still keyless. Find the questions people ask — and

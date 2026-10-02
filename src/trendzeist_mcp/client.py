@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -77,6 +78,36 @@ class TrendsError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = False):
         super().__init__(message)
         self.retryable = retryable
+
+
+ERROR_TEXT_LIMIT = 200
+_QUERY_STRING_RE = re.compile(r"\?[^\s'\")\]>]*")
+_STATUS_RE = re.compile(r"\b(?:status(?: code)?|HTTP|too many)\s*:?\s*(\d{3})\b", re.I)
+_HOST_RE = re.compile(r"https?://([^/\s'\"]+)")
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Short, token-free summary of an upstream exception for the model.
+
+    requests/urllib3 messages embed the full URL (with Google's ``token=`` and the
+    whole ``req=`` payload) and run to 1,500+ characters. Keep the status code and
+    host when present, strip every query string, collapse whitespace and truncate.
+    The raw exception stays available at debug level (see ``_guarded``).
+    """
+    raw = str(exc) or exc.__class__.__name__
+    status = _STATUS_RE.search(raw)
+    host = _HOST_RE.search(raw)
+    retries = re.search(r"Max retries exceeded", raw, re.I)
+    if status and host:
+        text = f"HTTP {status.group(1)} from {host.group(1)}"
+        if retries:
+            text += " after retries"
+        return text
+    text = _QUERY_STRING_RE.sub("?…", raw)
+    text = " ".join(text.split())
+    if len(text) > ERROR_TEXT_LIMIT:
+        text = text[: ERROR_TEXT_LIMIT - 1].rstrip() + "…"
+    return text
 
 
 @dataclass
@@ -225,6 +256,10 @@ class _TTLCache:
                             p.unlink(missing_ok=True)
                 except (OSError, ValueError, KeyError, TypeError):
                     p.unlink(missing_ok=True)
+            # Pre-0.2 releases cached with pickle; those files are never read
+            # again, so remove the litter (one-time migration).
+            for p in self._dir.glob("*.pkl"):
+                p.unlink(missing_ok=True)
         except OSError as exc:
             logger.debug("disk cache sweep failed: %s", exc)
 
@@ -450,12 +485,16 @@ class Source:
                 retryable=True,
             )
         if isinstance(exc, InvalidParameterError):
-            return TrendsError(f"{self.label} rejected the request parameters: {exc}")
+            return TrendsError(
+                f"{self.label} rejected the request parameters: {describe_exception(exc)}"
+            )
         if isinstance(exc, (ResponseError, DownloadError, requests.RequestException)):
             self._reset()
-            return TrendsError(f"{self.label} request failed: {exc}", retryable=True)
+            return TrendsError(
+                f"{self.label} request failed: {describe_exception(exc)}", retryable=True
+            )
         if isinstance(exc, (ValueError, KeyError, IndexError, TypeError)):
-            return TrendsError(f"Unexpected response from {self.label}: {exc}")
+            return TrendsError(f"Unexpected response from {self.label}: {describe_exception(exc)}")
         return None
 
     def _guarded(self, fn: Callable[[], T]) -> T:
@@ -470,6 +509,7 @@ class Source:
                 mapped = self._map_error(exc)
                 if mapped is None:
                     raise
+                logger.debug("%s upstream failure: %r", self.label, exc)
                 self._record(str(mapped))
                 raise mapped from exc
             self._record(None)

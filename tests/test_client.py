@@ -241,6 +241,43 @@ def test_guarded_maps_every_error_branch(raised, retryable, fragment):
     assert fragment in str(exc.value)
 
 
+def test_mapped_errors_drop_urls_tokens_and_stay_short():
+    """10.6: a urllib3 MaxRetryError message carries the full widget URL + session token."""
+    secret_url = (
+        "https://trends.google.com/trends/api/widgetdata/multiline?req=%7B%22time%22%3A%22"
+        + "x" * 1200
+        + "&token=AB6YKJSECRETTOKEN&tz=360"
+    )
+    raised = requests.ConnectionError(
+        f"HTTPSConnectionPool(host='trends.google.com', port=443): Max retries exceeded with "
+        f"url: {secret_url} (Caused by ResponseError('too many 429 error responses'))"
+    )
+    c = _client()
+
+    def boom():
+        raise raised
+
+    with pytest.raises(TrendsError) as exc:
+        c._guarded(boom)
+    text = str(exc.value)
+    assert "token" not in text and "req=" not in text and len(text) < 250
+    assert text == "Google Trends request failed: HTTP 429 from trends.google.com after retries"
+    assert exc.value.retryable is True
+    assert c.status()["last_error"] == text
+
+
+def test_describe_exception_strips_query_strings_and_truncates():
+    from trendzeist_mcp.client import describe_exception
+
+    long = DownloadError("fetch failed for https://x.test/p?token=SECRET&a=1 then " + "y" * 500)
+    text = describe_exception(long)
+    assert "SECRET" not in text and "https://x.test/p?…" in text and len(text) <= 200
+    assert describe_exception(KeyError("widgets")) == "'widgets'"
+    assert describe_exception(ValueError()) == "ValueError"
+    resp = ResponseError("The request failed: Google returned status code 500. URL: https://trends.google.com/x?req=1")
+    assert describe_exception(resp) == "HTTP 500 from trends.google.com"
+
+
 def test_guarded_rate_limit_resets_session():
     c = _client()
     c._trend_req = object()  # pretend a session exists

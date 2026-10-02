@@ -6,6 +6,8 @@ RUN pip install --no-cache-dir --prefix=/install .
 
 FROM python:3.12-slim
 LABEL org.opencontainers.image.source="https://github.com/phalkmin/trendzeist-mcp" \
+      org.opencontainers.image.url="https://phalkmin.me/en/trendzeist-google-trends-mcp/" \
+      org.opencontainers.image.authors="Paulo H. Alkmin <phalkmin@protonmail.com>" \
       org.opencontainers.image.description="Google Trends MCP server for content ideation" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=builder /install /usr/local

@@ -10,6 +10,11 @@ from .client import TrendsError
 from .sources import Hub
 
 _SIGNAL_ORDER = {"breakout": 0, "rising": 1, "evergreen": 2}
+# Seed trend context window; see aeo.TREND_TIMEFRAME for the rationale.
+TREND_TIMEFRAME = "today 12-m"
+SKIP_MESSAGE = (
+    "Not fetched: Google is rate limiting this session. Retry in ~60 s with 1-2 seeds."
+)
 
 
 def _momentum(signal: str, value: float | int | None) -> float:
@@ -51,27 +56,29 @@ def discover_topics(
     errors: list[dict[str, str]] = []
     questions: list[dict[str, Any]] = []
     question_keys: set[str] = set()
+    suspect: list[dict[str, Any]] = []
 
-    # One interest_over_time call covers up to 5 seeds -> cheap trend context.
-    # Once Google starts refusing (429 / transport failure) we stop sending new
-    # requests, but still serve seeds whose related queries are already cached.
+    # One interest_over_time call covers up to 5 seeds -> cheap trend context on a
+    # fixed 12-month window (so direction_now / growth_3m are meaningful whatever
+    # timeframe the related queries use). It is enrichment only: if it fails we
+    # still try the first seed's related queries, and only enter cooling-down
+    # (skip uncached seeds) once a related_queries request itself is refused.
     cooling_down = False
     has_cache = getattr(hub.trends, "has_cached_related_queries", None)
 
     directions: dict[str, Any] = {}
     try:
-        iot = fmt.interest_over_time(hub.trends.interest_over_time(seeds, tf, g, cat, gp), seeds)
+        iot = fmt.interest_over_time(
+            hub.trends.interest_over_time(seeds, TREND_TIMEFRAME, g, cat, gp), seeds
+        )
         directions = iot["summary"]
     except TrendsError as exc:
         errors.append({"step": "interest_over_time", "error": str(exc)})
-        cooling_down = exc.retryable
 
     for seed in seeds:
         report: dict[str, Any] = {"seed": seed, "trend": directions.get(seed, {"available": False})}
         if cooling_down and not (callable(has_cache) and has_cache(seed, tf, g, cat, gp)):
-            report["skipped"] = (
-                "Not fetched: Google is rate limiting this session. Retry in a minute."
-            )
+            report["skipped"] = SKIP_MESSAGE
             errors.append({"step": f"related_queries:{seed}", "error": "skipped (rate limited)"})
             seed_reports.append(report)
             continue
@@ -87,8 +94,22 @@ def discover_topics(
 
         rising = fmt.mark_breakouts(fmt.related_list(res.get("rising"), per_seed, label="query"))
         top = fmt.related_list(res.get("top"), per_seed, label="query")
+        fmt.flag_suspects(rising, top, seed)
+        rising, flagged = fmt.split_suspects(rising)
+        for item in flagged:
+            suspect.append(
+                {
+                    "topic": item["name"],
+                    "growth_pct": item.get("growth_pct"),
+                    "is_breakout": item.get("is_breakout", False),
+                    "source_seed": seed,
+                    "reason": item["suspect_reason"],
+                }
+            )
         report["rising_count"] = len(rising)
         report["top_count"] = len(top)
+        if flagged:
+            report["suspect_count"] = len(flagged)
         for q in fmt.extract_questions(("rising", rising), ("top", top), limit=per_seed):
             norm = fmt.normalise_query(q["question"])
             if norm not in question_keys:
@@ -145,6 +166,7 @@ def discover_topics(
         "query": {
             "seed_keywords": seeds,
             "timeframe": tf,
+            "trend_timeframe": TREND_TIMEFRAME,
             "geo": g or "worldwide",
             "hl": hl_for(g) if callable(hl_for) else "en-US",
             "category": cat,
@@ -153,11 +175,13 @@ def discover_topics(
         "seeds": seed_reports,
         "topics": ranked,
         "questions": questions,
+        "suspect": suspect,
         "counts": {
             "breakout": sum(1 for c in ranked if c["signal"] == "breakout"),
             "rising": sum(1 for c in ranked if c["signal"] == "rising"),
             "evergreen": sum(1 for c in ranked if c["signal"] == "evergreen"),
             "questions": len(questions),
+            "suspect": len(suspect),
         },
         "errors": errors,
         "guidance": (
@@ -165,7 +189,10 @@ def discover_topics(
             "rising = growing interest (good near-term posts); evergreen = consistently "
             "popular (pillar content). angle = suggested title format. questions = "
             "question-shaped searches (FAQ / answer-engine candidates); expand them with "
-            "mine_questions. Cross-check finalists with interest_over_time."
+            "mine_questions. suspect = rising queries that look like injected spam "
+            "(kept out of topics and questions; do not write about them). Cross-check "
+            "finalists with interest_over_time; seeds[].trend.direction_now is the "
+            "recent slope over the last 12 months."
         ),
     }
     note = v.limit_note(max_per_seed, per_seed, name="max_per_seed")

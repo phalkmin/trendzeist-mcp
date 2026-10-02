@@ -134,6 +134,14 @@ def test_region_list_sorted_and_filtered():
         ("top 10 coffee gadgets", "listicle"),
         ("nespresso recall", "news"),
         ("new espresso machine 2026", "news"),
+        # 10.7: release-date questions are news, not how-to
+        ("when claude code released", "news"),
+        ("when claude code launched", "news"),
+        ("when does the new breville come out", "news"),
+        ("when will gpt 6 be available", "news"),
+        ("why claude code is so slow", "how-to"),  # troubleshooting stays how-to
+        ("where claude code is installed", "how-to"),
+        ("when to descale espresso machine", "how-to"),
         ("espresso", None),
         ("", None),
         (None, None),
@@ -156,6 +164,48 @@ def test_extract_questions_prioritises_and_dedupes():
     assert [q["question"] for q in out] == ["How to make espresso", "what is crema"]
     assert out[0]["source"] == "rising" and out[0]["is_breakout"] is True and out[0]["value"] == 9000
     assert out[1]["angle"] == "definition" and "is_breakout" not in out[1]
+
+
+SPAM_RISING = [
+    {"name": "codex vs claude code abraham quiros villalba", "value": 13400},
+    {"name": "apple smartring abraham quiros villalba", "value": 4550},
+    {"name": "solar shingles vs solar panels abraham quiros villalba", "value": 4500},
+    {"name": "abrahamquirosvillalba .com", "value": 4250},
+    {"name": "claude code vs cursor", "value": 300},
+    {"name": "how to install claude code", "value": 250},
+]
+
+
+def test_flag_suspects_marks_injected_name_and_domain():
+    rising = fmt.mark_breakouts([dict(it) for it in SPAM_RISING])
+    top = [{"name": "claude code cursor", "value": 100}, {"name": "install claude code", "value": 40}]
+    out = fmt.flag_suspects(rising, top, "claude code")
+    assert [bool(it.get("suspect")) for it in out] == [True, True, True, True, False, False]
+    assert "abraham quiros villalba" in out[0]["suspect_reason"] and "3 unrelated" in out[0]["suspect_reason"]
+    assert out[3]["suspect_reason"].startswith("domain-like")
+    assert out[0]["is_breakout"] is True  # Google's number is kept, only the trust changes
+    clean, suspect = fmt.split_suspects(out)
+    assert [c["name"] for c in clean] == ["claude code vs cursor", "how to install claude code"]
+    assert len(suspect) == 4
+
+
+def test_flag_suspects_leaves_ordinary_rising_lists_alone():
+    rising = [
+        {"name": n, "value": 100}
+        for n in [
+            "best espresso machine 2026", "best espresso beans", "best espresso grinder",
+            "espresso machine under 200", "breville espresso machine review",
+            "breville barista express", "breville bambino", "breville oracle jet",
+            "breville barista pro", "barista express vs pro",
+        ]
+    ]
+    out = fmt.flag_suspects(rising, [{"name": "espresso machine", "value": 100}], "espresso")
+    assert not any(it.get("suspect") for it in out)
+    # A repeated phrase that is also a top query is a real sub-topic, not an injection.
+    rising = [{"name": f"oat milk latte {x}", "value": 100} for x in ("recipe", "calories", "near me")]
+    out = fmt.flag_suspects(rising, [{"name": "oat milk latte", "value": 90}], "latte")
+    assert not any(it.get("suspect") for it in out)
+    assert fmt.flag_suspects([], [], "x") == []
 
 
 def test_tag_angles_in_place():
@@ -181,6 +231,47 @@ def test_growth_windows_need_time_index_and_span():
     assert out["growth_3m"] == 100.0 and out["growth_12m"] is None
     zero_base = pd.Series([0.0] * 100 + [5.0] * 91, index=pd.date_range("2026-01-01", periods=191, freq="D"))
     assert fmt._growth_windows(zero_base)["growth_3m"] is None
+
+
+def test_direction_labels_for_rise_and_fall_shapes():
+    # Born late, then collapsing (openclaw): never "rising"; whole window = new, now = falling.
+    late_fall = [0.0] * 17 + [50, 80, 100, 90, 70, 50, 40, 30, 20, 15, 10, 8, 6, 5]
+    assert fmt._direction(late_fall) == "new"
+    assert fmt._direction_now(late_fall) == "falling"
+    # Peak in the middle third: ends higher than it started (rising over the year) but falling now.
+    peaked = [13.0] * 17 + [90.0] * 17 + [27.0] * 18
+    assert fmt._direction(peaked) == "rising"
+    assert fmt._direction_now(peaked) == "falling"
+    # Monotonic rise stays rising on both.
+    rise = [float(i) for i in range(30)]
+    assert fmt._direction(rise) == "rising" and fmt._direction_now(rise) == "rising"
+    # Zero everywhere / too short are unchanged.
+    assert fmt._direction([0.0, 0.0, 0.0]) == "no_interest"
+    assert fmt._direction_now([1.0, 2.0]) == "insufficient_data"
+    # Still-growing newcomer: new overall, rising now.
+    newcomer = [0.0] * 10 + [5.0] * 10 + [20.0] * 10
+    assert fmt._direction(newcomer) == "new" and fmt._direction_now(newcomer) == "rising"
+
+
+def test_insight_mentions_recent_decline_when_labels_disagree():
+    peaked = [13.0] * 17 + [90.0] * 17 + [27.0] * 18
+    text = fmt._insight("claude code", peaked, "rising", 90, "2026-03-29", "falling")
+    assert text.startswith("Interest in 'claude code' rose 108%")
+    assert "peaking at 90 on 2026-03-29" in text
+    assert text.endswith(", but fell 59% in the last quarter of the period (falling).")
+    late_fall = [0.0] * 17 + [50, 80, 100, 90, 70, 50, 40, 30, 20, 15, 10, 8, 6, 5]
+    text = fmt._insight("openclaw", late_fall, "new", 100, "2026-03-08")
+    assert text.startswith("Interest in 'openclaw' appeared from zero")
+    assert "but fell" in text and text.endswith("(falling).")
+
+
+def test_interest_over_time_summary_has_direction_now_and_growth_note():
+    s = fmt.interest_over_time(_iot_frame(n=13), ["kw"])["summary"]["kw"]
+    assert s["direction_now"] == "rising"
+    assert s["growth_3m"] is None and s["growth_note"] == fmt.GROWTH_NOTE
+    long = fmt.interest_over_time(_iot_frame(n=120), ["kw"])["summary"]["kw"]
+    assert long["growth_3m"] is not None and long["growth_12m"] is not None
+    assert "growth_note" not in long
 
 
 def test_insight_sentences():

@@ -1,12 +1,12 @@
 [project]
 name = "trendzeist-mcp"
-version = "0.4.0"
+version = "0.4.1"
 description = "Free, local MCP server for content ideation and AEO: Google Trends topics and questions, Google News coverage, Wikipedia attention, an AEO opportunity finder. No API key, no browser."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Paulo H.", email = "phalkmin@gmail.com" }]
+authors = [{ name = "Paulo H. Alkmin", email = "phalkmin@protonmail.com" }]
 keywords = [
     "mcp",
     "model-context-protocol",
@@ -44,7 +44,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/phalkmin/trendzeist-mcp"
+Homepage = "https://phalkmin.me/en/trendzeist-google-trends-mcp/"
 Repository = "https://github.com/phalkmin/trendzeist-mcp"
 Issues = "https://github.com/phalkmin/trendzeist-mcp/issues"
 Changelog = "https://github.com/phalkmin/trendzeist-mcp/blob/main/CHANGELOG.md"

@@ -21,6 +21,10 @@ from .sources import Hub
 _AEO_PREFIXES: tuple[str, ...] = ("how to", "what is", "why", "can", "vs")
 _QUESTIONS_PER_SEED = 15
 _ANGLE_RANK = {angle: i for i, angle in enumerate(fmt.ANGLES)}
+# Seed trend context always uses a 12-month window, independent of the
+# related-queries timeframe: it is one request for up to 5 seeds either way, and
+# only a >= 6-month series can yield growth_3m and a meaningful direction_now.
+TREND_TIMEFRAME = "today 12-m"
 
 
 def _score(
@@ -31,7 +35,9 @@ def _score(
 ) -> tuple[int, dict[str, int]]:
     """Transparent 0-100 heuristic; every component is reported in score_breakdown."""
     parts: dict[str, int] = {"questions": min(40, 8 * len(cluster["questions"]))}
-    parts["trend"] = {"rising": 20, "stable": 10}.get(trend.get("direction"), 0)
+    # Recent slope, not the whole-window label: a topic that peaked six months ago
+    # and fell 70% since must not keep collecting "rising" points.
+    parts["trend"] = {"rising": 20, "stable": 10, "new": 10}.get(trend.get("direction_now"), 0)
     parts["trend"] += 15 if cluster["has_breakout"] else 0
     if news is None:
         parts["news"] = 0
@@ -48,6 +54,21 @@ def _score(
     else:
         parts["wikipedia"] = 10 if cluster["angle"] == "definition" else 5
     return min(100, sum(parts.values())), parts
+
+
+def _trend_block(trend: dict[str, Any]) -> dict[str, Any]:
+    """Compact per-opportunity trend summary; explains a null growth_3m."""
+    if not trend.get("available"):
+        return {"available": False}
+    block: dict[str, Any] = {
+        "direction": trend.get("direction"),
+        "direction_now": trend.get("direction_now"),
+        "growth_3m": trend.get("growth_3m"),
+        "insight": trend.get("insight"),
+    }
+    if block["growth_3m"] is None and trend.get("growth_note"):
+        block["growth_note"] = trend["growth_note"]
+    return block
 
 
 def _brief(
@@ -95,6 +116,8 @@ def _seed_context(
             res = hub.trends.related_queries(seed, tf, g, 0, "")
             rising = fmt.mark_breakouts(fmt.related_list(res.get("rising"), 25, label="query"))
             top = fmt.related_list(res.get("top"), 25, label="query")
+            # Suspect (spam-like) rising items never become questions or breakouts.
+            rising, _ = fmt.split_suspects(fmt.flag_suspects(rising, top, seed))
             for q in fmt.extract_questions(
                 ("rising", rising), ("top", top), limit=_QUESTIONS_PER_SEED
             ):
@@ -187,12 +210,14 @@ def aeo_opportunities(
 
     trends: dict[str, Any] = {}
     try:
-        trends = fmt.interest_over_time(hub.trends.interest_over_time(kws, tf, g, 0, ""), kws)[
-            "summary"
-        ]
+        trends = fmt.interest_over_time(
+            hub.trends.interest_over_time(kws, TREND_TIMEFRAME, g, 0, ""), kws
+        )["summary"]
     except TrendsError as exc:
         errors.append({"step": "interest_over_time", "error": str(exc)})
-        cooling = exc.retryable
+        # Trend context is enrichment only. Do not enter cooling here: the first
+        # seed's own (lane-paced) requests get a chance, and only their failure
+        # marks the session as rate limited (see _seed_context).
 
     seen: set[str] = set()
     clusters: dict[tuple[str, str], dict[str, Any]] = {}
@@ -250,15 +275,7 @@ def aeo_opportunities(
                 "questions": cluster["questions"][:8],
                 "question_count": len(cluster["questions"]),
                 "evidence_from": sorted(cluster["origins"]),
-                "trend": (
-                    {
-                        "direction": trend.get("direction"),
-                        "growth_3m": trend.get("growth_3m"),
-                        "insight": trend.get("insight"),
-                    }
-                    if trend.get("available")
-                    else {"available": False}
-                ),
+                "trend": _trend_block(trend),
                 "news": news,
                 "wikipedia": wiki,
                 "citability_hints": hints,
@@ -274,6 +291,7 @@ def aeo_opportunities(
         "query": {
             "seeds": kws,
             "timeframe": tf,
+            "trend_timeframe": TREND_TIMEFRAME,
             "geo": g or "worldwide",
             "hl": hl,
             "news_geo": news_geo,
@@ -289,7 +307,8 @@ def aeo_opportunities(
         "errors": errors,
         "score_note": (
             "score is a transparent heuristic (0-100): questions found (8 each, max 40); seed "
-            "trend (rising 20 / stable 10, +15 if a breakout question); news (10 if covered "
+            "trend over the last 12 months by direction_now, the recent slope (rising 20 / "
+            "stable or new 10 / falling 0; +15 if a breakout question); news (10 if covered "
             "this week, +5 if 10+ articles in 30 days); Wikipedia (10 if the article's "
             "attention is rising; no search hit scores 10 for definition angles, else 5; "
             "a related-only hit scores 0). "

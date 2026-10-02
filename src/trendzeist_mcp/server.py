@@ -93,9 +93,12 @@ def interest_over_time(
     gprop: str = "",
 ) -> dict[str, Any]:
     """Search-interest time series (0-100) for 1-5 keywords, with per-keyword
-    summary (mean, latest, peak, direction, growth_3m/growth_12m % and a plain-English
-    insight). Long series are downsampled to ~60 points. gprop: '' (web), 'news',
-    'youtube' (authority channels answer engines cite), 'images', 'froogle'."""
+    summary (mean, latest, peak, direction over the whole window, direction_now =
+    recent slope, growth_3m/growth_12m % and a plain-English insight). Use
+    direction_now to decide whether to write about a topic *now*; direction can be
+    'rising' or 'new' for a topic that peaked months ago. Long series are downsampled
+    to ~60 points. gprop: '' (web), 'news', 'youtube' (authority channels answer
+    engines cite), 'images', 'froogle'."""
     return _tool(tools.interest_over_time)(keywords, timeframe, geo, category, gprop)
 
 
@@ -123,7 +126,9 @@ def related_queries(
 ) -> dict[str, Any]:
     """Top and rising search queries related to a keyword. 'rising' includes %
     growth and is_breakout (>5000%); every item carries a title `angle`, and
-    `questions` lists the question-shaped ones. Best single source of fresh blog angles."""
+    `questions` lists the question-shaped ones. Rising items flagged suspect=true look
+    like injected spam (one name across unrelated queries, or a domain) and are left
+    out of `questions`. Best single source of fresh blog angles."""
     return _tool(tools.related_queries)(keyword, timeframe, geo, category, gprop, limit)
 
 
@@ -190,10 +195,12 @@ def discover_topics(
     max_per_seed: int = 15,
 ) -> dict[str, Any]:
     """One-shot topic discovery for blog ideation. For 1-5 seed keywords, pulls
-    trend direction plus rising/top related queries, de-duplicates and ranks
-    candidates as breakout > rising > evergreen, each tagged with a title `angle`.
-    `questions` collects question-shaped searches across seeds. Partial failures
-    are reported per seed in `errors` instead of failing the call."""
+    12-month trend context (direction, direction_now, growth_3m) plus rising/top
+    related queries, de-duplicates and ranks candidates as breakout > rising >
+    evergreen, each tagged with a title `angle`. `questions` collects question-shaped
+    searches across seeds; `suspect` lists spam-like rising queries kept out of the
+    ranking. Partial failures are reported per seed in `errors` instead of failing
+    the call. First call of a session: start with 1-2 seeds to avoid a 429."""
     return _tool(_discover_topics)(seed_keywords, geo, timeframe, category, gprop, max_per_seed)
 
 
@@ -212,8 +219,9 @@ def aeo_opportunities(
 ) -> dict[str, Any]:
     """AEO opportunity finder. For 1-5 seeds: question-shaped searches (Trends + a
     capped Autocomplete pass) clustered by seed and title angle, each scored with
-    seed trend direction, Google News coverage (who to quote / pitch), Wikipedia
-    presence and the evidence type that makes the answer citable. Up to ~1+10
+    the seed's recent trend (direction_now over 12 months, growth_3m), Google News
+    coverage (who to quote / pitch), Wikipedia presence and the evidence type that
+    makes the answer citable. Spam-like rising queries are ignored. Up to ~1+10
     requests per seed; partial failures per source in `errors`. limit: clusters (1-25)."""
     return _tool(_aeo_opportunities)(seeds, geo, timeframe, limit)
 

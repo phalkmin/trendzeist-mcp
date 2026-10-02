@@ -12,8 +12,10 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
 ## Workflow
 
 1. **Discover** — `discover_topics(seed_keywords=[1-5 seeds], geo, timeframe="today 3-m")`.
-   Read `topics[]` (signal: breakout > rising > evergreen; `angle`: how-to | comparison |
-   listicle | definition | news) and `questions[]`.
+   Start a session with 1-2 seeds (Google 429s the first burst hardest). Read `topics[]`
+   (signal: breakout > rising > evergreen; `angle`: how-to | comparison | listicle |
+   definition | news) and `questions[]`. Ignore `suspect[]`: those rising queries look
+   like injected spam and must not become posts.
 2. **Mine questions** — `mine_questions(seed, geo, limit=30)` on the 1-2 strongest seeds.
    Up to 16 throttled requests; cached 24 h. Native-language questions need a seed in that language.
 3. **Find AEO opportunities** — `aeo_opportunities(seeds, geo, limit=10)`. Each opportunity is a
@@ -23,6 +25,10 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
    Follow `brief`.
 4. **Validate** — `interest_over_time` / `compare_keywords` with `timeframe="today 12-m"`.
    Use `summary.<kw>.insight`, `growth_3m`, `growth_12m` verbatim; never do the arithmetic yourself.
+   `direction` is the whole window; **`direction_now` is the recent slope and decides
+   "write about it now"**. `direction: new` + `direction_now: falling` = a topic that
+   spiked and faded; say so instead of calling it rising. A `growth_note` explains a
+   `null` growth field (too short a timeframe).
 5. **Brief** — prompts `content_brief(topic, audience, geo)` for a full outline or
    `answer_brief(question, geo)` for one citable answer (direct 40-60-word answer, one
    statistic, one quote, sources, FAQ, schema). `news_coverage` gives dated headlines and
@@ -31,7 +37,8 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
 ## Reading the signals
 
 - `breakout` = brand-new or exploding demand (time-sensitive). `rising` = growing.
-  `evergreen` = consistently popular (pillar content).
+  `evergreen` = consistently popular (pillar content). A rising item with `suspect: true`
+  (one unrelated name repeated across breakouts, or a `.com`) is manipulation, not demand.
 - `coverage` in `news_coverage`: none / low / moderate / high over 30 days. High = crowded;
   low with rising search interest = open field.
 - `has_article=false` in `wiki_attention` = no encyclopedic anchor exists; a well-cited

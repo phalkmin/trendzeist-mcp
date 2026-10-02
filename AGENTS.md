@@ -39,6 +39,8 @@ tests/           Offline by default. tests/test_live_canary.py is `-m live` only
 - Report silent adjustments: clamped limits → `note` (`validation.limit_note`), empty
   results → `reason`.
 - No new runtime deps without a reason; the target is `uvx trendzeist-mcp` starting in <2 s.
+- **Git is the maintainer's job.** Agents never create branches, commits or tags. Edit the
+  working tree, run the tests, and report; the maintainer commits and tags on GitHub.
 
 ## Commands
 ```bash

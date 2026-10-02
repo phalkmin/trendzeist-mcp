@@ -7,6 +7,7 @@ returns a JSON-serialisable dict. ``server.py`` registers these with MCP.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 from urllib.parse import quote
 
@@ -110,6 +111,7 @@ def compare_keywords(
                 "mean_interest": mean,
                 "share_pct": round(100 * mean / total, 1),
                 "direction": summary[kw].get("direction"),
+                "direction_now": summary[kw].get("direction_now"),
                 "latest": summary[kw].get("latest"),
             }
             for kw, mean in ranking
@@ -141,11 +143,13 @@ def related_queries(
     rising = fmt.tag_angles(
         fmt.mark_breakouts(fmt.related_list(res.get("rising"), lim, label="query"))
     )
+    fmt.flag_suspects(rising, top, kw)
+    clean_rising, suspects = fmt.split_suspects(rising)
     out: dict[str, Any] = {
         "query": _query_meta(hub, [kw], tf, g, cat, gp),
         "top": top,
         "rising": rising,
-        "questions": fmt.extract_questions(("rising", rising), ("top", top), limit=lim),
+        "questions": fmt.extract_questions(("rising", clean_rising), ("top", top), limit=lim),
         "available": bool(top or rising),
         "notes": {
             "top": "value = relative popularity 0-100 among related searches",
@@ -154,6 +158,13 @@ def related_queries(
             "questions": "question-shaped related searches (rising first), deduplicated",
         },
     }
+    if suspects:
+        out["suspect_count"] = len(suspects)
+        out["notes"]["suspect"] = (
+            "rising items with suspect=true look like injected spam (one name attached to "
+            "unrelated queries, or a domain); they are excluded from questions. Treat "
+            "their is_breakout as unreliable."
+        )
     note = v.limit_note(limit, lim)
     if note:
         out["note"] = note
@@ -306,6 +317,9 @@ def mine_questions(
     # Spread the budget across prefixes so a small limit still yields a mix of
     # angles instead of ten "how to ..." variants from the first request.
     per_prefix = max(3, math.ceil(lim / len(prefixes)))
+    # The seed must survive as whole words: Autocomplete completes an unfinished
+    # last token ("wordpress ai" -> "wordpress airplay"), which is off-topic.
+    seed_re = re.compile(rf"\b{re.escape(fmt.normalise_query(kw))}s?\b")
 
     def absorb(prefix: str, suggestions: list[str]) -> None:
         taken = 0
@@ -317,6 +331,8 @@ def mine_questions(
             if not norm or norm in seen:
                 continue
             if not (fmt.is_question(text) or prefix == "vs"):
+                continue
+            if not seed_re.search(norm):
                 continue
             seen.add(norm)
             taken += 1
@@ -332,7 +348,9 @@ def mine_questions(
     for prefix in ("", *prefixes):
         if len(questions) >= lim:
             break
-        query = f"{prefix} {kw}".strip() if prefix != "vs" else f"{kw} vs"
+        # Trailing space: ask Google for the *next* word instead of completing the
+        # seed's last token.
+        query = f"{prefix} {kw} ".lstrip() if prefix != "vs" else f"{kw} vs "
         try:
             absorb(prefix, hub.autocomplete.suggest(query, g))
             prefixes_done.append(prefix or "(seed)")

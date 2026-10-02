@@ -60,13 +60,13 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 
 | Tool | What you get |
 |---|---|
-| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle`; plus `questions[]` people ask |
+| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle`; plus `questions[]` people ask and `suspect[]` spam-like rising queries kept out of the ranking |
 | `mine_questions` | Long-tail questions about a seed from Google Autocomplete (`how to`, `why`, `what is`, `vs` …), deduped and angle-tagged — FAQ / AEO fuel |
-| `aeo_opportunities` | Question clusters per seed × angle, scored with trend direction, Google News coverage (publishers to quote / pitch), Wikipedia presence and citability hints — one call, partial failures per source |
+| `aeo_opportunities` | Question clusters per seed × angle, scored with the seed's recent trend (`direction_now`, `growth_3m` over 12 months), Google News coverage (publishers to quote / pitch), Wikipedia presence and citability hints — one call, partial failures per source |
 | `news_coverage` | Who covers a topic in Google News: headlines, publisher frequency table, recency histogram, coverage label |
 | `wiki_attention` | Exact-title Wikipedia article and daily pageviews (direction, growth); `has_article=false` and optional `related_article` when only a different search hit is found |
 | `trendzeist_status` | Health of every source (live / error / idle), cache usage, effective settings — free, no requests |
-| `interest_over_time` | 0-100 interest curve with mean, peak, direction, `growth_3m` / `growth_12m` and a plain-English `insight` |
+| `interest_over_time` | 0-100 interest curve with mean, peak, `direction` (whole window), `direction_now` (recent slope), `growth_3m` / `growth_12m` and a plain-English `insight` |
 | `compare_keywords` | Head-to-head share and winner for 2-5 keywords |
 | `related_queries` | Top & rising related searches with breakout flags, angles and `questions[]` |
 | `related_topics` | Top & rising Knowledge-Graph topics (best-effort) |
@@ -90,6 +90,18 @@ FAQ, schema). A ready-made agent skill lives in [`SKILL.md`](SKILL.md).
   comparison → table + quotes, definition → cite a primary source, news → dated publisher quotes.
 - Anything silently adjusted is reported: clamped limits add a `note`, empty results add a
   `reason`.
+- **Two trend labels.** `direction` compares the first and last third of the window
+  (`rising | falling | stable | new | no_interest | insufficient_data`; `new` = no interest
+  in the first third). `direction_now` compares the last quarter of the window with the
+  quarter before it and answers "is it still growing *now*?". A topic that peaked
+  mid-window reads `direction: rising` (or `new`) and `direction_now: falling`; the
+  `insight` sentence says so. Composites (`discover_topics`, `aeo_opportunities`) always
+  fetch the seed trend on `today 12-m` (echoed as `query.trend_timeframe`) and score on
+  `direction_now`.
+- **Suspect rising queries.** Search-manipulation campaigns attach one name to many
+  unrelated "Breakout" queries. `related_queries` flags such items `suspect: true` with a
+  `suspect_reason`; `discover_topics` moves them to `suspect[]`; `aeo_opportunities` ignores
+  them. Google's `is_breakout` value is kept, only the trust changes.
 - `citability_hints` (on `aeo_opportunities`) encode the GEO paper (Aggarwal et al., KDD
   2024): citing sources, quotations and statistics each lifted AI-engine visibility 30-40%;
   keyword stuffing did nothing.
@@ -158,8 +170,13 @@ Point a client at the clone with
   question prefix); at the default 2 s interval that is ~30 s worst case. It stops as soon
   as `limit` is met and returns partial results if Google starts refusing.
 - Values are Google's relative 0–100 index, not absolute search volume. `growth_3m` /
-  `growth_12m` compare the mean of the last window with the window before it and are
-  `null` when the timeframe is too short (use `today 12-m` / `today 5-y`).
+  `growth_12m` compare the mean of the last window with the window before it, so each
+  needs *two* windows of data: `growth_3m` needs ≥ 6 months (`today 12-m`), `growth_12m`
+  needs `today 5-y`. When either is `null` for that reason the summary carries a
+  `growth_note` saying which timeframe to use.
+- Google rate-limits the first burst of a session hardest. Start with 1–2 seeds in
+  `discover_topics` / `aeo_opportunities`; a 429 on the trend-context step no longer
+  aborts the call (related queries are still fetched), and skip messages say when to retry.
 - Question prefixes in `mine_questions` are English; for native-language questions in a
   non-English market, pass a seed already phrased in that language.
 - `related_topics` frequently returns nothing from Google; `related_queries` is reliable.
