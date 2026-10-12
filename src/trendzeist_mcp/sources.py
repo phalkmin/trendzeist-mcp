@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 from . import __version__
+from .archive import ARCHIVE_FILENAME, Archive
 from .formatters import normalise_query
 from .client import (
     CallStats,
@@ -229,6 +230,12 @@ class Hub:
         self.autocomplete = AutocompleteSource(self.settings, self.cache, self._google, self.stats)
         self.news = GoogleNewsSource(self.settings, self.cache, self._google, self.stats)
         self.wikipedia = WikipediaSource(self.settings, self.cache, self._wikimedia, self.stats)
+        # Observation archive lives next to the disk cache; no cache dir = no archive.
+        self.archive = Archive(
+            Path(resolved) / ARCHIVE_FILENAME if resolved else None,
+            enabled=self.settings.archive_enabled,
+            retention_days=self.settings.archive_days,
+        )
 
     @property
     def sources(self) -> tuple[Source, ...]:
@@ -237,9 +244,14 @@ class Hub:
     def begin_call(self) -> None:
         """Reset request/cache counters for the tool call starting on this thread."""
         self.stats.begin()
+        self.archive.begin_call()
 
     def call_meta(self) -> dict[str, Any]:
-        return self.stats.meta()
+        meta = self.stats.meta()
+        err = self.archive.call_error()
+        if err:
+            meta["archive_error"] = err
+        return meta
 
     def statuses(self) -> list[dict[str, Any]]:
         return [s.status() for s in self.sources]

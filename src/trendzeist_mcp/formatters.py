@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import pandas as pd
@@ -712,4 +712,331 @@ def citability_hints(angle: str | None) -> dict[str, Any]:
     """Evidence recipe for an angle (falls back to how-to); returns a copy."""
     hints = CITABILITY_HINTS.get(angle or "how-to", CITABILITY_HINTS["how-to"])
     return {"evidence": list(hints["evidence"]), "structure": hints["structure"], "cite": hints["cite"]}
+
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0: seasonality (N1)
+# ---------------------------------------------------------------------------
+
+MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June", "July", "August",
+    "September", "October", "November", "December",
+)
+SEASONAL_MIN_YEARS = 3
+SEASONAL_STRENGTH_THRESHOLD = 1.5
+PUBLISH_LEAD_DAYS = 42
+_FULL_YEAR_MIN_POINTS = 40  # weekly series: 52 points per full year, allow gaps
+_PEAK_OVER_MEAN = 1.2  # a year's peak month must be >= 120% of that year's monthly mean
+
+
+def seasonality_profile(series: pd.Series, today: date | None = None) -> dict[str, Any]:
+    """Monthly demand profile from a multi-year (ideally 5-y weekly) series.
+
+    - ``monthly_index``: mean per calendar month over all years, 0-100 relative to
+      the strongest month.
+    - ``peak_months``: months in a year's top 2 in >= 3 of the full years present.
+    - ``seasonal_strength`` = mean(peak months) / mean(other months).
+    - ``seasonal``: strength >= 1.5 and at least one peak month; ``None`` with a
+      ``reason`` when fewer than 3 full years of non-zero data exist.
+    - ``next_peak`` / ``next_peak_in_days`` / ``publish_by`` (peak - 42 days or
+      ``"now"`` when already inside the lead window).
+    """
+    today = today or datetime.now(timezone.utc).date()
+    out: dict[str, Any] = {
+        "seasonal": None,
+        "seasonal_strength": None,
+        "peak_months": [],
+        "trough_months": [],
+        "monthly_index": {},
+        "years_analysed": 0,
+        "next_peak": None,
+        "next_peak_in_days": None,
+        "publish_by": None,
+        "insight": None,
+    }
+    if series is None or len(series) == 0 or not isinstance(series.index, pd.DatetimeIndex):
+        out["reason"] = "No time series available."
+        return out
+    s = series.astype(float)
+    years = s.index.year
+    counts = s.groupby(years).count()
+    full_years = [
+        int(y) for y, n in counts.items() if n >= _FULL_YEAR_MIN_POINTS and s[years == y].sum() > 0
+    ]
+    out["years_analysed"] = len(full_years)
+    # Profile, strength and index all come from the same full-year subset: a partial
+    # year's four January weeks must not be able to overturn three complete years.
+    full = s[s.index.year.isin(full_years)] if full_years else s
+    monthly_all = full.groupby(full.index.month).mean()
+    if len(monthly_all):
+        peak_val = float(monthly_all.max()) or 1.0
+        out["monthly_index"] = {
+            MONTH_NAMES[int(m) - 1]: round(100.0 * float(val) / peak_val, 1)
+            for m, val in monthly_all.items()
+        }
+    if len(full_years) < SEASONAL_MIN_YEARS:
+        out["reason"] = (
+            f"Only {len(full_years)} full year(s) of data; seasonality needs at least "
+            f"{SEASONAL_MIN_YEARS} (timeframe 'today 5-y')."
+        )
+        return out
+
+    # A month is a peak candidate for a year when it is in that year's top 2 *and*
+    # clearly above the year's mean; otherwise a flat year would nominate two
+    # arbitrary months (ties resolve to January) and fake a second peak.
+    top2_counts: Counter[int] = Counter()
+    for y in full_years:
+        year_s = s[years == y]
+        year_months = year_s.groupby(year_s.index.month).mean()
+        floor = float(year_months.mean()) * _PEAK_OVER_MEAN
+        for m in year_months.sort_values(ascending=False).index[:2]:
+            if float(year_months.loc[m]) >= floor:
+                top2_counts[int(m)] += 1
+    peaks = sorted(m for m, n in top2_counts.items() if n >= SEASONAL_MIN_YEARS)
+    out["peak_months"] = [MONTH_NAMES[m - 1] for m in peaks]
+    others = [int(m) for m in monthly_all.index if int(m) not in peaks]
+    strength: float | None = None
+    if peaks and others:
+        peak_mean = float(monthly_all.loc[peaks].mean())
+        other_mean = float(monthly_all.loc[others].mean())
+        troughs = monthly_all.loc[others].nsmallest(2).index
+        out["trough_months"] = [MONTH_NAMES[int(m) - 1] for m in sorted(int(x) for x in troughs)]
+        if other_mean > 0:
+            strength = round(peak_mean / other_mean, 2)
+            out["seasonal_strength"] = strength
+            out["seasonal"] = bool(strength >= SEASONAL_STRENGTH_THRESHOLD)
+        else:
+            # Zero interest outside the peak months: the strongest seasonality there
+            # is, not an absence of it. The ratio is unbounded, so report it as such.
+            out["seasonal_strength"] = None
+            out["strength_note"] = "no measurable interest outside peak months (ratio unbounded)"
+            out["seasonal"] = peak_mean > 0
+    else:
+        out["seasonal"] = False
+
+    if out["seasonal"]:
+        # A peak month that is *today's* month is active, not upcoming.
+        if today.month in peaks:
+            out["in_peak_now"] = True
+            out["peak_month_now"] = MONTH_NAMES[today.month - 1]
+        nxt = min(
+            date(today.year if m > today.month else today.year + 1, m, 1) for m in peaks
+        )
+        out["next_peak"] = nxt.isoformat()
+        out["next_peak_in_days"] = (nxt - today).days
+        publish = nxt - timedelta(days=PUBLISH_LEAD_DAYS)
+        out["publish_by"] = "now" if publish <= today else publish.isoformat()
+        when = (
+            f"every {out['peak_months'][0]}" if len(peaks) == 1 else "in " + " and ".join(out["peak_months"])
+        )
+        ratio = f"{strength}x the rest of the year" if strength is not None else "no off-season interest"
+        if out.get("in_peak_now"):
+            out["insight"] = (
+                f"Peaks {when} ({ratio}); the peak is happening now ({out['peak_month_now']}), "
+                f"so publish immediately or plan for {out['next_peak']} (publish by {out['publish_by']})."
+            )
+        else:
+            by = "publish now" if out["publish_by"] == "now" else f"publish by {out['publish_by']}"
+            out["insight"] = f"Peaks {when} ({ratio}); next peak {out['next_peak']}, {by}."
+    else:
+        out["insight"] = (
+            "No reliable seasonal peak: demand is spread through the year. Publish on trend "
+            "signals (direction_now) rather than the calendar."
+        )
+    return out
+
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0: compare_channels
+# ---------------------------------------------------------------------------
+
+CHANNELS: tuple[tuple[str, str], ...] = (
+    ("", "web"),
+    ("youtube", "youtube"),
+    ("news", "news"),
+    ("images", "images"),
+    ("froogle", "shopping"),
+)
+FORMAT_HINTS: dict[str, str] = {
+    "web": "long-form article or guide",
+    "youtube": "video or step-by-step visual tutorial",
+    "shopping": "buying guide, comparison or 'best X' list",
+    "news": "timely or newsjacking piece",
+    "images": "visual / infographic-led content",
+}
+CHANNEL_NOISE_FLOOR = 5.0
+
+
+def channel_insight(channels: dict[str, dict[str, Any]], fastest: str | None) -> str:
+    """One sentence comparing the fastest-growing channel with web search."""
+    if not fastest:
+        return (
+            "No channel shows enough interest (mean >= 5) to compare growth; the topic is "
+            "too small or too new for a format decision."
+        )
+
+    def pct(x: float | None) -> str:
+        return "n/a" if x is None else f"{x:+.0f}%"
+
+    label = "Web search" if fastest == "web" else fastest.capitalize()
+    fg = channels[fastest].get("growth_3m") or 0.0
+    wg = (channels.get("web") or {}).get("growth_3m")
+    vs_web = "" if fastest == "web" else f" vs {pct(wg)} on web search"
+    hint = FORMAT_HINTS[fastest]
+    # "Fastest" among declining channels is "declining least": say so, and do not
+    # dress a shrinking topic up as a format opportunity.
+    if fg <= -5:
+        return (
+            f"Every channel is declining over the last quarter; {label} is falling least "
+            f"({pct(fg)}{vs_web}). This is a refresh / consolidation signal, not a launch "
+            f"signal; if you do publish, the least-bad format is a {hint}."
+        )
+    if fg < 5:
+        return (
+            f"No channel is growing meaningfully over the last quarter ({label} is flat at "
+            f"{pct(fg)}{vs_web}). Choose the format by audience fit rather than momentum; "
+            f"default: {hint}."
+        )
+    if fastest == "web":
+        return f"Web search grows fastest ({pct(fg)} over the last quarter); lead with a {hint}."
+    return f"{label} interest grows {pct(fg)}{vs_web}; lead with a {hint}."
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0: site coverage (N3)
+# ---------------------------------------------------------------------------
+
+SITE_PARTIAL_JACCARD = 0.6
+
+
+def site_coverage(candidate: str, site_queries: list[str]) -> tuple[str, str | None]:
+    """``(covered | partial | gap, matched_site_query)`` for one candidate topic.
+
+    covered: exact normalised match, or every candidate token appears in a site
+    query; partial: token Jaccard >= 0.6 with some site query; gap: otherwise.
+    """
+    cand = normalise_query(candidate)
+    if not cand or not site_queries:
+        return "gap", None
+    cand_tokens = set(cand.split())
+    best: tuple[float, str | None] = (0.0, None)
+    for sq in site_queries:
+        norm = normalise_query(sq)
+        if not norm:
+            continue
+        if norm == cand:
+            return "covered", sq
+        toks = set(norm.split())
+        if cand_tokens <= toks:
+            return "covered", sq
+        union = cand_tokens | toks
+        jac = len(cand_tokens & toks) / len(union) if union else 0.0
+        if jac > best[0]:
+            best = (jac, sq)
+    if best[0] >= SITE_PARTIAL_JACCARD:
+        return "partial", best[1]
+    return "gap", None
+
+
+
+# ---------------------------------------------------------------------------
+# 0.5.0: unified explainable opportunity score (N8)
+# ---------------------------------------------------------------------------
+
+SCORE_MAX: dict[str, int] = {"demand": 25, "momentum": 25, "freshness": 15, "gap": 20, "aeo": 15}
+SCORE_NOTE = (
+    "score is a transparent 0-100 heuristic; score_breakdown gives points, max and the "
+    "reason per component: demand 25 (questions found or top-query popularity), momentum 25 "
+    "(seed direction_now: rising 15 / stable or new 8 / falling 0 / unknown 5; +10 breakout, "
+    "+5 rising query), freshness 15 (Google News: 10 if covered this week, +5 if 10+ articles "
+    "in 30 days; 0 when news was not fetched), gap 20 (vs. site_queries: gap 20 / partial 10 / "
+    "covered 0; neutral 10 without site_queries), aeo 15 (question-shaped 5; definition angle "
+    "with no Wikipedia article +10, rising Wikipedia attention +5). Compare scores within one "
+    "call only."
+)
+
+
+def _component(points: float, maximum: int, reason: str) -> dict[str, Any]:
+    return {"points": int(max(0, min(maximum, round(points)))), "max": maximum, "reason": reason}
+
+
+def opportunity_score(
+    *,
+    questions: int = 0,
+    popularity: float | None = None,
+    direction_now: str | None = None,
+    has_breakout: bool = False,
+    is_rising: bool = False,
+    news: dict[str, Any] | None = None,
+    coverage: str | None = None,
+    angle: str | None = None,
+    wiki: dict[str, Any] | None = None,
+    question_shaped: bool = False,
+) -> tuple[int, dict[str, dict[str, Any]]]:
+    """0-100 heuristic shared by discover_topics and aeo_opportunities.
+
+    Every component reports ``points``, ``max`` and a one-line ``reason`` so the
+    model can explain (or disagree with) the ranking. Weights per SCORE_NOTE.
+    """
+    parts: dict[str, dict[str, Any]] = {}
+
+    if questions:
+        parts["demand"] = _component(
+            5 * questions, 25, f"{questions} question(s) found (5 each, max 25)"
+        )
+    elif popularity is not None:
+        parts["demand"] = _component(popularity / 4, 25, f"top-query popularity {popularity:.0f}/100")
+    else:
+        parts["demand"] = _component(5, 25, "rising-only item: popularity unknown")
+
+    base = {"rising": 15, "stable": 8, "new": 8, "falling": 0}
+    if direction_now in base:
+        pts, why = base[direction_now], f"seed direction_now {direction_now}"
+    else:
+        pts, why = 5, "seed trend unavailable"
+    if has_breakout:
+        pts, why = pts + 10, why + " + breakout"
+    elif is_rising:
+        pts, why = pts + 5, why + " + rising query"
+    parts["momentum"] = _component(pts, 25, why)
+
+    if news is None:
+        parts["freshness"] = _component(0, 15, "news not fetched")
+    else:
+        a7 = int(news.get("articles_7d") or 0)
+        a30 = int(news.get("articles_30d") or 0)
+        parts["freshness"] = _component(
+            (10 if a7 > 0 else 0) + (5 if a30 >= 10 else 0),
+            15,
+            f"{a7} article(s) in 7 d, {a30} in 30 d",
+        )
+
+    gap_pts = {"gap": 20, "partial": 10, "covered": 0}
+    if coverage in gap_pts:
+        parts["gap"] = _component(gap_pts[coverage], 20, f"site coverage: {coverage}")
+    else:
+        parts["gap"] = _component(10, 20, "no site_queries given (neutral)")
+
+    pts = 5 if (question_shaped or questions) else 0
+    why = "question-shaped" if pts else "not a question"
+    rising_wiki = wiki is not None and wiki.get("has_article") and wiki.get("direction") == "rising"
+    if angle == "definition":
+        if wiki is None:
+            pts, why = pts + 5, why + "; definition angle (Wikipedia not checked)"
+        elif wiki.get("related_article"):
+            why += "; Wikipedia has a related article (verify before claiming a gap)"
+        elif wiki.get("has_article"):
+            why += "; Wikipedia article exists"
+            if rising_wiki:
+                pts, why = pts + 5, why + " with rising attention"
+        else:
+            pts, why = pts + 10, why + "; no Wikipedia article: definition gap"
+    elif rising_wiki:
+        pts, why = pts + 5, why + "; Wikipedia attention rising"
+    parts["aeo"] = _component(pts, 15, why)
+
+    total = min(100, sum(p["points"] for p in parts.values()))
+    return total, parts
 

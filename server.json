@@ -3,7 +3,7 @@
   "name": "io.github.phalkmin/trendzeist-mcp",
   "title": "Trendzeist – Google Trends for content ideation",
   "description": "Free, keyless MCP for content ideation and AEO: Google Trends topics and questions, Google News coverage, Wikipedia attention, an AEO opportunity finder and citable-answer briefs. No API key.",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "websiteUrl": "https://phalkmin.me/en/trendzeist-google-trends-mcp/",
   "repository": {
     "url": "https://github.com/phalkmin/trendzeist-mcp",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "trendzeist-mcp",
-      "version": "0.4.1",
+      "version": "0.5.0",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [
@@ -44,6 +44,20 @@
           "isRequired": false,
           "isSecret": true,
           "format": "string"
+        },
+        {
+          "name": "TRENDZEIST_ARCHIVE",
+          "description": "Set to 0 to disable the local observation archive behind what_changed / trend_history.",
+          "isRequired": false,
+          "format": "string",
+          "default": "1"
+        },
+        {
+          "name": "TRENDZEIST_ARCHIVE_DAYS",
+          "description": "Retention in days for observation archive rows.",
+          "isRequired": false,
+          "format": "number",
+          "default": "365"
         }
       ]
     }

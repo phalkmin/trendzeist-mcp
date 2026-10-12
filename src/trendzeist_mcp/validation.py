@@ -193,3 +193,79 @@ def limit_note(requested: int | None, effective: int, *, name: str = "limit") ->
     if requested is None or requested == effective:
         return None
     return f"{name} {requested} exceeds the maximum; clamped to {effective}."
+
+
+MAX_SINCE_DAYS = 90
+MAX_HISTORY_DAYS = 365
+MAX_SITE_QUERIES = 500
+MAX_SITE_QUERY_LENGTH = 200
+MAX_TOPIC_FILTER_LENGTH = 100
+
+
+def validate_since_days(since_days: int) -> int:
+    """``what_changed`` lookback: integer 1-90 (clamped; report with ``limit_note``)."""
+    if since_days is None:
+        return 7
+    if isinstance(since_days, bool) or not isinstance(since_days, int):
+        raise ValidationError("since_days must be an integer number of days (1-90)")
+    if since_days < 1:
+        raise ValidationError("since_days must be >= 1")
+    return min(since_days, MAX_SINCE_DAYS)
+
+
+def validate_days(days: int, *, default: int, maximum: int = MAX_HISTORY_DAYS) -> int:
+    """Generic day-count argument (``trend_history.days``); clamped to ``maximum``."""
+    if days is None:
+        return default
+    if isinstance(days, bool) or not isinstance(days, int):
+        raise ValidationError("days must be an integer")
+    if days < 1:
+        raise ValidationError("days must be >= 1")
+    return min(days, maximum)
+
+
+def validate_site_queries(site_queries: Sequence[str] | None) -> tuple[list[str], int]:
+    """Clean a site-coverage list: ``(queries, dropped)`` where ``dropped`` counts
+    entries removed by the 500-item cap (report with a ``note``).
+
+    Entries are trimmed, de-duplicated case-insensitively; blanks are skipped;
+    anything longer than 200 characters is rejected (it is not a search query).
+    """
+    if site_queries is None:
+        return [], 0
+    if isinstance(site_queries, str) or not isinstance(site_queries, (list, tuple)):
+        raise ValidationError(
+            "site_queries must be a list of strings (queries the site already ranks for, "
+            "e.g. from a Search Console MCP)"
+        )
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for q in site_queries:
+        if not isinstance(q, str):
+            raise ValidationError("each site_queries entry must be a string")
+        text = " ".join(q.split())
+        if not text:
+            continue
+        if len(text) > MAX_SITE_QUERY_LENGTH:
+            raise ValidationError(
+                f"site_queries entry '{text[:20]}...' exceeds {MAX_SITE_QUERY_LENGTH} characters"
+            )
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    dropped = max(0, len(cleaned) - MAX_SITE_QUERIES)
+    return cleaned[:MAX_SITE_QUERIES], dropped
+
+
+def validate_topic_filter(topic_filter: str | None) -> str:
+    """``trending_now`` filter: free text, trimmed, ``''`` = no filter."""
+    if topic_filter is None:
+        return ""
+    if not isinstance(topic_filter, str):
+        raise ValidationError("topic_filter must be a string")
+    text = " ".join(topic_filter.split())
+    if len(text) > MAX_TOPIC_FILTER_LENGTH:
+        raise ValidationError(f"topic_filter exceeds {MAX_TOPIC_FILTER_LENGTH} characters")
+    return text

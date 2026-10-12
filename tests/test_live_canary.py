@@ -79,6 +79,24 @@ def test_wiki_attention_live(client):
     assert out["pageviews"]["days"] >= 7, out["pageviews"]
 
 
+def test_seasonality_live(client):
+    # 5-year weekly series; 'christmas gifts' peaks every December.
+    out = tools.seasonality(client, "christmas gifts", geo="US")
+    assert out["available"] is True, out.get("reason")
+    assert out["years_analysed"] >= 3, out
+    assert out["seasonal"] is True and "December" in out["peak_months"], out
+
+
+def test_compare_channels_live(client):
+    # Five IOT requests (web, youtube, news, images, froogle); later ones are `skipped`
+    # on the first 429, so only web plus at least one other channel is required here.
+    out = tools.compare_channels(client, "espresso", geo="US")
+    assert "web" in out["channels"] and out["channels"]["web"]["available"], out
+    assert out["channels"]["web"]["growth_3m"] is not None
+    assert any(c.get("available") for n, c in out["channels"].items() if n != "web"), out
+    assert out["momentum"] in {"growing", "flat", "all_declining", "unknown"}
+
+
 def test_status_live(client):
     out = tools.trendzeist_status(client)
     assert {s["name"] for s in out["sources"]} == {

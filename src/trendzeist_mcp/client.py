@@ -129,6 +129,9 @@ class Settings:
     static_ttl: int = STATIC_TTL
     max_memory_entries: int = MAX_MEMORY_ENTRIES
     max_series_points: int = MAX_SERIES_POINTS
+    # Observation archive (0.5.0): TRENDZEIST_ARCHIVE=0 disables recording.
+    archive_enabled: bool = True
+    archive_days: int = 365
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -161,6 +164,9 @@ class Settings:
             static_ttl=positive_int("TRENDZEIST_STATIC_TTL", STATIC_TTL),
             max_memory_entries=positive_int("TRENDZEIST_MAX_MEMORY_ENTRIES", MAX_MEMORY_ENTRIES),
             max_series_points=positive_int("TRENDZEIST_MAX_SERIES_POINTS", MAX_SERIES_POINTS),
+            archive_enabled=env("TRENDZEIST_ARCHIVE", "1").strip().lower()
+            not in {"0", "false", "no", "off"},
+            archive_days=positive_int("TRENDZEIST_ARCHIVE_DAYS", 365),
         )
 
     def hl_for(self, geo: str) -> str:
@@ -378,6 +384,10 @@ class CallStats:
 
     def count(self, attr: str) -> None:
         setattr(self._local, attr, getattr(self._local, attr, 0) + 1)
+
+    def misses(self) -> int:
+        """Cache misses so far in this call; lets tools record only fresh data."""
+        return getattr(self._local, "cache_misses", 0)
 
     def meta(self) -> dict[str, Any]:
         hits = getattr(self._local, "cache_hits", 0)

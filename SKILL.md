@@ -34,6 +34,38 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
    statistic, one quote, sources, FAQ, schema). `news_coverage` gives dated headlines and
    publishers to quote or pitch; `wiki_attention` gives the definition anchor or flags a gap.
 
+## Timing, format and the weekly review (0.5)
+
+- **What changed?** `what_changed(seeds, geo, since_days=7)` compares today's related
+  queries with the newest archived snapshot at least `since_days` old. Act on `action`:
+  `investigate now` (new or promoted breakout) > `consider` (new rising) >
+  `refresh existing post` (a long-standing top query that rose and settled) >
+  `review: ...` (stopped rising or left Google's list). **Never retire on `review:` alone**:
+  leaving a relative, bounded list is not falling demand. Run
+  `interest_over_time([<item>], "today 12-m")` and retire only if `direction_now` is
+  `falling`. The first call only records a baseline (`reason` gives the rerun date); a
+  `reason` saying Google returned nothing is not a mass drop. Say so instead of
+  inventing a change. `direction_flip` is on `direction_now`.
+- **When to publish?** `seasonality(keyword, geo)` -> `peak_months`, `publish_by`
+  (6 weeks before `next_peak`), `in_peak_now`, `insight`. `seasonal: null` + `reason` =
+  too young to tell; `strength_note` = no off-season interest at all (very seasonal).
+- **Which format?** `compare_channels(keyword, geo)` -> `fastest_channel`, `momentum` and
+  `format_hint` (youtube: video tutorial; shopping: buying guide; news: timely piece;
+  images: infographic-led; web: long-form guide). Use `format_hint` only when `momentum`
+  is `growing`; `all_declining` means the "fastest" channel is just falling least.
+  Compare growth only, never means.
+- **Is it worth doing on this site?** Pass `site_queries=[...]` (the site's Search
+  Console queries or page titles) to `discover_topics` / `aeo_opportunities`. `coverage`
+  is `covered` (every question answered: refresh) / `partial` (some unanswered, see
+  `coverage_counts`) / `gap` (new page). `exclude_covered=true` drops only fully covered
+  clusters. Without `site_queries` the `gap` score component is neutral.
+- **Score.** Read `score_breakdown.<component>.reason`, not the number alone; compare
+  within one call only. `momentum_seed` says which seed's trend fed a shared topic.
+  `trend_history(keyword)` is free (archive only): `breakout_episodes >= 3` in 90 days =
+  recurring topic, build a durable page (`breakout_observations` is just polling count).
+- Prompt `weekly_review(seeds, geo, site_queries)` runs this as a content meeting and
+  outputs PUBLISH NOW / PLAN FOR <date> / REFRESH / RETIRE.
+
 ## Reading the signals
 
 - `breakout` = brand-new or exploding demand (time-sensitive). `rising` = growing.
@@ -55,7 +87,8 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
   `trendzeist_status` (free) shows which source is erroring; Wikipedia keeps working
   during a Google cool-down.
 - Do not loop `mine_questions` over many seeds in one turn; 3 seeds is ~50 requests.
-  `aeo_opportunities` is worst case 1 + 10 requests per seed.
+  `aeo_opportunities` is worst case 1 + 10 requests per seed. `compare_channels` is 5
+  requests; `what_changed` is 1 + N; `seasonality` is 1; `trend_history` is 0.
 
 ## Anti-patterns
 

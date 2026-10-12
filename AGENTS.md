@@ -10,8 +10,12 @@ and Wikimedia sources for content ideation and AEO.
 src/trendzeist_mcp/
   server.py      MCP registration only (tools + prompts). Thin; delegates to tools.py / discovery.py / aeo.py.
   tools.py       Tool logic. Pure functions taking a Hub first. Unit-tested with a fake hub.
-  discovery.py   discover_topics composite (rank breakout > rising > evergreen).
-  aeo.py         aeo_opportunities composite (questions x trend x news x Wikipedia x citability).
+                 fetch_trend / fetch_related are the shared fetch+archive paths every tool
+                 and composite must use for Trends data (never hub.trends.* directly).
+  discovery.py   discover_topics composite (rank breakout > rising > evergreen, scored).
+  aeo.py         aeo_opportunities composite (questions x trend x news x Wikipedia x site x citability).
+  archive.py     Observation archive (sqlite3, lazy, never raises). Written on cache misses
+                 via tools.fetch_recording; read by what_changed / trend_history.
   client.py      Shared plumbing: Settings, TrendsError, _TTLCache, Lane (per-host lock+interval),
                  CallStats, Source base (_get/_cached/_guarded/status) and TrendsClient (Google Trends).
   sources.py     AutocompleteSource, GoogleNewsSource, WikipediaSource and Hub (composes all sources;
@@ -33,6 +37,9 @@ tests/           Offline by default. tests/test_live_canary.py is `-m live` only
   new `Source` subclass in `sources.py` + attribute on `Hub`; Google hosts share
   `Hub._google`, others get their own `Lane`.
 - Keep outputs JSON-native (no numpy scalars, no Timestamps) — use `formatters._to_native`.
+- Archive writes go through `tools.fetch_recording(hub, fetch, record)` so cache hits never
+  create snapshots; record only the *clean* rising list (`fmt.split_suspects`). Archive
+  methods must never raise — surface failures via `last_error` / `_meta.archive_error`.
 - Every tool result gets `schema_version` + `_meta` via `tools.finalize` (called by
   `server._tool`). Bump `tools.SCHEMA_VERSION` only when a field is removed or changes
   meaning; adding fields is compatible.

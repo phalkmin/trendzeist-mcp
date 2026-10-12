@@ -35,8 +35,13 @@ server = MCPServer(
         "seed and angle with trend, news coverage, Wikipedia presence and citability hints "
         "-> validate finalists with interest_over_time / compare_keywords (use the summary's "
         "insight and growth_3m/growth_12m) -> news_coverage for who to quote or pitch and "
-        "wiki_attention for the definition anchor (or the gap to fill). gprop='news' or "
-        "'youtube' shows what outlets and video audiences care about. Timeframes: "
+        "wiki_attention for the definition anchor (or the gap to fill). Timing and format: "
+        "what_changed (since the last snapshot: new breakouts, cooled or dropped queries, "
+        "with an action each), seasonality (peak months and a publish_by date), "
+        "compare_channels (web / YouTube / News / Images / Shopping growth with a "
+        "format_hint), trend_history (local archive, free). Pass site_queries (what the "
+        "site already ranks for) to discover_topics / aeo_opportunities to mark gaps. "
+        "gprop='news' or 'youtube' shows what outlets and video audiences care about. Timeframes: "
         "'now 7-d', 'today 1-m', 'today 3-m', 'today 12-m', 'today 5-y', 'all' or "
         "'YYYY-MM-DD YYYY-MM-DD'. Geo: '' (worldwide), ISO country ('US', 'BR') or region "
         "('US-CA'); results come back in the market's language unless TRENDZEIST_HL is set. "
@@ -172,10 +177,12 @@ def suggest_keywords(keyword: str) -> dict[str, Any]:
 
 
 @server.tool()
-def trending_now(geo: str = "US", max_articles: int = 3) -> dict[str, Any]:
+def trending_now(geo: str = "US", max_articles: int = 3, topic_filter: str = "") -> dict[str, Any]:
     """Real-time trending searches (last ~24h) for a country or US state, with
-    approximate traffic and linked news headlines. Good for newsjacking."""
-    return _tool(tools.trending_now)(geo, max_articles)
+    approximate traffic and linked news headlines. Good for newsjacking. topic_filter
+    keeps only trends whose title or headlines contain every word given (e.g.
+    'coffee'); the full feed is still fetched and cached once."""
+    return _tool(tools.trending_now)(geo, max_articles, topic_filter)
 
 
 @server.tool()
@@ -193,15 +200,22 @@ def discover_topics(
     category: int = 0,
     gprop: str = "",
     max_per_seed: int = 15,
+    site_queries: list[str] | None = None,
+    exclude_covered: bool = False,
 ) -> dict[str, Any]:
     """One-shot topic discovery for blog ideation. For 1-5 seed keywords, pulls
     12-month trend context (direction, direction_now, growth_3m) plus rising/top
     related queries, de-duplicates and ranks candidates as breakout > rising >
-    evergreen, each tagged with a title `angle`. `questions` collects question-shaped
-    searches across seeds; `suspect` lists spam-like rising queries kept out of the
-    ranking. Partial failures are reported per seed in `errors` instead of failing
-    the call. First call of a session: start with 1-2 seeds to avoid a 429."""
-    return _tool(_discover_topics)(seed_keywords, geo, timeframe, category, gprop, max_per_seed)
+    evergreen, each tagged with a title `angle` and an explainable `score`.
+    `questions` collects question-shaped searches across seeds; `suspect` lists
+    spam-like rising queries kept out of the ranking. site_queries = queries the
+    site already ranks for (fill from a Search Console MCP or page titles): each topic
+    then gets coverage covered / partial / gap, and exclude_covered drops the covered
+    ones. Partial failures are reported per seed in `errors` instead of failing the
+    call. First call of a session: start with 1-2 seeds to avoid a 429."""
+    return _tool(_discover_topics)(
+        seed_keywords, geo, timeframe, category, gprop, max_per_seed, site_queries, exclude_covered
+    )
 
 
 @server.tool()
@@ -215,15 +229,24 @@ def mine_questions(seed: str, geo: str = "", limit: int = 30) -> dict[str, Any]:
 
 @server.tool()
 def aeo_opportunities(
-    seeds: list[str], geo: str = "", timeframe: str = "today 3-m", limit: int = 10
+    seeds: list[str],
+    geo: str = "",
+    timeframe: str = "today 3-m",
+    limit: int = 10,
+    site_queries: list[str] | None = None,
+    exclude_covered: bool = False,
 ) -> dict[str, Any]:
     """AEO opportunity finder. For 1-5 seeds: question-shaped searches (Trends + a
     capped Autocomplete pass) clustered by seed and title angle, each scored with
     the seed's recent trend (direction_now over 12 months, growth_3m), Google News
-    coverage (who to quote / pitch), Wikipedia presence and the evidence type that
-    makes the answer citable. Spam-like rising queries are ignored. Up to ~1+10
-    requests per seed; partial failures per source in `errors`. limit: clusters (1-25)."""
-    return _tool(_aeo_opportunities)(seeds, geo, timeframe, limit)
+    coverage (who to quote / pitch), Wikipedia presence, the site's own coverage and
+    the evidence type that makes the answer citable (score_breakdown explains every
+    point). site_queries = queries the site already ranks for (fill from a Search
+    Console MCP or page titles); clusters then carry coverage covered / partial / gap
+    and exclude_covered drops covered ones. Spam-like rising queries are ignored.
+    Up to ~1+10 requests per seed; partial failures per source in `errors`.
+    limit: clusters (1-25)."""
+    return _tool(_aeo_opportunities)(seeds, geo, timeframe, limit, site_queries, exclude_covered)
 
 
 @server.tool()
@@ -245,10 +268,53 @@ def wiki_attention(topic: str, lang: str = "en", days: int = 30) -> dict[str, An
 
 
 @server.tool()
+def what_changed(seeds: list[str], geo: str = "", since_days: int = 7) -> dict[str, Any]:
+    """What changed for 1-5 seeds since the last snapshot at least since_days (1-90)
+    old: new_breakouts and promoted (action: investigate now), new_rising (consider),
+    cooled / dropped queries (review: verify with interest_over_time before retiring,
+    or refresh existing post), rank_moves and a direction_flip on direction_now.
+    Leaving Google's relative list is not proof of falling demand. Refreshes current
+    data first (1 + N requests, cached), then compares complete snapshots from the
+    local observation archive, which fills up as any tool fetches fresh data. No
+    baseline yet -> per-seed reason with the date to rerun."""
+    return _tool(tools.what_changed)(seeds, geo, since_days)
+
+
+@server.tool()
+def trend_history(keyword: str, geo: str = "", days: int = 90) -> dict[str, Any]:
+    """Local archive of what the tools have seen about a keyword (as a seed or as a
+    related query under other seeds) in the last `days` (1-365): first_seen /
+    last_seen, breakout_episodes (separate breakout runs; >= 3 = recurring, durable
+    page) vs breakout_observations (polling count), direction_timeline per timeframe
+    and seen_under_seeds. Free: makes no network requests."""
+    return _tool(tools.trend_history)(keyword, geo, days)
+
+
+@server.tool()
+def seasonality(keyword: str, geo: str = "") -> dict[str, Any]:
+    """When demand for a keyword peaks each year (5-year weekly data): monthly_index,
+    peak_months, seasonal_strength, next_peak and publish_by (6 weeks before the
+    peak), with a plain-English insight. One request; seasonal=null with a reason
+    when fewer than 3 full years exist."""
+    return _tool(tools.seasonality)(keyword, geo)
+
+
+@server.tool()
+def compare_channels(keyword: str, geo: str = "", timeframe: str = "today 12-m") -> dict[str, Any]:
+    """Which Google property a topic grows on: web, youtube, news, images, shopping,
+    each with direction / direction_now / growth_3m, plus fastest_channel and a
+    format_hint (video tutorial, buying guide, newsjacking piece ...). 5 requests
+    (web first; the rest are `skipped` on a 429). Channels are separate 0-100 scales:
+    compare growth, never means."""
+    return _tool(tools.compare_channels)(keyword, geo, timeframe)
+
+
+@server.tool()
 def trendzeist_status() -> dict[str, Any]:
     """Health of every data source (google_trends, google_autocomplete, google_news,
-    wikipedia: live / error / idle with the last error), cache usage and effective
-    settings. Free: makes no network requests."""
+    wikipedia: live / error / idle with the last error), cache usage, observation
+    archive (rows, dates, last_error) and effective settings. Free: makes no
+    network requests."""
     return _tool(tools.trendzeist_status)()
 
 
@@ -344,6 +410,53 @@ def content_brief(topic: str, audience: str = "general readers", geo: str = "") 
         "- Target regions and the language to write in.\n"
         "- Publishers / outlets to quote or pitch, from news_coverage.\n"
         "- Publish timing from the trend signals, and what data was unavailable."
+    )
+
+
+@server.prompt()
+def weekly_review(seeds: str, geo: str = "", site_queries: str = "") -> str:
+    """Weekly content meeting: what changed, what is seasonal, which format, what to publish / refresh / retire."""
+    seed_list = [s.strip() for s in seeds.split(",") if s.strip()]
+    seeds_repr = ", ".join(f"'{s}'" for s in seed_list) or "'<seed>'"
+    where = geo or "worldwide"
+    site_line = (
+        f"site_queries=[{site_queries}]"
+        if site_queries.strip()
+        else "site_queries=[] (ask for the Search Console query list, or page titles, if available)"
+    )
+    return (
+        f"You are running the weekly content review for seeds [{seeds_repr}] (market: {where}).\n\n"
+        "Research, in this order (stop and report if a tool returns a 429):\n"
+        f"1. what_changed(seeds=[{seeds_repr}], geo='{geo}', since_days=7). For each seed read "
+        "new_breakouts and promoted (action: investigate now), new_rising (consider), "
+        "cooled / dropped (action starts with 'review:' or is 'refresh existing post'), "
+        "rank_moves and direction_flip. If a seed has no baseline yet, say so and note the "
+        "rerun date from its reason; if a seed's reason says Google returned nothing, report "
+        "that, do not infer drops.\n"
+        "2. For every 'review:' item you intend to retire: interest_over_time([<item>], "
+        "'today 12-m'). Retire only if direction_now is falling; otherwise it is a refresh.\n"
+        "3. For each new breakout or rising item that looks evergreen (a how-to, a product "
+        "or a recurring event rather than a one-off headline): seasonality(keyword=<item>, "
+        f"geo='{geo}'). Note peak_months, publish_by, in_peak_now and the insight.\n"
+        f"4. For the top 3 items by opportunity: compare_channels(keyword=<item>, geo='{geo}'). "
+        "Use format_hint only when momentum is 'growing'; 'all_declining' is a refresh signal.\n"
+        f"5. aeo_opportunities(seeds=[{seeds_repr}], geo='{geo}', {site_line}). Prefer clusters "
+        "with coverage 'gap'; 'partial' clusters still contain unanswered questions (see "
+        "coverage_counts); only fully 'covered' clusters are refresh candidates. Quote "
+        "score_breakdown reasons, not the raw number.\n"
+        "6. Optional: trend_history(keyword=<item>) for anything that looks familiar; "
+        "breakout_episodes >= 3 means a recurring topic that deserves a durable page "
+        "(breakout_observations is just how often it was polled).\n\n"
+        "Output a prioritised list with four sections: PUBLISH NOW (new breakouts, rising items "
+        "inside their publish window), PLAN FOR <date> (seasonal items: publish_by date, peak "
+        "month), REFRESH (covered clusters, cooled queries, rank drops on topics the site "
+        "already ranks for), RETIRE (only items confirmed falling in step 2). For every item give: working "
+        "title, target keyword, format (from format_hint or the angle), evidence type "
+        "(how-to: steps + numbers; comparison: table + quotes; definition: cited definition; "
+        "news: dated publisher quotes), the signal that put it there (quote the tool's "
+        "insight or action verbatim), and the date. Say explicitly what the archive could "
+        "not answer yet (no baseline) instead of guessing. Decide on direction_now, never on "
+        "direction alone, and ignore anything listed under suspect."
     )
 
 

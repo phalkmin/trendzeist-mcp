@@ -399,10 +399,15 @@ def test_discover_topics_keeps_suspect_breakouts_out_of_ranking():
     topics = [t["topic"] for t in out["topics"]]
     assert "codex vs claude code abraham quiros villalba" not in topics
     assert "abrahamquirosvillalba .com" not in topics
-    assert out["topics"][0] == {
+    first = dict(out["topics"][0])
+    score, breakdown = first.pop("score"), first.pop("score_breakdown")
+    assert first.pop("momentum_seed") == "claude code"
+    assert first == {
         "topic": "how to install claude code", "signal": "breakout", "growth_pct": 9000,
         "popularity": None, "source_seeds": ["claude code"], "angle": "how-to",
     }
+    assert score == sum(p["points"] for p in breakdown.values())
+    assert breakdown["momentum"]["points"] == 18 and "breakout" in breakdown["momentum"]["reason"]
     assert out["counts"] == {"breakout": 1, "rising": 1, "evergreen": 2, "questions": 1, "suspect": 4}
     assert [s["topic"] for s in out["suspect"]][:1] == ["codex vs claude code abraham quiros villalba"]
     assert out["suspect"][0]["is_breakout"] is True and "abraham quiros villalba" in out["suspect"][0]["reason"]
@@ -570,10 +575,14 @@ def test_server_registers_tools_and_prompt(monkeypatch):
         "aeo_opportunities",
         "news_coverage",
         "wiki_attention",
+        "what_changed",
+        "trend_history",
+        "seasonality",
+        "compare_channels",
         "trendzeist_status",
     }
     assert [p.name for p in asyncio.run(server.server.list_prompts())] == [
-        "blog_ideas_from_trends", "answer_brief", "content_brief",
+        "blog_ideas_from_trends", "answer_brief", "content_brief", "weekly_review",
     ]
 
     res = asyncio.run(server.server.call_tool("related_queries", {"keyword": "espresso"}))
@@ -581,13 +590,13 @@ def test_server_registers_tools_and_prompt(monkeypatch):
     payload = json.loads(res.content[0].text)
     assert payload["rising"][0]["is_breakout"] is True
     # Every result carries the schema version and per-call meta (C11 / N15).
-    assert payload["schema_version"] == tools.SCHEMA_VERSION == 2
+    assert payload["schema_version"] == tools.SCHEMA_VERSION == 3
     assert payload["_meta"]["requests_made"] == 2 and payload["_meta"]["cache_hit"] is False
     assert server._hub.calls[0] == ("begin",)
 
     mq = asyncio.run(server.server.call_tool("mine_questions", {"seed": "espresso", "limit": 3}))
     mq_payload = json.loads(mq.content[0].text)
-    assert mq_payload["count"] == 3 and mq_payload["schema_version"] == 2
+    assert mq_payload["count"] == 3 and mq_payload["schema_version"] == 3
 
     # Validation failures surface as ToolError with an actionable message.
     with pytest.raises(ToolError, match="Invalid argument"):
@@ -735,7 +744,12 @@ def test_aeo_opportunities_clusters_scores_and_ranks():
         "seed", "angle", "score", "score_breakdown", "questions", "question_count",
         "evidence_from", "trend", "news", "wikipedia", "citability_hints", "brief",
     }
-    assert sum(top["score_breakdown"].values()) == top["score"]
+    assert sum(p["points"] for p in top["score_breakdown"].values()) == top["score"]
+    assert set(top["score_breakdown"]) == {"demand", "momentum", "freshness", "gap", "aeo"}
+    assert all(set(p) == {"points", "max", "reason"} for p in top["score_breakdown"].values())
+    assert top["heuristic"] is True
+    assert top["score_breakdown"]["gap"]["points"] == 10  # neutral without site_queries
+    assert "coverage" not in top
     assert top["citability_hints"] == fmt.citability_hints(top["angle"])
     # cross-seed / cross-source dedupe by normalised form
     all_qs = [q.lower() for o in ops for q in o["questions"]]
@@ -757,7 +771,7 @@ def test_aeo_opportunities_trend_block_short_series_explains_null_growth():
     trend = out["opportunities"][0]["trend"]
     assert trend["direction"] == "rising" and trend["direction_now"] == "stable"
     assert trend["growth_3m"] is None and "6 months" in trend["growth_note"]
-    assert out["opportunities"][0]["score_breakdown"]["trend"] in (10, 25)  # stable now
+    assert out["opportunities"][0]["score_breakdown"]["momentum"]["points"] in (8, 18)  # stable now
 
 
 def test_aeo_opportunities_scores_recent_slope_not_whole_window():
@@ -778,7 +792,8 @@ def test_aeo_opportunities_scores_recent_slope_not_whole_window():
     assert "growth_note" not in trend
     assert "fell" in trend["insight"] and "(falling)" in trend["insight"]
     for op in out["opportunities"]:
-        assert op["score_breakdown"]["trend"] in (0, 15)  # only the breakout bonus survives
+        m = op["score_breakdown"]["momentum"]
+        assert m["points"] in (0, 10) and "falling" in m["reason"]  # only the breakout bonus survives
 
 
 def test_aeo_opportunities_iot_429_does_not_skip_seed_requests():
@@ -816,8 +831,13 @@ def test_aeo_related_wikipedia_hit_is_not_a_citation_or_confirmed_gap():
     out = aeo_opportunities(client, ["espresso"])
     wiki = {"has_article": False, "title": None, "related_article": "Coffee"}
     assert out["seeds"][0]["wikipedia"] == wiki
-    assert all(op["wikipedia"] == wiki and op["score_breakdown"]["wikipedia"] == 0
-               for op in out["opportunities"])
+    assert all(op["wikipedia"] == wiki for op in out["opportunities"])
+    # A related-only hit is never a definition gap: no Wikipedia points in the aeo component.
+    for op in out["opportunities"]:
+        aeo = op["score_breakdown"]["aeo"]
+        assert aeo["points"] == 5 and "definition gap" not in aeo["reason"]
+        if op["angle"] == "definition":
+            assert "verify" in aeo["reason"]
     assert all("verify relevance" in op["brief"] for op in out["opportunities"])
     assert not any(call[0] == "wiki_views" for call in client.calls)
 

@@ -1,6 +1,6 @@
 [project]
 name = "trendzeist-mcp"
-version = "0.4.1"
+version = "0.5.0"
 description = "Free, local MCP server for content ideation and AEO: Google Trends topics and questions, Google News coverage, Wikipedia attention, an AEO opportunity finder. No API key, no browser."
 readme = "README.md"
 requires-python = ">=3.11"

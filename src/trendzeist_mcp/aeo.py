@@ -24,36 +24,34 @@ _ANGLE_RANK = {angle: i for i, angle in enumerate(fmt.ANGLES)}
 # Seed trend context always uses a 12-month window, independent of the
 # related-queries timeframe: it is one request for up to 5 seeds either way, and
 # only a >= 6-month series can yield growth_3m and a meaningful direction_now.
-TREND_TIMEFRAME = "today 12-m"
+TREND_TIMEFRAME = tools.TREND_TIMEFRAME
 
 
-def _score(
-    cluster: dict[str, Any],
-    trend: dict[str, Any],
-    news: dict[str, Any] | None,
-    wiki: dict[str, Any] | None,
-) -> tuple[int, dict[str, int]]:
-    """Transparent 0-100 heuristic; every component is reported in score_breakdown."""
-    parts: dict[str, int] = {"questions": min(40, 8 * len(cluster["questions"]))}
-    # Recent slope, not the whole-window label: a topic that peaked six months ago
-    # and fell 70% since must not keep collecting "rising" points.
-    parts["trend"] = {"rising": 20, "stable": 10, "new": 10}.get(trend.get("direction_now"), 0)
-    parts["trend"] += 15 if cluster["has_breakout"] else 0
-    if news is None:
-        parts["news"] = 0
-    else:
-        parts["news"] = (10 if news["articles_7d"] > 0 else 0) + (
-            5 if news["articles_30d"] >= 10 else 0
-        )
-    if wiki is None:
-        parts["wikipedia"] = 0
-    elif wiki.get("related_article"):
-        parts["wikipedia"] = 0  # a search hit is not evidence of a missing article
-    elif wiki["has_article"]:
-        parts["wikipedia"] = 10 if wiki.get("direction") == "rising" else 0
-    else:
-        parts["wikipedia"] = 10 if cluster["angle"] == "definition" else 5
-    return min(100, sum(parts.values())), parts
+def _cluster_coverage(
+    cluster: dict[str, Any], site: list[str]
+) -> tuple[str | None, str | None, dict[str, int]]:
+    """Cluster coverage from its questions; conservative so no gap is hidden.
+
+    ``covered`` only when *every* question is covered; ``gap`` when none is covered
+    or partial; ``partial`` otherwise (a mix). ``matched`` is the site query behind
+    the first covered / partial question. Returns
+    ``(coverage, matched_site_query, per_question_counts)``.
+    """
+    if not site:
+        return None, None, {}
+    counts = {"covered": 0, "partial": 0, "gap": 0}
+    matched: str | None = None
+    for q in cluster["questions"]:
+        cov, m = fmt.site_coverage(q, site)
+        counts[cov] += 1
+        if m and matched is None:
+            matched = m
+    total = sum(counts.values())
+    if total and counts["covered"] == total:
+        return "covered", matched, counts
+    if counts["covered"] == 0 and counts["partial"] == 0:
+        return "gap", None, counts
+    return "partial", matched, counts
 
 
 def _trend_block(trend: dict[str, Any]) -> dict[str, Any]:
@@ -113,11 +111,9 @@ def _seed_context(
 
     if not cooling:
         try:
-            res = hub.trends.related_queries(seed, tf, g, 0, "")
-            rising = fmt.mark_breakouts(fmt.related_list(res.get("rising"), 25, label="query"))
-            top = fmt.related_list(res.get("top"), 25, label="query")
+            top, rising = tools.fetch_related(hub, seed, tf, g, 0, "", 25)
             # Suspect (spam-like) rising items never become questions or breakouts.
-            rising, _ = fmt.split_suspects(fmt.flag_suspects(rising, top, seed))
+            rising, _ = fmt.split_suspects(rising)
             for q in fmt.extract_questions(
                 ("rising", rising), ("top", top), limit=_QUESTIONS_PER_SEED
             ):
@@ -195,12 +191,15 @@ def aeo_opportunities(
     geo: str = "",
     timeframe: str = "today 3-m",
     limit: int = 10,
+    site_queries: list[str] | None = None,
+    exclude_covered: bool = False,
 ) -> dict[str, Any]:
     """Question clusters x trend x news coverage x Wikipedia presence x citability hints."""
     kws = v.validate_keywords(seeds)
     tf = v.validate_timeframe(timeframe)
     g = v.validate_geo(geo)
     lim = v.validate_limit(limit, default=10, maximum=25)
+    site, site_dropped = v.validate_site_queries(site_queries)
     hl = tools._hl_for(hub, g)
     lang = hl.split("-")[0].lower()
     news_geo = g.split("-")[0] if g else "US"
@@ -210,9 +209,7 @@ def aeo_opportunities(
 
     trends: dict[str, Any] = {}
     try:
-        trends = fmt.interest_over_time(
-            hub.trends.interest_over_time(kws, TREND_TIMEFRAME, g, 0, ""), kws
-        )["summary"]
+        trends = tools.fetch_trend(hub, kws, TREND_TIMEFRAME, g)["summary"]
     except TrendsError as exc:
         errors.append({"step": "interest_over_time", "error": str(exc)})
         # Trend context is enrichment only. Do not enter cooling here: the first
@@ -262,26 +259,45 @@ def aeo_opportunities(
         context[seed] = (trend, news, wiki)
 
     ranked: list[dict[str, Any]] = []
+    covered_dropped = 0
     for cluster in clusters.values():
         trend, news, wiki = context[cluster["seed"]]
-        score, parts = _score(cluster, trend, news, wiki)
-        hints = fmt.citability_hints(cluster["angle"])
-        ranked.append(
-            {
-                "seed": cluster["seed"],
-                "angle": cluster["angle"],
-                "score": score,
-                "score_breakdown": parts,
-                "questions": cluster["questions"][:8],
-                "question_count": len(cluster["questions"]),
-                "evidence_from": sorted(cluster["origins"]),
-                "trend": _trend_block(trend),
-                "news": news,
-                "wikipedia": wiki,
-                "citability_hints": hints,
-                "brief": _brief(cluster, hints, news, wiki),
-            }
+        coverage, matched, cov_counts = _cluster_coverage(cluster, site)
+        if exclude_covered and coverage == "covered":
+            covered_dropped += 1
+            continue
+        score, parts = fmt.opportunity_score(
+            questions=len(cluster["questions"]),
+            direction_now=trend.get("direction_now"),
+            has_breakout=cluster["has_breakout"],
+            news=news,
+            coverage=coverage,
+            angle=cluster["angle"],
+            wiki=wiki,
+            question_shaped=True,
         )
+        hints = fmt.citability_hints(cluster["angle"])
+        item: dict[str, Any] = {
+            "seed": cluster["seed"],
+            "angle": cluster["angle"],
+            "score": score,
+            "score_breakdown": parts,
+            "heuristic": True,
+            "questions": cluster["questions"][:8],
+            "question_count": len(cluster["questions"]),
+            "evidence_from": sorted(cluster["origins"]),
+            "trend": _trend_block(trend),
+            "news": news,
+            "wikipedia": wiki,
+            "citability_hints": hints,
+            "brief": _brief(cluster, hints, news, wiki),
+        }
+        if coverage is not None:
+            item["coverage"] = coverage
+            item["coverage_counts"] = cov_counts
+            if matched:
+                item["matched"] = matched
+        ranked.append(item)
     ranked.sort(
         key=lambda c: (-c["score"], kws.index(c["seed"]), _ANGLE_RANK.get(c["angle"], 99))
     )
@@ -305,15 +321,7 @@ def aeo_opportunities(
             "questions": len(seen),
         },
         "errors": errors,
-        "score_note": (
-            "score is a transparent heuristic (0-100): questions found (8 each, max 40); seed "
-            "trend over the last 12 months by direction_now, the recent slope (rising 20 / "
-            "stable or new 10 / falling 0; +15 if a breakout question); news (10 if covered "
-            "this week, +5 if 10+ articles in 30 days); Wikipedia (10 if the article's "
-            "attention is rising; no search hit scores 10 for definition angles, else 5; "
-            "a related-only hit scores 0). "
-            "Compare scores within one call only."
-        ),
+        "score_note": fmt.SCORE_NOTE,
         "guidance": (
             "Each opportunity is one cluster of question-shaped searches sharing a seed and a "
             "title angle. Write one page per cluster: answer the questions in order, include "
@@ -327,12 +335,24 @@ def aeo_opportunities(
             "Google results are cached 15 min / 24 h, Wikipedia 24 h."
         ),
     }
+    if site:
+        out["query"]["site_queries_count"] = len(site)
+        out["counts"]["covered"] = (
+            sum(1 for c in ranked if c.get("coverage") == "covered") + covered_dropped
+        )
+        out["counts"]["partial"] = sum(1 for c in ranked if c.get("coverage") == "partial")
+        out["counts"]["gap"] = sum(1 for c in ranked if c.get("coverage") == "gap")
     if cooling:
         out["partial"] = (
             "Google started rate limiting during this call: later seeds have fewer questions "
             "and no news figures (see seeds[].skipped and errors). Wikipedia data is complete."
         )
-    note = v.limit_note(limit, lim)
-    if note:
-        out["note"] = note
+    notes = [
+        v.limit_note(limit, lim),
+        f"site_queries truncated to {v.MAX_SITE_QUERIES}; {site_dropped} dropped." if site_dropped else None,
+        f"{covered_dropped} covered cluster(s) removed (exclude_covered=true)." if covered_dropped else None,
+    ]
+    notes = [n for n in notes if n]
+    if notes:
+        out["note"] = " ".join(notes)
     return out

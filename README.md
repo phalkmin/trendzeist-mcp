@@ -60,31 +60,55 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 
 | Tool | What you get |
 |---|---|
-| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle`; plus `questions[]` people ask and `suspect[]` spam-like rising queries kept out of the ranking |
+| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle` and an explainable `score`; plus `questions[]` people ask and `suspect[]` spam-like rising queries kept out of the ranking. Pass `site_queries` (what your site already ranks for) to mark each topic `covered / partial / gap` |
 | `mine_questions` | Long-tail questions about a seed from Google Autocomplete (`how to`, `why`, `what is`, `vs` …), deduped and angle-tagged — FAQ / AEO fuel |
-| `aeo_opportunities` | Question clusters per seed × angle, scored with the seed's recent trend (`direction_now`, `growth_3m` over 12 months), Google News coverage (publishers to quote / pitch), Wikipedia presence and citability hints — one call, partial failures per source |
+| `aeo_opportunities` | Question clusters per seed × angle, scored with the seed's recent trend (`direction_now`, `growth_3m` over 12 months), Google News coverage (publishers to quote / pitch), Wikipedia presence, your site's coverage (`site_queries`) and citability hints — one call, partial failures per source |
+| `what_changed` | What moved since your last snapshot (1-90 days): new and promoted breakouts (*investigate now*), new rising (*consider*), cooled / dropped queries (*refresh existing post*, or *review* — verify with `interest_over_time` before retiring), rank moves and a `direction_now` flip — from the local observation archive |
+| `seasonality` | When demand peaks each year (5-year weekly data): `peak_months`, `seasonal_strength`, `next_peak`, `publish_by` (6 weeks before), one-sentence `insight` |
+| `compare_channels` | Where a topic grows: web / YouTube / News / Images / Shopping with `growth_3m`, `direction_now`, `fastest_channel`, `momentum` (growing / flat / all_declining) and a `format_hint` (video tutorial, buying guide, newsjacking piece …) |
+| `trend_history` | Everything the local archive has seen about a keyword: `first_seen`, `breakout_episodes` (separate runs; recurring = durable page) vs `breakout_observations` (polling count), `direction_timeline` per timeframe, `seen_under_seeds` — free, no requests |
 | `news_coverage` | Who covers a topic in Google News: headlines, publisher frequency table, recency histogram, coverage label |
 | `wiki_attention` | Exact-title Wikipedia article and daily pageviews (direction, growth); `has_article=false` and optional `related_article` when only a different search hit is found |
-| `trendzeist_status` | Health of every source (live / error / idle), cache usage, effective settings — free, no requests |
+| `trendzeist_status` | Health of every source (live / error / idle), cache usage, observation archive (rows, dates, last error), effective settings — free, no requests |
 | `interest_over_time` | 0-100 interest curve with mean, peak, `direction` (whole window), `direction_now` (recent slope), `growth_3m` / `growth_12m` and a plain-English `insight` |
 | `compare_keywords` | Head-to-head share and winner for 2-5 keywords |
 | `related_queries` | Top & rising related searches with breakout flags, angles and `questions[]` |
 | `related_topics` | Top & rising Knowledge-Graph topics (best-effort) |
 | `interest_by_region` | Where demand lives: COUNTRY (worldwide), REGION (within a country), CITY / DMA (US or worldwide) |
 | `suggest_keywords` | Disambiguate a term into Google entities (title, type, mid) |
-| `trending_now` | What's trending right now, with news headlines |
+| `trending_now` | What's trending right now, with news headlines; `topic_filter` keeps only trends mentioning your words |
 | `list_categories` | Find Google Trends category ids to narrow any query |
 
 Prompts: `blog_ideas_from_trends(topic, audience, geo)` (guided ideation),
-`content_brief(topic, audience, geo)` (titles, outline, FAQ, regions, publishers) and
+`content_brief(topic, audience, geo)` (titles, outline, FAQ, regions, publishers),
 `answer_brief(question, geo)` (a citable answer: direct answer, statistic, quote, sources,
-FAQ, schema). A ready-made agent skill lives in [`SKILL.md`](SKILL.md).
+FAQ, schema) and `weekly_review(seeds, geo, site_queries)` (content meeting: publish now /
+plan for a date / refresh / retire). A ready-made agent skill lives in [`SKILL.md`](SKILL.md).
 
 **Output conventions**
 
-- Every result carries `schema_version` (currently `2`; bumped only when a field is removed
+- Every result carries `schema_version` (currently `3`; bumped only when a field is removed
   or changes meaning) and `_meta` with `requests_made`, `cache_hit`, `cache_hits`,
-  `cache_misses` for that call — so the model knows when to slow down.
+  `cache_misses` for that call — so the model knows when to slow down. `_meta.archive_error`
+  appears only when the local archive could not be written (the tool result is unaffected).
+- **Explainable score.** `discover_topics.topics[]` and `aeo_opportunities.opportunities[]`
+  carry `score` (0-100) and `score_breakdown` with five components, each
+  `{points, max, reason}`: `demand` 25 (questions found or top-query popularity),
+  `momentum` 25 (`direction_now` + breakout / rising), `freshness` 15 (Google News, 0 when
+  not fetched), `gap` 20 (vs. `site_queries`: gap 20 / partial 10 / covered 0; neutral 10
+  without them), `aeo` 15 (question-shaped; definition angle with no Wikipedia article).
+  Compare scores within one call only.
+- **Observation archive.** Every fresh fetch (not cache hits) of related queries, trend
+  labels, trending searches and mined questions becomes one snapshot (unique id; an empty
+  Google answer is a snapshot too) with normalised rows in `archive.sqlite3` next to the
+  disk cache (stdlib `sqlite3`, 365-day retention, opened lazily). Related-query snapshots
+  hold the *complete* lists regardless of a caller's `limit`, so comparisons never invent
+  drops. `what_changed` and `trend_history` read it; `trendzeist_status.archive` reports
+  it. Suspect rising queries never enter it. Archive errors never fail a tool.
+  `TRENDZEIST_ARCHIVE=0` turns it off.
+- **Site coverage is conservative.** An `aeo_opportunities` cluster is `covered` only when
+  *every* question in it is covered; a mix is `partial` (see `coverage_counts`), so
+  `exclude_covered` can never hide an unanswered question.
 - `angle` is one of `how-to | comparison | listicle | definition | news` (or `null`) —
   the title format the query suggests. Pair it with evidence: how-to → steps + numbers,
   comparison → table + quotes, definition → cite a primary source, news → dated publisher quotes.
@@ -120,6 +144,7 @@ FAQ, schema). A ready-made agent skill lives in [`SKILL.md`](SKILL.md).
 | Ranked topic discovery in one call | ✅ `discover_topics` | ❌ raw primitives only |
 | Guided ideation prompt | ✅ `blog_ideas_from_trends` | ❌ |
 | Multi-source, keyless | ✅ Trends + Autocomplete + News + Wikipedia | single source, or paid aggregators |
+| Knows *when* and *what's worth it* | ✅ `what_changed`, `seasonality`, `compare_channels`, `site_queries` gaps | ❌ data only, no editorial reading |
 | Related queries + breakout detection | ✅ | often missing in hosted/paid servers |
 | Cost / auth | free, none | API key, monthly quota |
 | Browser required | no | Chrome for some Python libraries |
@@ -156,7 +181,9 @@ Point a client at the clone with
 | `TRENDZEIST_RETRIES` | `3` | Retry attempts on transient errors |
 | `TRENDZEIST_BACKOFF` | `1.5` | Exponential backoff factor |
 | `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs. Rotated per request for explore calls; **RSS, Autocomplete, News and Wikipedia always use the first one** |
-| `TRENDZEIST_CACHE_DIR` | OS user cache dir | Persistent JSON cache location (`0700`); `off` to disable |
+| `TRENDZEIST_CACHE_DIR` | OS user cache dir | Persistent JSON cache location (`0700`); `off` to disable (also disables the archive) |
+| `TRENDZEIST_ARCHIVE` | `1` | `0` disables the observation archive (`what_changed` / `trend_history` then report `available: false`) |
+| `TRENDZEIST_ARCHIVE_DAYS` | `365` | Retention for archive rows (pruned once per process on first write) |
 | `TRENDZEIST_LOG_LEVEL` | `WARNING` | Python logging level (stderr) |
 
 ## Notes & limitations
@@ -189,6 +216,20 @@ Point a client at the clone with
   Verify related titles and redirects manually before claiming an encyclopedic content gap.
 - Cache TTLs, memory-entry count and series-point cap must be positive integers; invalid
   values produce an actionable tool error rather than an opaque formatter failure.
+- `what_changed` needs a baseline: the first call records one and reports
+  `reason: "baseline recorded <date>; rerun after <date>"` per seed. Snapshots accrue from
+  everyday use (`discover_topics`, `related_queries` on `today 3-m`; trend labels on
+  `today 12-m`), so a week of normal work is enough. `trend_history` is archive-only.
+- `seasonality` needs at least 3 full years of non-zero weekly data (`today 5-y`); younger
+  topics return `seasonal: null` with a `reason`. Profile and strength use full years only;
+  zero off-season interest is reported as seasonal with `strength_note` (ratio unbounded);
+  `in_peak_now` flags that the peak month is the current one. `compare_channels` issues 5
+  requests and stops at the first 429 (`skipped` lists the rest); channels are separate
+  0-100 scales, and `momentum: all_declining` means `fastest_channel` is only falling least.
+- `what_changed` never says "retire": leaving Google's relative, bounded related list is
+  not evidence of falling demand. Items get `review: ...` actions; confirm with
+  `interest_over_time` on the item before retiring. A snapshot where Google returned
+  nothing is reported as such, not as a mass drop.
 - Camoufox/browser mode from pytrends-modern is intentionally not used.
 
 ## Disclaimer

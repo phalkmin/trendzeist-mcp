@@ -4,6 +4,79 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-10-11
+
+"Knows *when* and *what's worth it*": what changed since last week, seasonal publish-by
+dates, which channel a topic grows on, and opportunities checked against your own site.
+`schema_version` **2 → 3** (see Changed).
+
+### Added
+- **Observation archive** (`archive.py`, stdlib `sqlite3`, `archive.sqlite3` next to the
+  disk cache). Every *fresh* fetch (never a cache hit) of related queries (top + clean
+  rising), trend labels (`direction`, `direction_now`, `growth_3m`), trending searches and
+  mined questions becomes one **snapshot** (uuid header row — an empty Google answer is a
+  snapshot too) with normalised observation rows keyed by seed / geo / timeframe.
+  Related-query snapshots store the *complete* lists Google returned, independent of the
+  caller's display `limit`. Suspect rising queries never enter it. Normalisation is the
+  same as the question de-duper (`Wi-Fi` ≡ `wi fi`). Opened lazily (cold start
+  unchanged), WAL, one locked connection, 365-day retention (`TRENDZEIST_ARCHIVE_DAYS`),
+  opt-out `TRENDZEIST_ARCHIVE=0`. Archive errors (including malformed stored timestamps)
+  never fail a tool: they appear as `_meta.archive_error` and in `trendzeist_status.archive`.
+- **`what_changed(seeds, geo, since_days=7)`**: refreshes current data, then compares with
+  the newest snapshot at least `since_days` old. Per seed: `new_breakouts` and `promoted`
+  (a known query that became a breakout; action `investigate now`), `new_rising`
+  (`consider`), `cooled` (rising → top: `refresh existing post` when it was already a top
+  query, else `review: no longer rising …`), `dropped` (`review: left Google's list …`),
+  `rank_moves` (|Δ| ≥ 3), `direction_flip` on `direction_now`, `first_seen` per item,
+  `baseline_at` / `current_at`, `current_items` / `baseline_items`. The tool never says
+  "retire": leaving a relative, bounded list is not evidence of falling demand; guidance
+  tells the model to confirm with `interest_over_time` first. An empty snapshot on either
+  side yields a `reason`, not a mass drop. No baseline yet → `reason` with the rerun date.
+- **`trend_history(keyword, geo, days=90)`**: archive-only (no requests). `first_seen`,
+  `last_seen`, `breakout_episodes` (separate breakout runs — polling one breakout three
+  times is one episode), `breakout_observations`, `rising_observations`,
+  `seen_under_seeds`, `direction_timeline` keyed by timeframe, `latest_rank`,
+  `questions_recorded`.
+- **`seasonality(keyword, geo)`**: one `today 5-y` request → `monthly_index`,
+  `peak_months` (top-2 in ≥ 3 full years and ≥ 120 % of the year's mean),
+  `seasonal_strength`, `seasonal`, `next_peak`, `next_peak_in_days`, `publish_by`
+  (−42 days or `"now"`), `in_peak_now` / `peak_month_now` when the current month is a
+  peak, `insight`. Profile and strength use full years only (a partial year cannot
+  overturn them); zero off-season interest is `seasonal: true` with `strength_note`
+  instead of a division by zero. Fewer than 3 full years → `seasonal: null` + `reason`.
+- **`compare_channels(keyword, geo, timeframe)`**: web, YouTube, News, Images, Shopping
+  (five requests, web first; the rest are `skipped` on the first 429). Per channel
+  `direction`, `direction_now`, `growth_3m`, `mean`, `latest`, `format_hint`;
+  `fastest_channel` among channels with `mean ≥ 5`; `momentum`
+  (`growing | flat | all_declining | unknown`) so a channel that is merely falling least is
+  never described as growing; `insight`.
+- **`site_queries` / `exclude_covered`** on `discover_topics` and `aeo_opportunities`
+  (≤ 500 queries, each ≤ 200 chars). Topics / clusters get `coverage`
+  `covered | partial | gap` (+ `matched`), `counts.covered/partial/gap`. A cluster is
+  `covered` only when *every* question is covered (`coverage_counts` shows the mix), so
+  `exclude_covered` can never hide an unanswered question.
+- `discover_topics.topics[].momentum_seed`: which seed's `direction_now` fed a shared
+  topic's score (the most favourable one, so results do not depend on seed order).
+- **`trending_now(topic_filter="")`**: keeps trends whose title or headlines contain every
+  word; `unfiltered_count`; empty → `reason` naming the filter.
+- **`weekly_review(seeds, geo, site_queries)`** prompt: `what_changed` → `seasonality` →
+  `compare_channels` → `aeo_opportunities` with `site_queries` → PUBLISH NOW / PLAN FOR
+  <date> / REFRESH / RETIRE.
+- `discover_topics.topics[]` now carry `score` / `score_breakdown`; `score_note` on both
+  composites; `trendzeist_status.archive`; `_meta.archive_error`.
+- Live canary probes for `seasonality` and `compare_channels`.
+
+### Changed
+- **Unified explainable score** (`formatters.opportunity_score`), shared by
+  `discover_topics` and `aeo_opportunities`. `score_breakdown` is now
+  `{component: {points, max, reason}}` with components `demand` 25, `momentum` 25
+  (`direction_now`: rising 15 / stable·new 8 / falling 0 / unknown 5; +10 breakout,
+  +5 rising query), `freshness` 15, `gap` 20 (neutral 10 without `site_queries`), `aeo` 15.
+  The old `questions / trend / news / wikipedia` integer components are gone →
+  **`schema_version` 3**. `aeo_opportunities[]` gains `heuristic: true`.
+- `related_queries` / `discover_topics` / `aeo_opportunities` share one fetch path
+  (`tools.fetch_related`, `tools.fetch_trend`) so every trend lookup feeds the archive.
+
 ## [0.4.1] - 2026-10-02
 
 Hotfix for errors found while writing posts from 0.4.0 output (an agent quoted "rising"
