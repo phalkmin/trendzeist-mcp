@@ -286,6 +286,112 @@ def _growth_note(growth: dict[str, float | None]) -> str | None:
     return GROWTH_NOTE if any(val is None for val in growth.values()) else None
 
 
+# Level shift (issue 4, 2026-11-03). On 2026-07-12 five unrelated 12-month series
+# stepped down 30-50 % in the same week and never came back while Search Console
+# showed no change: a Google sampling / normalisation change, not demand. Any growth
+# or direction figure whose windows straddle such a week mixes the artifact with the
+# real change, so the formatter detects sustained steps and says so.
+LEVEL_SHIFT_WINDOW = 4  # points on each side of the step
+LEVEL_SHIFT_MIN_CHANGE = 0.30  # relative change between the two window means
+LEVEL_SHIFT_HOLD = 0.15  # every later window must stay this far on the new side
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values)
+
+
+def detect_level_shift(series: pd.Series) -> dict[str, Any] | None:
+    """Largest sustained step in a series, or ``None``.
+
+    A step at point ``i`` needs: the 4-point mean after it differs from the 4-point
+    mean before it by >= 30 %; every later 4-point mean stays >= 15 % on the new
+    side (a spike or a season that reverts is not a shift); the level before the
+    step was itself steady (not the tail of a ramp or a spike); and the new level
+    is new (returning to an earlier level is a season ending, not a shift).
+    """
+    vals = [float(x) for x in series.tolist()]
+    n, w = len(vals), LEVEL_SHIFT_WINDOW
+    if n < 2 * w:
+        return None
+    windows = [_mean(vals[j : j + w]) for j in range(n - w + 1)]  # windows[j] = mean of vals[j:j+w]
+    best: tuple[int, float, float, float] | None = None
+    for i in range(w, n - w + 1):
+        before, after = windows[i - w], windows[i]
+        if before <= 0:
+            continue
+        change = (after - before) / before
+        if abs(change) < LEVEL_SHIFT_MIN_CHANGE:
+            continue
+        sign = 1.0 if change > 0 else -1.0
+        if any(sign * (windows[j] - before) / before < LEVEL_SHIFT_HOLD for j in range(i + 1, n - w + 1)):
+            continue  # reverted (or faded) later: not a sustained shift
+        if i >= 2 * w and windows[i - 2 * w] > 0 and abs(before - windows[i - 2 * w]) / windows[i - 2 * w] >= LEVEL_SHIFT_MIN_CHANGE:
+            continue  # the "before" level is itself a jump (ramp or spike)
+        if any(abs(windows[j] - after) / before < LEVEL_SHIFT_HOLD for j in range(0, i - w)):
+            continue  # the series was already at this level earlier: a return, not a shift
+        if best is None or abs(change) > abs(best[1]):
+            best = (i, change, before, after)
+    if best is None:
+        return None
+    i, change, before, after = best
+    post = vals[i:]
+    date = series.index[i]
+    return {
+        "date": _to_native(date) if isinstance(date, pd.Timestamp) else str(date),
+        "change_pct": round(100.0 * change, 1),
+        "before_mean": round(before, 1),
+        "after_mean": round(after, 1),
+        # What happened after the step: did the slide continue, or did it hold?
+        "post_shift_change_pct": _pct_change(_mean(post[:w]), _mean(post[-w:])) if len(post) >= 2 * w else None,
+    }
+
+
+def _shift_affects_growth(series: pd.Series, shift_date: Any) -> bool:
+    """True when the step falls inside the two windows growth_3m compares."""
+    if not isinstance(series.index, pd.DatetimeIndex):
+        return True
+    span = pd.Timedelta(days=2 * _GROWTH_WINDOWS["growth_3m"])
+    return bool(pd.Timestamp(shift_date) > series.index.max() - span)
+
+
+def level_shift_warnings(shifts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """One warning per (week, direction) across the keywords of a call.
+
+    Two or more series stepping the same way in the same week is the signature of
+    a source-wide sampling change (``likely_artifact``).
+    """
+    groups: dict[tuple[Any, str], list[str]] = {}
+    for kw, shift in shifts.items():
+        direction = "down" if shift["change_pct"] < 0 else "up"
+        groups.setdefault((shift["date"], direction), []).append(kw)
+    out: list[dict[str, Any]] = []
+    for (date, direction), kws in groups.items():
+        change = round(_mean([shifts[kw]["change_pct"] for kw in kws]), 1)
+        shared = len(kws) >= 2
+        if shared:
+            head = (
+                f"{len(kws)} series stepped {direction} together in the week of {date} "
+                f"({', '.join(kws)}) and stayed there; a shared step is usually a change in "
+                "Google's sampling, not in demand."
+            )
+        else:
+            head = f"'{kws[0]}' stepped {direction} {abs(change):g}% in the week of {date} and stayed there."
+        out.append(
+            {
+                "type": "level_shift",
+                "date": date,
+                "direction": direction,
+                "change_pct": change,
+                "shared_by": kws,
+                "likely_artifact": shared,
+                "message": head
+                + " growth_3m, direction and direction_now figures whose windows span that "
+                "week overstate the change; read the curve on each side of it.",
+            }
+        )
+    return out
+
+
 def _change_phrase(before: float, after: float) -> str:
     change = round(100.0 * (after - before) / before)
     verb = "rose" if change > 0 else "fell" if change < 0 else "held flat"
@@ -340,6 +446,7 @@ def interest_over_time(
             "original_points": 0,
             "downsampled": False,
             "scale": SCALE_NOTE,
+            "warnings": [],
             "note": "Google returned no data for this query (too little search volume?).",
         }
 
@@ -350,6 +457,7 @@ def interest_over_time(
         complete = df.drop(columns=["isPartial"])
 
     summary: dict[str, Any] = {}
+    shifts: dict[str, dict[str, Any]] = {}
     for kw in kws:
         if kw not in complete.columns:
             summary[kw] = {"available": False}
@@ -379,6 +487,17 @@ def interest_over_time(
         growth_note = _growth_note(growth)
         if growth_note:
             summary[kw]["growth_note"] = growth_note
+        shift = detect_level_shift(stats_series)
+        if shift:
+            shift["growth_affected"] = _shift_affects_growth(stats_series, shift["date"])
+            verb = "down" if shift["change_pct"] < 0 else "up"
+            shift["warning"] = (
+                f"Interest stepped {verb} {abs(shift['change_pct']):g}% in the week of "
+                f"{shift['date']} and stayed there"
+                + ("; growth_3m spans that step and overstates the change." if shift["growth_affected"] else ".")
+            )
+            summary[kw]["level_shift"] = shift
+            shifts[kw] = shift
 
     sampled = _downsample(complete, max_points)
     points: list[dict[str, Any]] = []
@@ -396,6 +515,7 @@ def interest_over_time(
         "original_points": int(len(complete)),
         "downsampled": len(sampled) != len(complete),
         "scale": SCALE_NOTE,
+        "warnings": level_shift_warnings(shifts),
     }
 
 
@@ -434,7 +554,7 @@ def mark_breakouts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # out of the breakout bucket, the question lists and the score.
 _SUSPECT_MIN_ITEMS = 3
 _SUSPECT_MAX_OVERLAP = 0.34  # residual token Jaccard above this = genuinely related items
-_DOMAIN_RE = re.compile(r"(^|\s)[\w-]+\s?\.\s?(com|net|org|io|co|app|ai|dev|xyz|info)(\s|$)")
+_DOMAIN_RE = re.compile(r"(^|\s)([\w-]+)\s?\.\s?(com|net|org|io|co|app|ai|dev|xyz|info)(\s|$)")
 _STOPWORDS = frozenset(
     "a an the and or of in on for to with vs versus is are how what why when where who "
     "can do does best top new free near me my your its it this that from by at as be".split()
@@ -501,13 +621,102 @@ def flag_suspects(
                 "absent from top queries",
             )
 
+    domains: list[tuple[int, str]] = []  # (index, domain label) of domain-like items
     for i, it in enumerate(rising):
-        if i not in reasons and _DOMAIN_RE.search((it.get("name") or "").lower()):
-            reasons[i] = "domain-like rising query (looks like a site promoting itself)"
+        match = _DOMAIN_RE.search((it.get("name") or "").lower())
+        if match:
+            domains.append((i, match.group(2).replace("-", "")))
+            if i not in reasons:
+                reasons[i] = "domain-like rising query (looks like a site promoting itself)"
+    # The same campaign usually appends the domain's name, as separate words, to
+    # unrelated queries ("abrahamquirosvillalba .com" -> "... abraham quiros villalba").
+    # Any 2+ token run that concatenates to the label marks the query as a carrier;
+    # a single token is a brand word, not a name, and is left alone.
+    for di, label in domains:
+        for i, toks in enumerate(tokens_by_idx):
+            if i == di or i in reasons:
+                continue
+            run = _token_run_for(toks, label)
+            if run:
+                reasons[i] = (
+                    f"carries the name '{run}' of the domain-like rising query "
+                    f"'{rising[di].get('name')}'"
+                )
+
+    for i, it in enumerate(rising):
         if i in reasons:
             it["suspect"] = True
             it["suspect_reason"] = reasons[i]
     return rising
+
+
+def _token_run_for(tokens: list[str], label: str) -> str | None:
+    """The 2+ token run of ``tokens`` whose concatenation equals ``label``, if any."""
+    for n in range(2, len(tokens) + 1):
+        for i in range(len(tokens) - n + 1):
+            if "".join(tokens[i : i + n]) == label:
+                return " ".join(tokens[i : i + n])
+    return None
+
+
+# Off-topic rising queries (issue 1, 2026-11-03). Google's rising list for a seed
+# sometimes carries searches that share nothing with it (for AI-tool seeds: prompts
+# people paste into the search box, "how to bake a cake"). They rank first because
+# a handful of searches is a huge % rise from a tiny base. Composites keep them out of
+# topics, questions and the score and list them in ``filtered_out``.
+_OFF_TOPIC_MIN_PREFIX = 4
+
+
+def _tokens_match(a: str, b: str) -> bool:
+    """Same word, or one is a 4+ letter prefix of the other (claude/claudes, mac/macos)."""
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= _OFF_TOPIC_MIN_PREFIX and long_.startswith(short)
+
+
+def _related_to(tokens: set[str], vocabulary: set[str]) -> bool:
+    return any(_tokens_match(t, w) for t in tokens for w in vocabulary)
+
+
+def flag_off_topic(
+    rising: list[dict[str, Any]],
+    top: list[dict[str, Any]],
+    seed: str,
+    context: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Mark rising items with no word in common with the seed, its top queries or
+    ``context`` (other seeds in the call) as ``off_topic`` / ``off_topic_reason``.
+
+    Suspect (spam) items are left to :func:`flag_suspects`.
+    """
+    vocabulary = set(normalise_query(seed).split()) - _STOPWORDS
+    for extra in context:
+        vocabulary |= set(normalise_query(extra).split()) - _STOPWORDS
+    for it in top:
+        vocabulary |= set(normalise_query(it.get("name") or "").split()) - _STOPWORDS
+    for it in rising:
+        if it.get("suspect"):
+            continue
+        tokens = set(normalise_query(it.get("name") or "").split()) - _STOPWORDS
+        if tokens and _related_to(tokens, vocabulary):
+            continue
+        it["off_topic"] = True
+        it["off_topic_reason"] = (
+            f"no word in common with '{seed}' or its top related queries; likely an "
+            "unrelated search that rose from a tiny base"
+        )
+    return rising
+
+
+def split_off_topic(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(on_topic, off_topic) partition of a flagged rising list."""
+    return (
+        [it for it in items if not it.get("off_topic")],
+        [it for it in items if it.get("off_topic")],
+    )
 
 
 def split_suspects(
@@ -909,18 +1118,44 @@ def channel_insight(channels: dict[str, dict[str, Any]], fastest: str | None) ->
 # ---------------------------------------------------------------------------
 
 SITE_PARTIAL_JACCARD = 0.6
+# Common tech abbreviations seen in Search Console exports; both sides of a
+# comparison are mapped, so either spelling matches the other.
+SITE_SYNONYMS: dict[str, str] = {
+    "mac": "macos", "osx": "macos", "wp": "wordpress", "wc": "woocommerce",
+    "js": "javascript", "ts": "typescript", "py": "python", "k8s": "kubernetes",
+    "gpt": "chatgpt", "ia": "ai",
+}
+
+
+def _fold_token(token: str) -> str:
+    """Synonym + plural folding so 'mac' ~ 'macos' and 'skill' ~ 'skills'."""
+    token = SITE_SYNONYMS.get(token, token)
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        token = token[:-1]
+    return token
+
+
+def _site_tokens(text: str) -> set[str]:
+    return {_fold_token(t) for t in normalise_query(text).split()}
+
+
+def _site_overlap(cand_tokens: set[str], site_tokens: set[str]) -> int:
+    """Candidate tokens with a match (equal, or 4+ letter prefix) in the site query."""
+    return sum(1 for t in cand_tokens if any(_tokens_match(t, s) for s in site_tokens))
 
 
 def site_coverage(candidate: str, site_queries: list[str]) -> tuple[str, str | None]:
     """``(covered | partial | gap, matched_site_query)`` for one candidate topic.
 
-    covered: exact normalised match, or every candidate token appears in a site
-    query; partial: token Jaccard >= 0.6 with some site query; gap: otherwise.
+    Tokens are compared after lowercasing, punctuation stripping, plural folding and
+    a small synonym map (mac/macos, wp/wordpress...). covered: every candidate token
+    matches a token of one site query; partial: token Jaccard >= 0.6 with some site
+    query; gap: otherwise.
     """
     cand = normalise_query(candidate)
     if not cand or not site_queries:
         return "gap", None
-    cand_tokens = set(cand.split())
+    cand_tokens = _site_tokens(cand)
     best: tuple[float, str | None] = (0.0, None)
     for sq in site_queries:
         norm = normalise_query(sq)
@@ -928,11 +1163,12 @@ def site_coverage(candidate: str, site_queries: list[str]) -> tuple[str, str | N
             continue
         if norm == cand:
             return "covered", sq
-        toks = set(norm.split())
-        if cand_tokens <= toks:
+        toks = _site_tokens(norm)
+        overlap = _site_overlap(cand_tokens, toks)
+        if overlap == len(cand_tokens):
             return "covered", sq
-        union = cand_tokens | toks
-        jac = len(cand_tokens & toks) / len(union) if union else 0.0
+        union = len(cand_tokens) + len(toks) - overlap
+        jac = overlap / union if union else 0.0
         if jac > best[0]:
             best = (jac, sq)
     if best[0] >= SITE_PARTIAL_JACCARD:
@@ -1040,3 +1276,140 @@ def opportunity_score(
     total = min(100, sum(p["points"] for p in parts.values()))
     return total, parts
 
+
+
+# 0.6.0: compare_keywords editorial layer (E2)
+
+CHALLENGER_MIN_SHARE = 10.0
+NICHE_MAX_SHARE = 5.0
+_RISING_NOW = ("rising", "new")
+_IMPLICATIONS = {
+    "leader": "Main term: use it in the title and H1.",
+    "rising challenger": "Smaller but rising: worth its own post or a comparison post now.",
+    "declining": "Falling: mention it for completeness, don't build a new page on it.",
+    "niche": "Little search interest: use as a secondary phrase or in an FAQ, not as a target.",
+    "steady": "Stable secondary term: cover it in a section or subheading.",
+    "no interest": "No measurable search interest in this window: not a target.",
+}
+_LEADER_FALLING = " Interest is falling; check whether a rising term is replacing it."
+_LEADER_DEAD = (
+    " No interest in the most recent weeks: its mean comes from earlier in the window; "
+    "check whether a rising term has replaced it."
+)
+_ROLE_PHRASES = (
+    ("rising challenger", "rising (worth a comparison post)"),
+    ("declining", "declining"),
+    ("niche", "niche (secondary phrase only)"),
+    ("steady", "steady (secondary term)"),
+)
+
+
+_UNKNOWN_NOW = (None, "insufficient_data")
+_NO_INTEREST_REASON = (
+    "no keyword shows measurable search interest in this window; nothing to target — try a "
+    "broader phrase, a wider geo or a longer timeframe"
+)
+_UNKNOWN_SUFFIX = " Recent trend unknown (too few points); verify with a longer timeframe."
+# ``direction_now`` labels that mean "not growing now". ``no_interest`` (both recent
+# quarters at zero) is worse than ``falling``: a term that was big early in the
+# window and is dead now must never read as "not falling".
+_DOWN_NOW = ("falling", "no_interest")
+# Below this mean (0-100 scale) a comparison is noise: roles still apply, but the
+# winner is qualified rather than asserted. Same floor as compare_channels.
+WINNER_NOISE_FLOOR = 5.0
+_NOISE_SUFFIX = (
+    "; every term is near the noise floor (mean < 5), so this ranking is weak evidence — "
+    "validate with a broader phrase, wider geo or longer timeframe"
+)
+
+
+def _role(index: int, row: dict[str, Any]) -> str:
+    now = row.get("direction_now")
+    share = row.get("share_pct") or 0.0
+    if index == 0:
+        return "leader"
+    if now in _RISING_NOW and share >= CHALLENGER_MIN_SHARE:
+        return "rising challenger"
+    if now in _DOWN_NOW:
+        return "declining"
+    if share < NICHE_MAX_SHARE:
+        return "niche"
+    return "steady"
+
+
+def compare_interpretation(ranking: list[dict[str, Any]], *, unavailable: int = 0) -> dict[str, Any]:
+    """Tag each ``compare_keywords`` ranking row with ``role`` / ``content_implication``
+    (in place) and pick the term to target.
+
+    ``ranking`` must be sorted by ``mean_interest`` descending (row 0 is the leader).
+    Returns ``{"winner": {keyword, reason} | None, "seo_interpretation": str | None}``
+    plus ``winner_reason`` when there is no winner. No positive interest anywhere →
+    no winner (a tie at zero must not become "target the first keyword"); an
+    unknown recent slope is said to be unknown, never "not falling" or "steady".
+    ``unavailable`` is how many requested keywords returned no data: a one-row
+    ranking is then a one-horse race and the sentence says so.
+    """
+    if not ranking:
+        return {"winner": None, "seo_interpretation": None}
+    if not any((r.get("mean_interest") or 0) > 0 for r in ranking):
+        for row in ranking:
+            row["role"] = "no interest"
+            row["content_implication"] = _IMPLICATIONS["no interest"]
+        return {"winner": None, "winner_reason": _NO_INTEREST_REASON, "seo_interpretation": None}
+    for i, row in enumerate(ranking):
+        role = _role(i, row)
+        row["role"] = role
+        text = _IMPLICATIONS[role]
+        if role == "leader" and row.get("direction_now") == "falling":
+            text += _LEADER_FALLING
+        elif role == "leader" and row.get("direction_now") == "no_interest":
+            text += _LEADER_DEAD
+        if row.get("direction_now") in _UNKNOWN_NOW:
+            text += _UNKNOWN_SUFFIX
+        row["content_implication"] = text
+
+    leader = ranking[0]
+    lk = leader["keyword"]
+    now = leader.get("direction_now")
+    down = "dead now" if now == "no_interest" else "falling"
+    challengers = [r for r in ranking if r["role"] == "rising challenger"]
+    if now in _DOWN_NOW and challengers:
+        ck = challengers[0]["keyword"]  # ranking order = highest share first
+        winner = {
+            "keyword": ck,
+            "reason": f"{lk} is bigger but {down}; {ck} is rising — target it and mention {lk} for context",
+        }
+    elif now in _DOWN_NOW:
+        winner = {
+            "keyword": lk,
+            "reason": f"highest interest, though {down}; no rising alternative in this set",
+        }
+    elif now in _UNKNOWN_NOW:
+        winner = {"keyword": lk, "reason": "highest interest; recent trend unknown (too few points)"}
+    else:
+        winner = {"keyword": lk, "reason": "highest interest and not falling"}
+    if all((r.get("mean_interest") or 0) < WINNER_NOISE_FLOOR for r in ranking):
+        winner["reason"] += _NOISE_SUFFIX
+    if len(ranking) == 1 and unavailable:
+        winner["reason"] += (
+            f"; the only term with data ({unavailable} unavailable), so this is not a comparison"
+        )
+    return {"winner": winner, "seo_interpretation": _seo_sentence(winner["keyword"], ranking, unavailable)}
+
+
+def _seo_sentence(target: str, ranking: list[dict[str, Any]], unavailable: int = 0) -> str:
+    row = next(r for r in ranking if r["keyword"] == target)
+    now = row.get("direction_now")
+    label = "trend unknown" if now in _UNKNOWN_NOW else "no recent interest" if now == "no_interest" else now
+    parts = [f"Target '{target}' ({row['role']}, {label})"]
+    lk = ranking[0]["keyword"]
+    if target != lk:
+        lead_now = ranking[0].get("direction_now")
+        parts.append(f"'{lk}' leads but {'has no recent interest' if lead_now == 'no_interest' else 'is falling'}")
+    for role, phrase in _ROLE_PHRASES:
+        names = [f"'{r['keyword']}'" for r in ranking if r["role"] == role and r["keyword"] != target]
+        if names:
+            parts.append(f"{', '.join(names)} {'is' if len(names) == 1 else 'are'} {phrase}")
+    if len(ranking) == 1 and unavailable:
+        parts.append(f"the only term with data ({unavailable} unavailable), not a comparison")
+    return "; ".join(parts) + "."

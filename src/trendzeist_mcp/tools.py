@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import timedelta
-from typing import Any, Callable, TypeVar
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Iterable, TypeVar
 from urllib.parse import quote
 
 import pandas as pd
@@ -42,6 +42,21 @@ _QUESTION_PREFIXES: tuple[str, ...] = (
     "how to", "how do", "how much", "how long", "why", "what is", "what are", "when",
     "where", "which", "can", "should", "is", "does", "vs",
 )
+# Realness ranking for mined questions (issue 5, 2026-11-03): Autocomplete answers a
+# rare prefix + seed by padding it with one token ("how long llms.txt last"). A real
+# question carries a verb (or compares), is specific, and comes back under more than
+# one prefix. The verb list is deliberately small: auxiliaries plus the verbs people
+# use about tools; a missing verb only costs points unless the completion is also bare.
+_QUESTION_HIT_POINTS = 3
+_QUESTION_VERBS = frozenset(
+    "is are was were be been do does did can could should would will has have had need "
+    "needs work works working use used using add adding install installing create "
+    "creating make making mean means matter matters help helps cost costs take takes "
+    "support supports run runs exist exists generate write check test validate read get "
+    "set configure enable disable build fix improve affect allow require requires "
+    "replace replaces compare".split()
+)
+_COMPARISON_WORDS = frozenset({"vs", "versus", "or", "better", "difference", "alternative", "alternatives"})
 
 
 def _setting(hub: Hub, name: str, default: Any) -> Any:
@@ -158,12 +173,23 @@ def fetch_trend(
 
 
 def fetch_related(
-    hub: Hub, kw: str, tf: str, g: str, cat: int, gp: str, limit: int
+    hub: Hub,
+    kw: str,
+    tf: str,
+    g: str,
+    cat: int,
+    gp: str,
+    limit: int,
+    *,
+    context: Iterable[str] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Related queries as ``(top, rising)`` in Google's order; archives on a miss.
 
     ``rising`` items carry ``growth_pct`` / ``is_breakout`` and, where detected,
-    ``suspect`` / ``suspect_reason`` (split with ``fmt.split_suspects``).
+    ``suspect`` / ``suspect_reason`` (split with ``fmt.split_suspects``) or
+    ``off_topic`` / ``off_topic_reason`` (split with ``fmt.split_off_topic``).
+    ``context`` lists the other seeds of a composite call: a rising query that
+    mentions one of them is on topic.
 
     Suspect detection and the archive both see the *complete* lists Google
     returned; ``limit`` is applied only to what is handed back, so a caller's
@@ -175,6 +201,7 @@ def fetch_related(
         top = fmt.related_list(res.get("top"), None, label="query")
         rising = fmt.mark_breakouts(fmt.related_list(res.get("rising"), None, label="query"))
         fmt.flag_suspects(rising, top, kw)
+        fmt.flag_off_topic(rising, top, kw, context)
         return top, rising
 
     def record(pair: tuple[list[dict[str, Any]], list[dict[str, Any]]]) -> None:
@@ -211,6 +238,7 @@ def compare_keywords(
                 "direction": summary[kw].get("direction"),
                 "direction_now": summary[kw].get("direction_now"),
                 "latest": summary[kw].get("latest"),
+                "growth_3m": summary[kw].get("growth_3m"),
             }
             for kw, mean in ranking
         ],
@@ -218,7 +246,22 @@ def compare_keywords(
         "unavailable": [kw for kw, s in summary.items() if not s.get("available")],
         "points": data["points"],
         "scale": data.get("scale"),
+        "warnings": data.get("warnings", []),
     }
+    for row in out["ranking"]:
+        if summary[row["keyword"]].get("level_shift"):
+            row["level_shift"] = summary[row["keyword"]]["level_shift"]
+    out.update(fmt.compare_interpretation(out["ranking"], unavailable=len(out["unavailable"])))
+    if not out["ranking"]:
+        out["winner_reason"] = (
+            "no keyword returned data for this timeframe/geo (see unavailable); nothing to "
+            "compare — try a longer timeframe, a wider geo or check the spelling"
+        )
+    growth_note = next(
+        (summary[kw]["growth_note"] for kw, _ in ranking if summary[kw].get("growth_note")), None
+    )
+    if growth_note and any(r["growth_3m"] is None for r in out["ranking"]):
+        out["growth_note"] = growth_note
     if "note" in data:
         out["note"] = data["note"]
     return out
@@ -240,6 +283,7 @@ def related_queries(
     fmt.tag_angles(top)
     fmt.tag_angles(rising)
     clean_rising, suspects = fmt.split_suspects(rising)
+    clean_rising, off_topic = fmt.split_off_topic(clean_rising)
     out: dict[str, Any] = {
         "query": _query_meta(hub, [kw], tf, g, cat, gp),
         "top": top,
@@ -259,6 +303,13 @@ def related_queries(
             "rising items with suspect=true look like injected spam (one name attached to "
             "unrelated queries, or a domain); they are excluded from questions. Treat "
             "their is_breakout as unreliable."
+        )
+    if off_topic:
+        out["off_topic_count"] = len(off_topic)
+        out["notes"]["off_topic"] = (
+            "rising items with off_topic=true share no word with the seed or its top "
+            "queries (unrelated searches rising from a tiny base); they are excluded from "
+            "questions. Pass category= to narrow Google's related queries."
         )
     note = v.limit_note(limit, lim)
     if note:
@@ -345,6 +396,101 @@ def suggest_keywords(hub: Hub, keyword: str) -> dict[str, Any]:
         ],
         "note": "Pass a 'mid' (e.g. '/m/05z1_') as a keyword to query the disambiguated topic.",
     }
+
+
+# 0.6.0 (E1): flag seeds that name several Google entities. Detection only: the seed is
+# still queried as typed (a mid would change the data from search term to topic).
+_AMBIGUITY_MAX = 5
+_ENTITY_ID = re.compile(r"^/[mg]/\w+$")
+
+
+def entity_ambiguity(hub: Hub, seed: str) -> list[dict[str, Any]] | None:
+    """Entities whose title equals ``seed`` when there are >= 2 of different types.
+
+    ``None`` when the seed already is an entity id (no request), ``[]`` when not
+    ambiguous. Raises ``TrendsError`` like any source call.
+    """
+    if _ENTITY_ID.match(seed):
+        return None
+    key = fmt.normalise_query(seed)
+    raw = hub.trends.suggestions(seed)
+    if not isinstance(raw, list):
+        raise TrendsError(f"Unexpected response from Google Trends suggestions: {type(raw).__name__}")
+    exact: list[dict[str, Any]] = []
+    for s in raw:
+        if not isinstance(s, dict):
+            raise TrendsError("Unexpected response from Google Trends suggestions: entry is not an object")
+        entry = {k: s.get(k) for k in ("title", "type", "mid")}
+        if any(val is not None and not isinstance(val, str) for val in entry.values()):
+            raise TrendsError("Unexpected response from Google Trends suggestions: non-string field")
+        if entry["title"] and fmt.normalise_query(entry["title"]) == key:
+            exact.append(entry)
+    if len(exact) < 2 or len({e["type"] for e in exact if e["type"]}) < 2:
+        return []
+    return exact[:_AMBIGUITY_MAX]
+
+
+AMBIGUITY_HL_NOTE = (
+    "Entity ambiguity was checked in the server language ({hl}), not this geo's language, "
+    "so a non-English seed is rarely matched. Set TRENDZEIST_HL to the seed's language to "
+    "check it properly."
+)
+AMBIGUITY_SKIPPED_NOTE = "Entity ambiguity check skipped: rate limited earlier in this call."
+
+
+def note_ambiguity_skipped(report: dict[str, Any]) -> None:
+    """Composites call this instead of :func:`flag_ambiguity` while cooling down, so a
+    seed report that lost its ``ambiguous`` field between two runs says why."""
+    report["ambiguity_note"] = AMBIGUITY_SKIPPED_NOTE
+
+
+def flag_ambiguity(
+    hub: Hub,
+    seed: str,
+    report: dict[str, Any],
+    errors: list[dict[str, str]],
+    *,
+    geo: str = "",
+    mid_rerun: bool = True,
+) -> bool:
+    """Composite enrichment: annotate ``report`` when ``seed`` is ambiguous.
+
+    A failure is recorded as ``entities:<seed>`` and never stops the seed.
+    ``mid_rerun=False`` for composites that also query News / Wikipedia /
+    Autocomplete: those sources take search text, not a Google entity id, so the
+    hint asks for a more specific phrase instead.
+
+    The suggestions endpoint answers in the server's ``hl`` (``TRENDZEIST_HL``), not
+    the geo's language; when those differ and nothing was found, say so (an English
+    entity title can never equal a Portuguese seed) instead of implying "not ambiguous".
+    """
+    try:
+        found = entity_ambiguity(hub, seed)
+    except TrendsError as exc:
+        errors.append({"step": f"entities:{seed}", "error": str(exc)})
+        return False
+    if not found:
+        if found is not None and _hl_for(hub, geo) != _setting(hub, "hl", "en-US"):
+            report["ambiguity_note"] = AMBIGUITY_HL_NOTE.format(hl=_setting(hub, "hl", "en-US"))
+        return False
+    mid = next((e["mid"] for e in found if e["mid"]), None)
+    # Google may leave ``type`` null on some entities (the rule only needs two
+    # non-empty types somewhere in the list), so take the first *named* type.
+    kind = next((e["type"] for e in found if e["type"]), None)
+    report["ambiguous"] = found
+    head = f"'{seed}' matches several entities. Confirm which one the user means"
+    if mid_rerun:
+        tail = ", or re-run with that entity's mid as the seed" + (f" (e.g. '{mid}')." if mid else ".")
+    else:
+        example = f" (e.g. '{seed} {kind.lower()}')" if kind else ""
+        tail = f", then re-run with a more specific phrase{example}."
+        if mid:
+            tail += (
+                f" A mid like '{mid}' only works for Google Trends; this tool also searches "
+                "News, Wikipedia and Autocomplete with the seed text."
+            )
+    report["clarify"] = head + tail
+    return True
 
 
 def trending_now(
@@ -434,8 +580,10 @@ def mine_questions(
     g = v.validate_geo(geo)
     lim = v.validate_limit(limit, default=30, maximum=100)
 
-    seen: set[str] = set()
+    seen: dict[str, dict[str, Any]] = {}
+    hit_prefixes: dict[str, set[str]] = {}
     questions: list[dict[str, Any]] = []
+    filtered_out: list[dict[str, str]] = []
     errors: list[dict[str, str]] = []
     prefixes_done: list[str] = []
     # Spread the budget across prefixes so a small limit still yields a mix of
@@ -444,29 +592,65 @@ def mine_questions(
     # The seed must survive as whole words: Autocomplete completes an unfinished
     # last token ("wordpress ai" -> "wordpress airplay"), which is off-topic.
     seed_re = re.compile(rf"\b{re.escape(fmt.normalise_query(kw))}s?\b")
+    seed_tokens = set(fmt.normalise_query(kw).split())
 
     def absorb(prefix: str, suggestions: list[str]) -> None:
         taken = 0
-        for text in suggestions:
+        for position, text in enumerate(suggestions, 1):
             if taken >= per_prefix:
                 break
             text = " ".join(text.split())
             norm = fmt.normalise_query(text)
-            if not norm or norm in seen:
+            if not norm:
+                continue
+            if norm in seen:
+                # Surfacing under a second prefix is evidence people really type it
+                # (a duplicate inside one answer is not).
+                if prefix not in hit_prefixes[norm]:
+                    hit_prefixes[norm].add(prefix)
+                    seen[norm]["prefix_hits"] += 1
+                    seen[norm]["score"] += _QUESTION_HIT_POINTS
                 continue
             if not (fmt.is_question(text) or prefix == "vs"):
                 continue
             if not seed_re.search(norm):
                 continue
-            seen.add(norm)
+            tokens = norm.split()
+            prefix_tokens = set(prefix.split())
+            extra = [t for t in tokens if t not in seed_tokens and t not in prefix_tokens]
+            has_verb = any(t in _QUESTION_VERBS for t in tokens)
+            comparison = prefix == "vs" or any(t in _COMPARISON_WORDS for t in tokens)
+            if not has_verb and not comparison and len(extra) <= 1:
+                # "how long llms.txt last", "when llms.txt file": Autocomplete padded the
+                # prefix with the seed; nobody types this as a question.
+                filtered_out.append(
+                    {
+                        "question": text,
+                        "prefix": prefix or None,
+                        "reason": "no verb and at most one word beyond prefix + seed (Autocomplete padding)",
+                    }
+                )
+                continue
+            score = _QUESTION_HIT_POINTS
+            if has_verb:
+                score += 2
+            if comparison:
+                score += 3
+            if position <= 3:
+                score += 1
+            if len(extra) >= 2:
+                score += 1
+            entry = {
+                "question": text,
+                "angle": fmt.classify_angle(text) or ("comparison" if prefix == "vs" else "how-to"),
+                "prefix": prefix or None,
+                "prefix_hits": 1,
+                "score": score,
+            }
+            seen[norm] = entry
+            hit_prefixes[norm] = {prefix}
             taken += 1
-            questions.append(
-                {
-                    "question": text,
-                    "angle": fmt.classify_angle(text) or ("comparison" if prefix == "vs" else "how-to"),
-                    "prefix": prefix or None,
-                }
-            )
+            questions.append(entry)
 
     stopped = False
     fetched_fresh = False
@@ -493,6 +677,8 @@ def mine_questions(
                 stopped = True
                 break
 
+    # Most real-looking first; ties keep Autocomplete's order (stable sort).
+    questions.sort(key=lambda q: -q["score"])
     questions = questions[:lim]
     if fetched_fresh and questions and getattr(hub, "archive", None) is not None:
         hub.archive.record_questions(kw, g, questions)
@@ -505,13 +691,19 @@ def mine_questions(
         "questions": questions,
         "count": len(questions),
         "by_angle": by_angle,
+        "filtered_out": filtered_out,
+        "filtered_count": len(filtered_out),
         "prefixes_queried": prefixes_done,
         "errors": errors,
         "guidance": (
-            "Each question is a candidate H2/FAQ entry or post title. Validate the "
-            "strongest with related_queries / interest_over_time; pair angle with "
-            "evidence type (how-to: steps + numbers; comparison: table + quotes; "
-            "definition: cite a primary source; news: dated publisher quotes)."
+            "Each question is a candidate H2/FAQ entry or post title, ranked by score: a "
+            "realness heuristic (seen under several prefixes = prefix_hits, has a verb or a "
+            "comparison word, high Autocomplete position, specific). Low scores are "
+            "Autocomplete artifacts more often than real questions. filtered_out lists "
+            "completions that only padded a prefix with the seed. Validate the strongest "
+            "with related_queries / interest_over_time; pair angle with evidence type "
+            "(how-to: steps + numbers; comparison: table + quotes; definition: cite a "
+            "primary source; news: dated publisher quotes)."
         ),
     }
     if stopped:
@@ -728,6 +920,8 @@ def compare_channels(
             )
             if summary.get("growth_3m") is None and summary.get("growth_note"):
                 block["growth_note"] = summary["growth_note"]
+            if summary.get("level_shift"):
+                block["level_shift"] = summary["level_shift"]
         channels[name] = block
 
     eligible = {
@@ -814,14 +1008,39 @@ def _seed_changes(
         report["reason"] = "No snapshot recorded yet for this seed; rerun after the next fetch."
         return report
     if baseline is None:
-        snaps = archive.snapshots(seed, g, GROUP_RELATED, RELATED_TIMEFRAME)
-        oldest = snaps[-1]["observed_at"]
-        oldest_dt = parse_ts(oldest)
+        snaps = [s for s in archive.snapshots(seed, g, GROUP_RELATED, RELATED_TIMEFRAME) if parse_ts(s["observed_at"])]
+        oldest = snaps[-1]
+        oldest_dt = parse_ts(oldest["observed_at"])
         rerun = (oldest_dt + timedelta(days=since_days)).date().isoformat() if oldest_dt else "?"
         report["reason"] = (
-            f"baseline recorded {_fmt_day(oldest)}; rerun after {rerun} (or lower since_days)."
+            f"baseline recorded {_fmt_day(oldest['observed_at'])}; rerun after {rerun} (or lower since_days)."
         )
-        return report
+        if oldest["id"] == latest["id"]:
+            # First run: nothing to compare with yet, but the current state is still
+            # actionable. List it as first_seen instead of returning an empty meeting.
+            report["first_run"] = True
+            report["first_seen"] = [
+                {
+                    "topic": r["item"],
+                    "status": r["status"],
+                    "value": r["value"],
+                    "action": (ACTION_INVESTIGATE if r["status"] == "breakout" else ACTION_CONSIDER)
+                    + " (no history yet)",
+                }
+                for r in archive.observations(latest["id"])
+                if r["kind"] == "rising_query"
+            ]
+            return report
+        # A younger snapshot exists: compare with the oldest one and say how old it is.
+        latest_dt = parse_ts(latest["observed_at"])
+        age = round((latest_dt - oldest_dt).total_seconds() / 86400, 1) if latest_dt and oldest_dt else None
+        baseline = oldest
+        report["baseline_at"] = oldest["observed_at"]
+        report["baseline_age_days"] = age
+        report["baseline_note"] = (
+            f"no snapshot is {since_days} days old yet; compared with one from "
+            f"{age:g} days ago ({since_days} requested)."
+        )
 
     now_rows = archive.observations(latest["id"])
     base_rows = archive.observations(baseline["id"])
@@ -949,8 +1168,13 @@ def what_changed(
             "back; 'review: ...' = a query that stopped rising or left Google's list. Leaving "
             "a relative, bounded list is NOT proof that demand fell: run "
             "interest_over_time([<topic>], 'today 12-m') and retire only if direction_now is "
-            "falling. first_seen is the earliest archive date for the item under any seed. "
-            "direction_flip compares direction_now on the 12-month window."
+            "falling. first_seen (on an item) is the earliest archive date for it under any "
+            "seed. direction_flip compares direction_now on the 12-month window. A seed with "
+            "first_run = true has no earlier snapshot: its first_seen list is the current "
+            "breakouts and rising queries ('... (no history yet)'), and the week-over-week "
+            "comparison starts on the rerun date in reason. baseline_note means no snapshot "
+            "was since_days old yet, so the comparison used a younger one (its real age is "
+            "in baseline_age_days)."
         ),
     }
     if archive is None:
@@ -981,22 +1205,84 @@ def what_changed(
     return out
 
 
-def _breakout_episodes(rows: list[dict[str, Any]], all_snapshots: list[dict[str, Any]]) -> int:
-    """Count separate breakout *episodes* for an item under one seed.
+EPISODE_MERGE_DAYS = 7
 
-    ``rows`` are this item's rising rows under the seed; ``all_snapshots`` are every
-    related snapshot of that seed in the window (so a snapshot where the item was
-    not a breakout ends the run). Polling the same breakout three times is one episode.
+
+def _pair_episode_runs(
+    rows: list[dict[str, Any]], all_snapshots: list[dict[str, Any]]
+) -> list[tuple[str, str]]:
+    """``(start, last_seen)`` of each breakout run for an item under one (seed, timeframe).
+
+    ``rows`` are this item's rising rows under the pair; ``all_snapshots`` are every
+    related snapshot of that pair in the window, **chronological** (a snapshot where
+    the item is not a breakout ends the run). Polling the same breakout three times
+    is one run.
     """
     breakout_ids = {r["snapshot_id"] for r in rows if r["status"] == "breakout"}
-    episodes = 0
+    runs: list[tuple[str, str]] = []
     inside = False
-    for snap in sorted(all_snapshots, key=lambda s: s["observed_at"]):
+    for snap in all_snapshots:
         is_breakout = snap["id"] in breakout_ids
-        if is_breakout and not inside:
-            episodes += 1
+        if is_breakout:
+            if inside:
+                runs[-1] = (runs[-1][0], snap["observed_at"])
+            else:
+                runs.append((snap["observed_at"], snap["observed_at"]))
         inside = is_breakout
-    return episodes
+    return runs
+
+
+def _snapshot_memo(
+    archive: Any, geo: str, since: str, until: str
+) -> Callable[[str, str], list[dict[str, Any]]]:
+    """``(seed, timeframe) -> related snapshot headers`` in ``[since, until]``,
+    chronological, fetched once per call (the archive returns newest first with
+    same-second ties in reverse insertion order, so reversing restores time order)."""
+    memo: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    def get(seed: str, tf: str) -> list[dict[str, Any]]:
+        if (seed, tf) not in memo:
+            snaps = archive.snapshots(seed, geo, GROUP_RELATED, tf, since, until)
+            memo[(seed, tf)] = list(reversed(snaps))
+        return memo[(seed, tf)]
+
+    return get
+
+
+def _episode_starts(
+    rows: list[dict[str, Any]],
+    snapshots_for: Callable[[str, str], list[dict[str, Any]]],
+) -> list[str]:
+    """Breakout episode starts for one item across every seed it appeared under.
+
+    Related lists are archived on whatever timeframe was requested, so a run is
+    tracked per (seed, timeframe): a 12-m breakout must not be ended (or hidden) by
+    the 3-m snapshots of the same seed. Runs are then merged into episodes: a run
+    that starts while another is still being observed, or within
+    ``EPISODE_MERGE_DAYS`` of the previous episode's last breakout, is the same
+    episode seen from another seed (adding a seed to a live breakout must not create
+    a new episode). Unparsable timestamps are kept (never merged away). Items with
+    no breakout row at all never touch the snapshot headers.
+    """
+    rising = [r for r in rows if r["kind"] == "rising_query"]
+    if not any(r["status"] == "breakout" for r in rising):
+        return []
+    runs: list[tuple[str, str]] = []
+    for seed, tf in sorted({(r["seed"], r["timeframe"]) for r in rising if r["status"] == "breakout"}):
+        under = [r for r in rising if r["seed"] == seed and r["timeframe"] == tf]
+        runs += _pair_episode_runs(under, snapshots_for(seed, tf))
+    kept: list[str] = []
+    episode_end: datetime | None = None
+    for start, last in sorted(runs):
+        t = parse_ts(start)
+        if t is not None and episode_end is not None and t - episode_end <= timedelta(days=EPISODE_MERGE_DAYS):
+            end = parse_ts(last)
+            if end is not None and end > episode_end:
+                episode_end = end
+            continue
+        kept.append(start)
+        episode_end = parse_ts(last) if t is not None else episode_end
+    return kept
 
 
 def trend_history(hub: Hub, keyword: str, geo: str = "", days: int = 90) -> dict[str, Any]:
@@ -1012,7 +1298,8 @@ def trend_history(hub: Hub, keyword: str, geo: str = "", days: int = 90) -> dict
     if archive is None:
         out["reason"] = _ARCHIVE_OFF_REASON
         return out
-    rows = archive.history(kw, g, d)
+    since, until = archive.window(d)
+    rows = archive.history(kw, g, d, until)
     note = v.limit_note(days, d, name="days")
     if not rows:
         out["reason"] = (
@@ -1040,18 +1327,7 @@ def trend_history(hub: Hub, keyword: str, geo: str = "", days: int = 90) -> dict
     }
 
     seeds_seen = sorted({r["seed"] for r in as_item})
-    window_start = rows[0]["observed_at"]
-    episodes = 0
-    # Related lists are archived on whatever timeframe was requested, so a run is
-    # tracked per (seed, timeframe): a 12-m breakout must not be ended (or hidden)
-    # by the 3-m snapshots of the same seed.
-    rising_pairs = sorted({(r["seed"], r["timeframe"]) for r in as_item if r["kind"] == "rising_query"})
-    for s, tf in rising_pairs:
-        under = [
-            r for r in as_item if r["seed"] == s and r["timeframe"] == tf and r["kind"] == "rising_query"
-        ]
-        snaps = archive.snapshots(s, g, GROUP_RELATED, tf)
-        episodes += _breakout_episodes(under, [sn for sn in snaps if sn["observed_at"] >= window_start])
+    episodes = len(_episode_starts(as_item, _snapshot_memo(archive, g, since, until)))
     breakout_obs = {
         r["snapshot_id"] for r in as_item if r["kind"] == "rising_query" and r["status"] == "breakout"
     }
@@ -1070,7 +1346,8 @@ def trend_history(hub: Hub, keyword: str, geo: str = "", days: int = 90) -> dict
         questions_recorded=len({r["item"] for r in as_seed if r["kind"] == "question"}),
         guidance=(
             "breakout_episodes counts separate runs of 'breakout' status under other seeds "
-            "(a run ends when a later snapshot of that seed no longer lists it as breakout); "
+            "(a run ends when a later snapshot of that seed no longer lists it as breakout, so "
+            "sparse polling undercounts); "
             ">= 3 episodes in 90 days = a recurring topic worth a durable page. "
             "breakout_observations is only how many snapshots saw it (polling frequency, not "
             "recurrence). direction_timeline is keyed by timeframe; trust the most recent "
@@ -1079,6 +1356,111 @@ def trend_history(hub: Hub, keyword: str, geo: str = "", days: int = 90) -> dict
     )
     if note:
         out["note"] = note
+    return out
+
+
+RECURRING_ACTION = (
+    "durable page: it keeps breaking out; build one evergreen page and refresh it at each "
+    "new spike instead of writing a new post"
+)
+
+
+def recurring_topics(
+    hub: Hub,
+    geo: str = "",
+    days: int = 90,
+    min_episodes: int = 3,
+    seeds: list[str] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Topics with repeated breakout episodes in the archive; makes no upstream request."""
+    g = v.validate_geo(geo)
+    d = v.validate_days(days, default=90)
+    me = v.validate_min_episodes(min_episodes)
+    seed_list = v.validate_keywords(seeds) if seeds else None
+    lim = v.validate_limit(limit, default=20, maximum=50)
+    out: dict[str, Any] = {
+        "query": {"geo": g or "worldwide", "days": d, "min_episodes": me, "seeds": seed_list},
+        "topics": [],
+    }
+    notes = [
+        v.limit_note(days, d, name="days"),
+        v.limit_note(min_episodes, me, name="min_episodes"),
+        v.limit_note(limit, lim),
+    ]
+    archive = _archive(hub)
+    rows: list[dict[str, Any]] = []
+    if archive is not None:
+        since, until = archive.window(d)
+        # Same population as trend_history: a seed listed as its own rising query is
+        # not "a topic that keeps coming back under other seeds".
+        rows = [r for r in archive.rising_items(g, d, seed_list, until) if r["item"] != r["seed"]]
+    if archive is None:
+        out["reason"] = _ARCHIVE_OFF_REASON
+    elif not rows:
+        out["reason"] = (
+            "No rising queries in the archive for this window yet. History accrues as "
+            "discover_topics, related_queries, aeo_opportunities and what_changed fetch fresh "
+            "data; run what_changed weekly to build it."
+        )
+    else:
+        # Coverage is how far back the archive itself reaches for this geo (not the
+        # oldest rising row, which is always inside the window). Clamped to [0, d]:
+        # a future-stamped oldest row is not coverage.
+        oldest = parse_ts(archive.oldest(g))
+        coverage = max(0, min(d, (datetime.now(timezone.utc) - oldest).days)) if oldest else None
+        out["coverage_days"] = coverage
+        if coverage is not None and coverage < d:
+            notes.append(
+                f"The archive only covers {coverage} of the requested {d} days; "
+                "episode counts are a lower bound."
+            )
+        snapshots_for = _snapshot_memo(archive, g, since, until)
+        by_item: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            by_item.setdefault(r["item"], []).append(r)
+        topics = []
+        for item, item_rows in by_item.items():
+            # Cheap pre-filter: fewer breakout observations than episodes wanted can
+            # never qualify, and never needs the snapshot headers.
+            if sum(1 for r in item_rows if r["status"] == "breakout") < me:
+                continue
+            starts = _episode_starts(item_rows, snapshots_for)
+            if len(starts) < me:
+                continue
+            breakouts = [r["observed_at"] for r in item_rows if r["status"] == "breakout"]
+            topics.append(
+                {
+                    "topic": item,
+                    "episodes": len(starts),
+                    "first_breakout": _fmt_day(breakouts[0]),
+                    "last_breakout": _fmt_day(breakouts[-1]),
+                    "seeds": sorted({r["seed"] for r in item_rows}),
+                    "action": RECURRING_ACTION,
+                }
+            )
+        topics.sort(key=lambda t: (t["episodes"], t["last_breakout"] or ""), reverse=True)
+        out["topics"] = topics[:lim]
+        if not topics:
+            out["reason"] = (
+                f"No topic broke out {me}+ times in the window; try min_episodes=2 or a "
+                "longer window."
+            )
+        out["guidance"] = (
+            "An episode is a separate run of 'breakout' status (a run ends when a later "
+            "snapshot of that seed no longer lists it as breakout); runs that overlap or "
+            f"start within {EPISODE_MERGE_DAYS} days of the previous episode's last breakout "
+            "(under any seed) are one episode. Episodes count what this archive observed, not "
+            "proven independent spikes: a durable page is worth it when they fall in clearly "
+            "separate periods. Two breakouts are only separable when a poll between them saw "
+            "the topic *not* breaking out, so sparse polling undercounts (weekly what_changed "
+            "runs are what makes this tool work). Recurring is not the same as big: check volume with "
+            "compare_keywords before building the page. Suspect (spam-like) queries never "
+            "enter the archive. Archive-only: nothing was fetched."
+        )
+    notes = [n for n in notes if n]
+    if notes:
+        out["note"] = " ".join(notes)
     return out
 
 

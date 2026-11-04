@@ -60,18 +60,19 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 
 | Tool | What you get |
 |---|---|
-| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle` and an explainable `score`; plus `questions[]` people ask and `suspect[]` spam-like rising queries kept out of the ranking. Pass `site_queries` (what your site already ranks for) to mark each topic `covered / partial / gap` |
-| `mine_questions` | Long-tail questions about a seed from Google Autocomplete (`how to`, `why`, `what is`, `vs` …), deduped and angle-tagged — FAQ / AEO fuel |
-| `aeo_opportunities` | Question clusters per seed × angle, scored with the seed's recent trend (`direction_now`, `growth_3m` over 12 months), Google News coverage (publishers to quote / pitch), Wikipedia presence, your site's coverage (`site_queries`) and citability hints — one call, partial failures per source |
-| `what_changed` | What moved since your last snapshot (1-90 days): new and promoted breakouts (*investigate now*), new rising (*consider*), cooled / dropped queries (*refresh existing post*, or *review* — verify with `interest_over_time` before retiring), rank moves and a `direction_now` flip — from the local observation archive |
+| `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle` and an explainable `score`; plus `questions[]` people ask, `suspect[]` spam-like rising queries and `filtered_out[]` rising queries unrelated to the seeds, both kept out of the ranking. Pass `site_queries` (what your site already ranks for) to mark each topic `covered / partial / gap`; seeds that name several entities get `ambiguous` + `clarify` (ask before writing) |
+| `mine_questions` | Long-tail questions about a seed from Google Autocomplete (`how to`, `why`, `what is`, `vs` …), deduped, angle-tagged and ranked by a realness `score`; bare prefix + seed padding goes to `filtered_out[]` — FAQ / AEO fuel |
+| `aeo_opportunities` | Question clusters per seed × angle, scored with the seed's recent trend (`direction_now`, `growth_3m` over 12 months), Google News coverage (publishers to quote / pitch), Wikipedia presence, your site's coverage (`site_queries`) and citability hints — one call, partial failures per source; seeds that name several entities get `ambiguous` + `clarify` (ask before writing) |
+| `what_changed` | What moved since your last snapshot (1-90 days): new and promoted breakouts (*investigate now*), new rising (*consider*), cooled / dropped queries (*refresh existing post*, or *review* — verify with `interest_over_time` before retiring), rank moves and a `direction_now` flip — from the local observation archive. First run: `first_seen[]` (current state, *no history yet*); no snapshot old enough: compares with the oldest and says its real age |
 | `seasonality` | When demand peaks each year (5-year weekly data): `peak_months`, `seasonal_strength`, `next_peak`, `publish_by` (6 weeks before), one-sentence `insight` |
 | `compare_channels` | Where a topic grows: web / YouTube / News / Images / Shopping with `growth_3m`, `direction_now`, `fastest_channel`, `momentum` (growing / flat / all_declining) and a `format_hint` (video tutorial, buying guide, newsjacking piece …) |
 | `trend_history` | Everything the local archive has seen about a keyword: `first_seen`, `breakout_episodes` (separate runs; recurring = durable page) vs `breakout_observations` (polling count), `direction_timeline` per timeframe, `seen_under_seeds` — free, no requests |
+| `recurring_topics` | Topics that keep breaking out in the local archive (≥ `min_episodes` separate runs in `days`, runs that overlap or restart within 7 days, under any seed, count once): `episodes`, first/last breakout, seeds, and the action *one durable page, refreshed at each spike* — free, no requests |
 | `news_coverage` | Who covers a topic in Google News: headlines, publisher frequency table, recency histogram, coverage label |
 | `wiki_attention` | Exact-title Wikipedia article and daily pageviews (direction, growth); `has_article=false` and optional `related_article` when only a different search hit is found |
 | `trendzeist_status` | Health of every source (live / error / idle), cache usage, observation archive (rows, dates, last error), effective settings — free, no requests |
 | `interest_over_time` | 0-100 interest curve with mean, peak, `direction` (whole window), `direction_now` (recent slope), `growth_3m` / `growth_12m` and a plain-English `insight` |
-| `compare_keywords` | Head-to-head share and winner for 2-5 keywords |
+| `compare_keywords` | Head-to-head share for 2-5 keywords, each with a `role` (leader, rising challenger, declining, niche, steady) and a `content_implication`; `winner` = the term to target (a rising challenger beats a falling leader; `null` + `winner_reason` when nothing has measurable interest) plus a one-line `seo_interpretation` |
 | `related_queries` | Top & rising related searches with breakout flags, angles and `questions[]` |
 | `related_topics` | Top & rising Knowledge-Graph topics (best-effort) |
 | `interest_by_region` | Where demand lives: COUNTRY (worldwide), REGION (within a country), CITY / DMA (US or worldwide) |
@@ -103,12 +104,16 @@ plan for a date / refresh / retire). A ready-made agent skill lives in [`SKILL.m
   Google answer is a snapshot too) with normalised rows in `archive.sqlite3` next to the
   disk cache (stdlib `sqlite3`, 365-day retention, opened lazily). Related-query snapshots
   hold the *complete* lists regardless of a caller's `limit`, so comparisons never invent
-  drops. `what_changed` and `trend_history` read it; `trendzeist_status.archive` reports
+  drops. `what_changed`, `trend_history` and `recurring_topics` read it; `trendzeist_status.archive` reports
   it. Suspect rising queries never enter it. Archive errors never fail a tool.
   `TRENDZEIST_ARCHIVE=0` turns it off.
-- **Site coverage is conservative.** An `aeo_opportunities` cluster is `covered` only when
-  *every* question in it is covered; a mix is `partial` (see `coverage_counts`), so
-  `exclude_covered` can never hide an unanswered question.
+- **Site coverage is conservative but not literal.** An `aeo_opportunities` cluster is
+  `covered` only when *every* question in it is covered; a mix is `partial` (see
+  `coverage_counts`), so `exclude_covered` can never hide an unanswered question. Tokens
+  are compared after plural folding and a small tech synonym map (mac/macos,
+  wp/wordpress, js/javascript …), so "claude code mac" is covered by a site query
+  "claude code macos"; `matched` names the site query behind each verdict. Feeding the raw
+  Search Console variants still helps.
 - `angle` is one of `how-to | comparison | listicle | definition | news` (or `null`) —
   the title format the query suggests. Pair it with evidence: how-to → steps + numbers,
   comparison → table + quotes, definition → cite a primary source, news → dated publisher quotes.
@@ -124,8 +129,29 @@ plan for a date / refresh / retire). A ready-made agent skill lives in [`SKILL.m
   `direction_now`.
 - **Suspect rising queries.** Search-manipulation campaigns attach one name to many
   unrelated "Breakout" queries. `related_queries` flags such items `suspect: true` with a
-  `suspect_reason`; `discover_topics` moves them to `suspect[]`; `aeo_opportunities` ignores
-  them. Google's `is_breakout` value is kept, only the trust changes.
+  `suspect_reason` (a flagged `.com` also flags the queries carrying its name as words);
+  `discover_topics` moves them to `suspect[]`; `aeo_opportunities` ignores them. Google's
+  `is_breakout` value is kept, only the trust changes.
+- **Off-topic rising queries.** For niche seeds a handful of searches is a huge % rise, so
+  Google's rising list can lead with things like "how to bake a cake" under an AI-tool seed
+  (prompts pasted into the search box). A rising query with no word in common with the
+  seed, the other seeds of the call or the seed's top queries is `off_topic: true`;
+  `discover_topics` moves it to `filtered_out[]` (with reason, growth and breakout flag)
+  and out of `topics`, `questions` and the score, and from two such items a `note`
+  suggests `category=` (5 = Computers & Electronics). A real neighbour that shares no word
+  with the seed ("moka pot" under "espresso") lands there too, so scan `filtered_out`
+  before dismissing it.
+- **Level shifts are flagged.** A sustained step in a series (the 4-week mean changes by
+  ≥ 30 % and stays there) is reported as `level_shift` in the keyword's summary with its
+  `date`, `change_pct`, `post_shift_change_pct` (what happened after the step) and
+  `growth_affected`; `interest_over_time` / `compare_keywords` add `warnings[]` and mark
+  a step shared by several keywords in the same week `likely_artifact` (a Google sampling
+  change, not demand). Growth and direction figures whose windows span the step overstate
+  the change: read the curve on each side of it.
+- **"popularity unknown" in `score_breakdown.demand`** is normal for rising-only items:
+  Google gives a growth % but no popularity for them, so demand gets the minimum points.
+  A top item rising from a very low base deserves a look at its curve (`interest_over_time`)
+  before it becomes a post.
 - `citability_hints` (on `aeo_opportunities`) encode the GEO paper (Aggarwal et al., KDD
   2024): citing sources, quotations and statistics each lifted AI-engine visibility 30-40%;
   keyword stuffing did nothing.
@@ -182,7 +208,7 @@ Point a client at the clone with
 | `TRENDZEIST_BACKOFF` | `1.5` | Exponential backoff factor |
 | `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs. Rotated per request for explore calls; **RSS, Autocomplete, News and Wikipedia always use the first one** |
 | `TRENDZEIST_CACHE_DIR` | OS user cache dir | Persistent JSON cache location (`0700`); `off` to disable (also disables the archive) |
-| `TRENDZEIST_ARCHIVE` | `1` | `0` disables the observation archive (`what_changed` / `trend_history` then report `available: false`) |
+| `TRENDZEIST_ARCHIVE` | `1` | `0` disables the observation archive (`what_changed` / `trend_history` / `recurring_topics` then report a `reason`) |
 | `TRENDZEIST_ARCHIVE_DAYS` | `365` | Retention for archive rows (pruned once per process on first write) |
 | `TRENDZEIST_LOG_LEVEL` | `WARNING` | Python logging level (stderr) |
 
@@ -208,20 +234,35 @@ Point a client at the clone with
   non-English market, pass a seed already phrased in that language.
 - `related_topics` frequently returns nothing from Google; `related_queries` is reliable.
 - Google's legacy daily `trending_searches` endpoint is gone (404); `trending_now` uses the RSS feed.
-- `aeo_opportunities` is the most expensive call: worst case 1 + 10 requests per seed
+- `aeo_opportunities` is the most expensive call: worst case 1 + 11 requests per seed
   (Wikipedia runs on its own lane). Google requests stop at the first 429; Wikipedia data
   is still returned. `trendzeist_status` shows which source is erroring without any request.
+- The ambiguous-seed check in `discover_topics` / `aeo_opportunities` is one extra Google
+  Trends request per seed the first time that seed is seen (cached for the static TTL, so
+  repeats are free). It is skipped once a call is rate limited (the seed report then
+  carries an `ambiguity_note`); a failure there is an `entities:<seed>` error and never
+  stops the seed. The lookup answers in the server language (`TRENDZEIST_HL`, default
+  `en-US`), not the geo's: a Portuguese or German seed is rarely matched against English
+  entity titles, so a non-English geo with no match gets an `ambiguity_note` saying so.
+  Set `TRENDZEIST_HL` to the seed's language to check it properly.
 - `wiki_attention.has_article` confirms an exact-title search match only; a different
   Wikipedia search hit appears as `related_article`, not as a citation or proof of a gap.
   Verify related titles and redirects manually before claiming an encyclopedic content gap.
 - Cache TTLs, memory-entry count and series-point cap must be positive integers; invalid
   values produce an actionable tool error rather than an opaque formatter failure.
 - `what_changed` needs a baseline: the first call records one and reports
-  `reason: "baseline recorded <date>; rerun after <date>"` per seed. Snapshots accrue from
+  `reason: "baseline recorded <date>; rerun after <date>"` per seed, together with
+  `first_run: true` and `first_seen[]` (the current breakouts and rising queries, action
+  "… (no history yet)"). When snapshots exist but none is `since_days` old, it compares
+  with the oldest and says so (`baseline_note`, `baseline_age_days`). Snapshots accrue from
   everyday use (`discover_topics`, `related_queries` on `today 3-m`; trend labels on
-  `today 12-m`), so a week of normal work is enough. `trend_history` is archive-only.
+  `today 12-m`), so a week of normal work is enough. `trend_history` and
+  `recurring_topics` are archive-only; their episode counts can only separate two
+  breakouts when a poll between them saw the topic not breaking out, so sparse polling
+  undercounts (weekly `what_changed` runs are what makes them useful).
 - `seasonality` needs at least 3 full years of non-zero weekly data (`today 5-y`); younger
-  topics return `seasonal: null` with a `reason`. Profile and strength use full years only;
+  topics return `seasonal: null` with a `reason` (for a two-year-old topic, read the shape
+  with `interest_over_time(..., "today 5-y")` instead). Profile and strength use full years only;
   zero off-season interest is reported as seasonal with `strength_note` (ratio unbounded);
   `in_peak_now` flags that the peak month is the current one. `compare_channels` issues 5
   requests and stops at the first 429 (`skipped` lists the rest); channels are separate

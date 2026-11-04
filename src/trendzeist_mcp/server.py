@@ -39,7 +39,7 @@ server = MCPServer(
         "what_changed (since the last snapshot: new breakouts, cooled or dropped queries, "
         "with an action each), seasonality (peak months and a publish_by date), "
         "compare_channels (web / YouTube / News / Images / Shopping growth with a "
-        "format_hint), trend_history (local archive, free). Pass site_queries (what the "
+        "format_hint), trend_history and recurring_topics (local archive, free). Pass site_queries (what the "
         "site already ranks for) to discover_topics / aeo_opportunities to mark gaps. "
         "gprop='news' or 'youtube' shows what outlets and video audiences care about. Timeframes: "
         "'now 7-d', 'today 1-m', 'today 3-m', 'today 12-m', 'today 5-y', 'all' or "
@@ -101,9 +101,11 @@ def interest_over_time(
     summary (mean, latest, peak, direction over the whole window, direction_now =
     recent slope, growth_3m/growth_12m % and a plain-English insight). Use
     direction_now to decide whether to write about a topic *now*; direction can be
-    'rising' or 'new' for a topic that peaked months ago. Long series are downsampled
-    to ~60 points. gprop: '' (web), 'news', 'youtube' (authority channels answer
-    engines cite), 'images', 'froogle'."""
+    'rising' or 'new' for a topic that peaked months ago. A sustained step in a series
+    is reported as summary.<kw>.level_shift and in warnings (shared by several
+    keywords = likely a Google sampling change): growth figures spanning that week
+    overstate the change. Long series are downsampled to ~60 points. gprop: '' (web),
+    'news', 'youtube' (authority channels answer engines cite), 'images', 'froogle'."""
     return _tool(tools.interest_over_time)(keywords, timeframe, geo, category, gprop)
 
 
@@ -116,7 +118,11 @@ def compare_keywords(
     gprop: str = "",
 ) -> dict[str, Any]:
     """Compare 2-5 keywords head-to-head: relative share, leader and trend
-    direction for each. Use to pick the strongest angle among alternatives."""
+    direction for each. Use to pick the strongest angle among alternatives. Each
+    ranking row has a role (leader / rising challenger / declining / niche / steady)
+    and a content_implication; winner is the term to target (a rising challenger
+    beats a falling or dead leader; null + winner_reason when nothing has data or
+    interest) and seo_interpretation sums it up in one sentence."""
     return _tool(tools.compare_keywords)(keywords, timeframe, geo, category, gprop)
 
 
@@ -212,7 +218,9 @@ def discover_topics(
     site already ranks for (fill from a Search Console MCP or page titles): each topic
     then gets coverage covered / partial / gap, and exclude_covered drops the covered
     ones. Partial failures are reported per seed in `errors` instead of failing the
-    call. First call of a session: start with 1-2 seeds to avoid a 429."""
+    call. A seed report with 'ambiguous' names several Google entities (e.g. Apple
+    the company vs the fruit): ask the user before writing, or re-run with the right
+    mid. First call of a session: start with 1-2 seeds to avoid a 429."""
     return _tool(_discover_topics)(
         seed_keywords, geo, timeframe, category, gprop, max_per_seed, site_queries, exclude_covered
     )
@@ -244,7 +252,10 @@ def aeo_opportunities(
     point). site_queries = queries the site already ranks for (fill from a Search
     Console MCP or page titles); clusters then carry coverage covered / partial / gap
     and exclude_covered drops covered ones. Spam-like rising queries are ignored.
-    Up to ~1+10 requests per seed; partial failures per source in `errors`.
+    Up to ~1+10 requests per seed; partial failures per source in `errors`. A seed
+    report with 'ambiguous' names several Google entities (e.g. Apple the company vs
+    the fruit): ask the user before writing, then re-run with a more specific phrase
+    (a mid only works for Google Trends, not for News / Wikipedia / Autocomplete).
     limit: clusters (1-25)."""
     return _tool(_aeo_opportunities)(seeds, geo, timeframe, limit, site_queries, exclude_covered)
 
@@ -276,7 +287,9 @@ def what_changed(seeds: list[str], geo: str = "", since_days: int = 7) -> dict[s
     Leaving Google's relative list is not proof of falling demand. Refreshes current
     data first (1 + N requests, cached), then compares complete snapshots from the
     local observation archive, which fills up as any tool fetches fresh data. No
-    baseline yet -> per-seed reason with the date to rerun."""
+    snapshot old enough -> compares with the oldest available (baseline_note gives its
+    real age); first run -> first_seen lists the current breakouts and rising queries
+    ('no history yet') plus the date to rerun."""
     return _tool(tools.what_changed)(seeds, geo, since_days)
 
 
@@ -288,6 +301,24 @@ def trend_history(keyword: str, geo: str = "", days: int = 90) -> dict[str, Any]
     page) vs breakout_observations (polling count), direction_timeline per timeframe
     and seen_under_seeds. Free: makes no network requests."""
     return _tool(tools.trend_history)(keyword, geo, days)
+
+
+@server.tool()
+def recurring_topics(
+    geo: str = "",
+    days: int = 90,
+    min_episodes: int = 3,
+    seeds: list[str] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Topics that broke out again and again (local archive, last `days` 1-365):
+    each with episodes (separate breakout runs under other seeds; runs that overlap
+    or restart within 7 days, under any seed, count once), first/last breakout, the
+    seeds it appeared under and an action (one durable page, refreshed at each
+    spike). min_episodes 2-10 (default 3); seeds
+    (optional, up to 5) limits the scan. coverage_days + note when the archive is
+    younger than the window. Free: makes no network requests."""
+    return _tool(tools.recurring_topics)(geo, days, min_episodes, seeds, limit)
 
 
 @server.tool()
@@ -430,11 +461,15 @@ def weekly_review(seeds: str, geo: str = "", site_queries: str = "") -> str:
         f"1. what_changed(seeds=[{seeds_repr}], geo='{geo}', since_days=7). For each seed read "
         "new_breakouts and promoted (action: investigate now), new_rising (consider), "
         "cooled / dropped (action starts with 'review:' or is 'refresh existing post'), "
-        "rank_moves and direction_flip. If a seed has no baseline yet, say so and note the "
-        "rerun date from its reason; if a seed's reason says Google returned nothing, report "
-        "that, do not infer drops.\n"
+        "rank_moves and direction_flip. First run (seed has first_run: true): treat its "
+        "first_seen items as the current state to investigate, say the week-over-week review "
+        "starts on the rerun date in reason, and do not call anything new or dropped. If a seed "
+        "has baseline_note, quote the real snapshot age instead of 'last week'. If a seed's "
+        "reason says Google returned nothing, report that, do not infer drops.\n"
         "2. For every 'review:' item you intend to retire: interest_over_time([<item>], "
-        "'today 12-m'). Retire only if direction_now is falling; otherwise it is a refresh.\n"
+        "'today 12-m'). Retire only if direction_now is falling; otherwise it is a refresh. "
+        "If the result has a level_shift warning, the step is a data artifact until proven "
+        "otherwise: judge the curve after the step, not growth_3m.\n"
         "3. For each new breakout or rising item that looks evergreen (a how-to, a product "
         "or a recurring event rather than a one-off headline): seasonality(keyword=<item>, "
         f"geo='{geo}'). Note peak_months, publish_by, in_peak_now and the insight.\n"
@@ -443,9 +478,12 @@ def weekly_review(seeds: str, geo: str = "", site_queries: str = "") -> str:
         f"5. aeo_opportunities(seeds=[{seeds_repr}], geo='{geo}', {site_line}). Prefer clusters "
         "with coverage 'gap'; 'partial' clusters still contain unanswered questions (see "
         "coverage_counts); only fully 'covered' clusters are refresh candidates. Quote "
-        "score_breakdown reasons, not the raw number.\n"
-        "6. Optional: trend_history(keyword=<item>) for anything that looks familiar; "
-        "breakout_episodes >= 3 means a recurring topic that deserves a durable page "
+        "score_breakdown reasons, not the raw number. If a seed report has 'ambiguous', "
+        "stop and ask which entity is meant before planning anything for that seed.\n"
+        f"6. recurring_topics(geo='{geo}', days=90) (free, archive only): every topic listed "
+        "deserves one durable page refreshed at each spike, not another post; episode "
+        "counts are a lower bound (see coverage_days / note). Optional: "
+        "trend_history(keyword=<item>) for a single item that looks familiar "
         "(breakout_observations is just how often it was polled).\n\n"
         "Output a prioritised list with four sections: PUBLISH NOW (new breakouts, rising items "
         "inside their publish window), PLAN FOR <date> (seasonal items: publish_by date, peak "

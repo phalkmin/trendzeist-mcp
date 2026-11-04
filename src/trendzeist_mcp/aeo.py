@@ -9,7 +9,7 @@ its own lane and is never skipped because Google is cooling down.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 from . import formatters as fmt
 from . import tools
@@ -66,6 +66,8 @@ def _trend_block(trend: dict[str, Any]) -> dict[str, Any]:
     }
     if block["growth_3m"] is None and trend.get("growth_note"):
         block["growth_note"] = trend["growth_note"]
+    if trend.get("level_shift"):
+        block["level_shift"] = trend["level_shift"]
     return block
 
 
@@ -101,19 +103,24 @@ def _seed_context(
     lang: str,
     cooling: bool,
     errors: list[dict[str, str]],
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None, bool, bool]:
+    context: Sequence[str] = (),
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None, bool, bool, list[str]]:
     """Gather questions, news and Wikipedia context for one seed.
 
-    Returns ``(found_questions, news, wiki, cooling, skipped_google)``.
+    Returns ``(found_questions, news, wiki, cooling, skipped_google, off_topic_names)``.
     """
     found: list[dict[str, Any]] = []
+    off_topic_names: list[str] = []
     skipped = cooling
 
     if not cooling:
         try:
-            top, rising = tools.fetch_related(hub, seed, tf, g, 0, "", 25)
-            # Suspect (spam-like) rising items never become questions or breakouts.
+            top, rising = tools.fetch_related(hub, seed, tf, g, 0, "", 25, context=context)
+            # Suspect (spam-like) and off-topic rising items never become questions
+            # or breakouts.
             rising, _ = fmt.split_suspects(rising)
+            rising, off_topic = fmt.split_off_topic(rising)
+            off_topic_names = [it["name"] for it in off_topic]
             for q in fmt.extract_questions(
                 ("rising", rising), ("top", top), limit=_QUESTIONS_PER_SEED
             ):
@@ -182,7 +189,7 @@ def _seed_context(
     except TrendsError as exc:
         errors.append({"step": f"wikipedia:{seed}", "error": str(exc)})
 
-    return found, news, wiki, cooling, skipped
+    return found, news, wiki, cooling, skipped, off_topic_names
 
 
 def aeo_opportunities(
@@ -219,16 +226,24 @@ def aeo_opportunities(
     seen: set[str] = set()
     clusters: dict[tuple[str, str], dict[str, Any]] = {}
     seed_reports: list[dict[str, Any]] = []
+    ambiguous_seeds: list[str] = []
     context: dict[str, tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]] = {}
 
     for seed in kws:
         trend = trends.get(seed, {"available": False})
         report: dict[str, Any] = {"seed": seed, "trend": trend}
-        found, news, wiki, cooling, skipped = _seed_context(
-            hub, seed, tf, g, news_geo, lang, cooling, errors
+        # mid_rerun=False: News / Wikipedia / Autocomplete take search text, not a mid.
+        if cooling:
+            tools.note_ambiguity_skipped(report)
+        elif tools.flag_ambiguity(hub, seed, report, errors, geo=g, mid_rerun=False):
+            ambiguous_seeds.append(seed)
+        found, news, wiki, cooling, skipped, off_topic = _seed_context(
+            hub, seed, tf, g, news_geo, lang, cooling, errors, [s for s in kws if s != seed]
         )
         if skipped:
             report["skipped"] = "Google requests skipped: rate limited earlier in this call."
+        if off_topic:
+            report["off_topic_dropped"] = off_topic
 
         added = 0
         for q in found:
@@ -355,4 +370,6 @@ def aeo_opportunities(
     notes = [n for n in notes if n]
     if notes:
         out["note"] = " ".join(notes)
+    if ambiguous_seeds:
+        out["ambiguous_seeds"] = ambiguous_seeds
     return out

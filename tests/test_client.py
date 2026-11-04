@@ -511,3 +511,30 @@ def test_rss_429_is_a_rate_limit_error():
     with patch("requests.get", return_value=resp):
         with pytest.raises(TrendsError, match="Google Trends rate limit"):
             _client().trending_rss("US", 0)
+
+
+@pytest.mark.parametrize(
+    "raw", [{"default": {}}, [None], [{"title": 7, "type": "Topic"}], [{"title": "Apple", "type": ["x"]}]]
+)
+def test_suggestions_malformed_payload_is_a_trends_error(raw):
+    """0.6.0: suggestions are shaped at the source boundary, so a malformed Google answer
+    becomes an 'Unexpected response' TrendsError instead of an AttributeError in a tool."""
+    client = _client()
+    with patch.object(TrendReq, "suggestions", return_value=raw), patch(
+        "requests.get", return_value=_cookie_response()
+    ):
+        with pytest.raises(TrendsError) as exc:
+            client.suggestions("apple")
+    assert "Unexpected response" in str(exc.value) and exc.value.retryable is False
+
+
+def test_suggestions_are_shaped_to_title_type_mid():
+    raw = [{"mid": "/m/1", "title": "Apple", "type": "Fruit", "extra": 1}, {"title": "Apple"}]
+    with patch.object(TrendReq, "suggestions", return_value=raw), patch(
+        "requests.get", return_value=_cookie_response()
+    ):
+        out = _client().suggestions("apple")
+    assert out == [
+        {"title": "Apple", "type": "Fruit", "mid": "/m/1"},
+        {"title": "Apple", "type": None, "mid": None},
+    ]

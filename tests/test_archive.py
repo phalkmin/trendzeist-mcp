@@ -276,3 +276,22 @@ def test_archive_failure_surfaces_in_meta_not_as_error(tmp_path):
     assert out["available"] is True  # the tool still answered
     assert "write" in hub.call_meta()["archive_error"]
     assert tools.trendzeist_status(hub)["archive"]["last_error"]
+
+
+def test_rising_items_filters_kind_window_and_seeds(tmp_path):
+    a = Archive(tmp_path / "a.sqlite3")
+
+    def rec(seed, days_ago, rising):
+        ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with patch("trendzeist_mcp.archive._now", return_value=ts):
+            a.record_related(seed, "", "today 3-m", [{"name": "top one", "value": 50}],
+                             [{"name": r, "value": 9000, "is_breakout": True} for r in rising])
+
+    rec("coffee", 100, ["too old"])
+    rec("coffee", 5, ["cold brew"])
+    rec("tea", 4, ["matcha"])
+    rows = a.rising_items("", 90)
+    assert [r["item"] for r in rows] == ["cold brew", "matcha"]
+    assert {r["kind"] for r in rows} == {"rising_query"}
+    assert [r["item"] for r in a.rising_items("", 90, ["Coffee "])] == ["cold brew"]
+    assert a.rising_items("US", 90) == []

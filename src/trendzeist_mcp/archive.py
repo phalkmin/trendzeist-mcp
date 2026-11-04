@@ -46,6 +46,8 @@ GROUP_QUESTIONS = "questions"  # kind: question (status = angle)
 TREND_KINDS: tuple[str, ...] = ("direction", "direction_now", "growth_3m")
 RELATED_KINDS: tuple[str, ...] = ("rising_query", "top_query")
 _TS = "%Y-%m-%dT%H:%M:%SZ"
+_OBS_COLS = ("snapshot_id", "observed_at", "seed", "timeframe", "kind", "item", "value", "rank", "status")
+_OBS_SELECT = ", ".join(_OBS_COLS)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -280,12 +282,42 @@ class Archive:
 
     # ---- readers ---------------------------------------------------------------
 
-    def snapshots(self, seed: str, geo: str, group: str, timeframe: str) -> list[dict[str, Any]]:
-        """Snapshot headers for a seed, newest first: ``{id, observed_at, item_count}``."""
-        rows = self._query(
+    def _clean_rows(self, rows: list[tuple], text_cols: tuple[int, ...]) -> list[tuple]:
+        """Drop rows whose text columns are not ``str`` (SQLite TEXT columns are not
+        strict; a BLOB there would crash string comparisons downstream). Reported,
+        never raised."""
+        kept = [r for r in rows if all(isinstance(r[i], str) for i in text_cols)]
+        if len(kept) != len(rows):
+            self._fail("read", ValueError(f"{len(rows) - len(kept)} row(s) with malformed stored text skipped"))
+        return kept
+
+    def snapshots(
+        self,
+        seed: str,
+        geo: str,
+        group: str,
+        timeframe: str,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Snapshot headers for a seed, newest first: ``{id, observed_at, item_count}``.
+
+        ``since`` / ``until`` bound ``observed_at`` (inclusive). Ties on the
+        second are ordered by insertion, so reversing the list is chronological.
+        """
+        sql = (
             "SELECT snapshot_id, observed_at, item_count FROM snapshots WHERE seed=? AND geo=? "
-            "AND grp=? AND timeframe=? ORDER BY observed_at DESC, rowid DESC",
-            (_norm(seed), geo, group, timeframe),
+            "AND grp=? AND timeframe=?"
+        )
+        params: list[Any] = [_norm(seed), geo, group, timeframe]
+        if since is not None:
+            sql += " AND observed_at>=?"
+            params.append(since)
+        if until is not None:
+            sql += " AND observed_at<=?"
+            params.append(until)
+        rows = self._clean_rows(
+            self._query(sql + " ORDER BY observed_at DESC, rowid DESC", tuple(params)), (0, 1)
         )
         return [{"id": i, "observed_at": o, "item_count": n} for i, o, n in rows]
 
@@ -323,18 +355,51 @@ class Archive:
         )
         return rows[0][0] if rows else None
 
-    def history(self, keyword: str, geo: str, days: int) -> list[dict[str, Any]]:
+    @staticmethod
+    def window(days: int, now: datetime | None = None) -> tuple[str, str]:
+        """``(cutoff, now)`` timestamps for a ``days``-long window ending now.
+
+        Readers take an upper bound too: rows stamped in the future (clock
+        corrections, imported data) are not history and must not count.
+        """
+        end = now or datetime.now(timezone.utc)
+        return (end - timedelta(days=days)).strftime(_TS), end.strftime(_TS)
+
+    def _rows(self, sql: str, params: tuple) -> list[dict[str, Any]]:
+        rows = self._clean_rows(self._query(sql, params), (0, 1, 2, 3, 4, 5))
+        return [dict(zip(_OBS_COLS, row)) for row in rows]
+
+    def history(self, keyword: str, geo: str, days: int, until: str | None = None) -> list[dict[str, Any]]:
         """Every observation where the keyword is the seed *or* the item, oldest first."""
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(_TS)
+        cutoff, now = self.window(days)
         key = _norm(keyword)
-        rows = self._query(
-            "SELECT snapshot_id, observed_at, seed, timeframe, kind, item, value, rank, status "
-            "FROM observations WHERE geo=? AND observed_at>=? AND (seed=? OR item=?) "
-            "ORDER BY observed_at, snapshot_id",
-            (geo, cutoff, key, key),
+        return self._rows(
+            f"SELECT {_OBS_SELECT} FROM observations WHERE geo=? AND observed_at>=? AND observed_at<=? "
+            "AND (seed=? OR item=?) ORDER BY observed_at, snapshot_id",
+            (geo, cutoff, until or now, key, key),
         )
-        keys = ("snapshot_id", "observed_at", "seed", "timeframe", "kind", "item", "value", "rank", "status")
-        return [dict(zip(keys, row)) for row in rows]
+
+    def oldest(self, geo: str) -> str | None:
+        """Oldest observation timestamp for a geo (how far back the archive reaches)."""
+        rows = self._query("SELECT MIN(observed_at) FROM observations WHERE geo=?", (geo,))
+        value = rows[0][0] if rows else None
+        return value if isinstance(value, str) else None
+
+    def rising_items(
+        self, geo: str, days: int, seeds: list[str] | None = None, until: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Every ``rising_query`` observation in the window (optionally under ``seeds``), oldest first."""
+        cutoff, now = self.window(days)
+        sql = (
+            f"SELECT {_OBS_SELECT} FROM observations WHERE geo=? AND observed_at>=? AND observed_at<=? "
+            "AND kind='rising_query'"
+        )
+        params: list[Any] = [geo, cutoff, until or now]
+        if seeds:
+            keys = sorted({_norm(s) for s in seeds})
+            sql += f" AND seed IN ({','.join('?' * len(keys))})"
+            params += keys
+        return self._rows(sql + " ORDER BY observed_at, snapshot_id", tuple(params))
 
     def status(self) -> dict[str, Any]:
         """For ``trendzeist_status``; never raises."""

@@ -224,6 +224,20 @@ def validate_days(days: int, *, default: int, maximum: int = MAX_HISTORY_DAYS) -
     return min(days, maximum)
 
 
+MAX_MIN_EPISODES = 10
+
+
+def validate_min_episodes(min_episodes: int) -> int:
+    """``recurring_topics`` threshold: integer >= 2, clamped to 10 (report with ``limit_note``)."""
+    if min_episodes is None:
+        return 3
+    if isinstance(min_episodes, bool) or not isinstance(min_episodes, int):
+        raise ValidationError("min_episodes must be an integer (2-10)")
+    if min_episodes < 2:
+        raise ValidationError("min_episodes must be >= 2: one breakout is not a recurrence")
+    return min(min_episodes, MAX_MIN_EPISODES)
+
+
 def validate_site_queries(site_queries: Sequence[str] | None) -> tuple[list[str], int]:
     """Clean a site-coverage list: ``(queries, dropped)`` where ``dropped`` counts
     entries removed by the 500-item cap (report with a ``note``).

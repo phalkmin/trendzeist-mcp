@@ -735,8 +735,30 @@ class TrendsClient(Source):
         return self._cached(key, self.settings.explore_ttl, fetch)
 
     def suggestions(self, keyword: str) -> list[dict[str, Any]]:
+        """Entity suggestions as ``[{title, type, mid}]`` with string (or None) fields.
+
+        pytrends-modern hands back Google's ``topics`` list unchecked; shape it here
+        so a malformed answer is an "Unexpected response" ``TrendsError`` instead of
+        an ``AttributeError`` deep inside a tool (``_map_error`` covers ``TypeError``).
+        """
         key = _cache_key("sugg", kw=keyword, hl=self.settings.hl)
-        return self._cached(key, self.settings.static_ttl, lambda: self._req().suggestions(keyword))
+
+        def fetch() -> list[dict[str, Any]]:
+            raw = self._req().suggestions(keyword)
+            if not isinstance(raw, list):
+                raise TypeError(f"suggestions is {type(raw).__name__}, expected list")
+            out: list[dict[str, Any]] = []
+            for entry in raw:
+                if not isinstance(entry, dict):
+                    raise TypeError(f"suggestion entry is {type(entry).__name__}, expected object")
+                item = {k: entry.get(k) for k in ("title", "type", "mid")}
+                for k, val in item.items():
+                    if val is not None and not isinstance(val, str):
+                        raise TypeError(f"suggestion {k} is {type(val).__name__}, expected string")
+                out.append(item)
+            return out
+
+        return self._cached(key, self.settings.static_ttl, fetch)
 
     def categories(self) -> dict[str, Any]:
         key = _cache_key("cats", hl=self.settings.hl)

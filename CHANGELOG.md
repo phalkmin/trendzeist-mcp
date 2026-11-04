@@ -4,6 +4,129 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-11-04
+
+"Knows *which one* and *what keeps coming back*". Additive; `schema_version` stays 3.
+
+### Added
+- **Ambiguous-seed flag** in `discover_topics` and `aeo_opportunities`: a seed whose
+  exact title matches several Google entities of different types (Apple the company vs
+  the fruit) gets `ambiguous: [{title, type, mid}]` and a `clarify` hint; the call lists
+  them in `ambiguous_seeds`. Detection only — the seed is still queried as typed. Uses
+  the cached suggestions endpoint; skipped once the call is rate limited; a failure is an
+  `entities:<seed>` error, never a failed call.
+- **`compare_keywords` editorial layer:** per-keyword `growth_3m`, `role` (leader /
+  rising challenger / declining / niche / steady) and `content_implication`; top-level
+  `winner` (`{keyword, reason}` — a rising challenger beats a falling leader) and a
+  one-sentence `seo_interpretation`. `leader` is unchanged. When no keyword has measurable
+  interest `winner` is `null` with a `winner_reason` (a tie at zero is not a target); an
+  unknown recent slope is called unknown, never "not falling". `growth_note` explains a
+  null `growth_3m`.
+- **`recurring_topics(geo, days=90, min_episodes=3, seeds, limit=20)`:** archive-only list
+  of topics with repeated breakout episodes, with first/last breakout, seeds and a
+  *durable page* action; `coverage_days` + note when the archive is younger than the window.
+  Like `trend_history`, it counts a topic only under *other* seeds.
+- `TrendsClient.suggestions` now shapes Google's answer to `[{title, type, mid}]` (string
+  or null fields); a malformed payload is an "Unexpected response" `TrendsError`, so the
+  ambiguity check can never crash a composite.
+- **Off-topic rising queries** (tutorial run 2026-11-03): Google's rising list for an
+  AI-tool seed carried "how to bake a cake" and "best time to visit maldives" as the top
+  breakouts (prompts pasted into the search box, rising from a tiny base). A rising query
+  with no word in common with the seed, the other seeds of the call or the seed's top
+  queries is now `off_topic: true` (+ `off_topic_reason`) in `related_queries`;
+  `discover_topics` moves it to `filtered_out[]` (kind, growth, breakout flag, reason)
+  and out of `topics`, `questions` and the score, with `counts.off_topic`,
+  `seeds[].off_topic_count` and, from two such items, a `note` suggesting `category=`;
+  `aeo_opportunities` drops it from the clusters and lists it in
+  `seeds[].off_topic_dropped`. Nothing disappears silently. A legitimate neighbour that
+  shares no word with the seed ("moka pot" under "espresso") lands there too: scan
+  `filtered_out` before dismissing it.
+- **Level-shift warning** in every trend summary (`interest_over_time`,
+  `compare_keywords`, `compare_channels`, the seed `trend` of `discover_topics` /
+  `aeo_opportunities`): a sustained step (4-week means differ by ≥ 30 %, every later
+  window stays ≥ 15 % on the new side, the level before was steady and the new level is
+  new) is reported as `level_shift {date, change_pct, before_mean, after_mean,
+  post_shift_change_pct, growth_affected, warning}`; `interest_over_time` /
+  `compare_keywords` add `warnings[]` grouping series that stepped the same way in the
+  same week (`shared_by`, `likely_artifact` when two or more did). On 2026-07-12 five
+  unrelated 12-month series stepped down 30-50 % in one week with no change in Search
+  Console; growth figures spanning that week were partly artifact and nothing said so.
+- **`mine_questions` realness ranking:** each question carries `score` (3 per prefix it
+  surfaced under = `prefix_hits`; +2 for a verb, +3 for a comparison word, +1 for a top-3
+  Autocomplete position, +1 when it adds two or more words) and the list is sorted by it.
+  Completions with no verb that add at most one word to prefix + seed ("how long llms.txt
+  last", "when llms.txt file") go to `filtered_out[]` (+ `filtered_count`) instead of the
+  list: on the llms.txt run more than a third of the 40 "questions" were such padding.
+- **`what_changed` first run:** a seed with no earlier snapshot gets `first_run: true` and
+  `first_seen[]` (the current breakouts and rising queries with the action suffixed
+  "(no history yet)") next to the baseline `reason`, so the first `weekly_review` is not
+  an empty meeting. When a snapshot exists but none is `since_days` old, the comparison
+  uses the oldest one and says so (`baseline_at`, `baseline_age_days`, `baseline_note`:
+  "compared with one from 2 days ago (7 requested)"). The `weekly_review` prompt branches
+  on both.
+
+### Changed
+- **Site coverage matches near-variants.** `site_coverage` folds plurals and a small
+  synonym map (mac/macos, wp/wordpress, js/javascript, …) and matches tokens on a 4+
+  letter prefix, so "claude code mac" against a site query "claude code macos" is
+  `covered` (was `gap`, recommending a page the site already had). The partial threshold
+  (token Jaccard ≥ 0.6) and exact behaviour are unchanged; `matched` still names the site
+  query behind the verdict.
+- **Spam names linked to a flagged domain.** When the suspect heuristic flags a domain-like
+  rising query (`abrahamquirosvillalba .com`) it now also flags every rising query carrying
+  the domain label as separate words ("… abraham quiros villalba"), even when fewer than
+  three queries carry it. One-word labels (a brand) do not link.
+
+### Fixed
+- `trend_history.breakout_episodes` counted one breakout twice when two seeds saw it in
+  the same week. Breakout runs that overlap, or start within 7 days of the previous
+  episode's **last** breakout (under any seed, the same one included), are now one
+  episode: a breakout that flickers off and back on between daily polls counts once, and
+  adding a new seed to a live breakout no longer manufactures a "recurrence";
+  `trend_history` and `recurring_topics` share the counter.
+- Archive readers (`history`, `rising_items`, `snapshots`) are bounded by *now*: rows
+  stamped in the future (clock correction, imported data) are no longer history, and
+  `coverage_days` can no longer be negative. Rows whose text columns hold a non-string
+  (SQLite TEXT is not strict) are skipped and reported via `_meta.archive_error` instead
+  of raising. Same-second snapshots are read in insertion order, so an "empty then
+  breakout" pair written in one second no longer splits an episode.
+- `recurring_topics` skips items without enough breakout observations before touching
+  snapshot headers (a 50k-row archive with no breakouts: 11 s → 0.2 s).
+- `aeo_opportunities` no longer advises re-running with a `mid`: News, Wikipedia and
+  Autocomplete take search text, not a Google entity id. Its `clarify` asks for a more
+  specific phrase instead; `discover_topics` keeps the `mid` hint (Trends-only).
+- (review round 2) `aeo_opportunities` crashed with an opaque `AttributeError` when the
+  first exact-title entity Google returned had a `null` type (a legal payload: the
+  ambiguity rule only needs two named types somewhere in the list). The `clarify` example
+  now uses the first *named* type and is omitted when there is none.
+- (review round 2) `compare_keywords` called a leader whose recent interest is **zero**
+  (`direction_now: no_interest` — big early in the window, dead now) "highest interest
+  and not falling" and recommended it for the title/H1. `no_interest` now ranks below
+  `falling`: a rising challenger beats a dead leader, the leader's implication says its
+  mean comes from earlier in the window, non-leaders with `no_interest` are `declining`
+  (not `niche`), and `seo_interpretation` says "no recent interest". When every term's
+  mean is below 5 (`WINNER_NOISE_FLOOR`, same floor as `compare_channels`) `winner.reason`
+  is qualified as weak evidence instead of asserted.
+- (review round 2) Docs: SKILL/README request budgets include the ambiguity lookup
+  (`discover_topics` 1 + N plus one cached lookup per new seed; `aeo_opportunities`
+  1 + 11 per seed); `recurring_topics` / `trend_history` guidance states that two
+  breakouts are only separable when a poll between them saw the topic *not* breaking out
+  (sparse polling undercounts); SKILL.md gains `ambiguous`, `winner` and `recurring_topics`
+  steps; `server.json` / README archive consumer lists include `recurring_topics`.
+- (review round 3) The ambiguity lookup runs in the server language (`TRENDZEIST_HL`),
+  not the geo's, so a non-English seed was silently "not ambiguous". Seed reports now
+  carry `ambiguity_note` when the check found nothing for a geo whose language differs
+  from the server's, and when it was skipped because the call was rate limited (a seed
+  served from cache during cooling previously lost its `ambiguous` field without a
+  trace). Documented in README / SKILL.
+- (review round 3) `compare_keywords`: every keyword unavailable now yields a
+  `winner_reason` (was the only null-winner case without one); one keyword with data
+  plus unavailable others is labelled "the only term with data (N unavailable), not a
+  comparison" in `winner.reason` and `seo_interpretation`.
+- (review round 3) `weekly_review` prompt step 6 calls `recurring_topics` first and
+  step 5 tells the model to stop and ask on an `ambiguous` seed; `compare_keywords`
+  description mentions the dead-leader rule and `winner_reason`.
+
 ## [0.5.0] - 2026-10-11
 
 "Knows *when* and *what's worth it*": what changed since last week, seasonal publish-by

@@ -261,7 +261,8 @@ def test_mine_questions_expands_dedupes_and_tags():
     assert out["errors"] == [] and "partial" not in out
     # Budget is spread across prefixes (max 3 each) and stops once the limit is met.
     assert out["prefixes_queried"] == ["(seed)", "how to", "how do"]
-    assert [q["prefix"] for q in out["questions"]] == [None, None, "how to", "how to", "how do", "how do"]
+    # Ranked by realness: the "how do" questions carry a verb, the "how to" ones do not.
+    assert [q["prefix"] for q in out["questions"]] == [None, None, "how do", "how do", "how to", "how to"]
     assert "hl=pt-BR" in out["language_note"]
     assert "language_note" not in tools.mine_questions(FakeClient(), "espresso", geo="US", limit=3)
 
@@ -408,7 +409,7 @@ def test_discover_topics_keeps_suspect_breakouts_out_of_ranking():
     }
     assert score == sum(p["points"] for p in breakdown.values())
     assert breakdown["momentum"]["points"] == 18 and "breakout" in breakdown["momentum"]["reason"]
-    assert out["counts"] == {"breakout": 1, "rising": 1, "evergreen": 2, "questions": 1, "suspect": 4}
+    assert out["counts"] == {"breakout": 1, "rising": 1, "evergreen": 2, "questions": 1, "suspect": 4, "off_topic": 0}
     assert [s["topic"] for s in out["suspect"]][:1] == ["codex vs claude code abraham quiros villalba"]
     assert out["suspect"][0]["is_breakout"] is True and "abraham quiros villalba" in out["suspect"][0]["reason"]
     assert out["seeds"][0]["suspect_count"] == 4 and out["seeds"][0]["rising_count"] == 2
@@ -460,7 +461,7 @@ def test_discover_topics_ranking_is_seed_order_independent():
 
         def related_queries(self, kw, tf, geo, cat, gprop):
             return {
-                "top": None,
+                "top": pd.DataFrame({"query": ["topic"], "value": [50]}),
                 "rising": pd.DataFrame({"query": ["shared topic"], "value": [self.growth[kw]]}),
             }
 
@@ -577,6 +578,7 @@ def test_server_registers_tools_and_prompt(monkeypatch):
         "wiki_attention",
         "what_changed",
         "trend_history",
+        "recurring_topics",
         "seasonality",
         "compare_channels",
         "trendzeist_status",
