@@ -61,7 +61,7 @@ docker run -i --rm ghcr.io/phalkmin/trendzeist-mcp
 | Tool | What you get |
 |---|---|
 | `discover_topics` | Ranked blog topics from 1-5 seeds: breakout > rising > evergreen, deduped, each with a title `angle` and an explainable `score`; plus `questions[]` people ask, `suspect[]` spam-like rising queries and `filtered_out[]` rising queries unrelated to the seeds, both kept out of the ranking. Pass `site_queries` (what your site already ranks for) to mark each topic `covered / partial / gap`; seeds that name several entities get `ambiguous` + `clarify` (ask before writing) |
-| `mine_questions` | Long-tail questions about a seed from Google Autocomplete (`how to`, `why`, `what is`, `vs` …), deduped, angle-tagged and ranked by a realness `score`; bare prefix + seed padding goes to `filtered_out[]` — FAQ / AEO fuel |
+| `mine_questions` | Long-tail questions about a seed from Google Autocomplete (`how to`, `why`, `what is`, `vs` …, localised for pt / es / fr / de / it / pl / nl when `geo` or `TRENDZEIST_HL` says so — `prefix_language` tells which), deduped, angle-tagged and ranked by a realness `score`; bare prefix + seed padding goes to `filtered_out[]` — FAQ / AEO fuel |
 | `aeo_opportunities` | Question clusters per seed × angle, scored with the seed's recent trend (`direction_now`, `growth_3m` over 12 months), Google News coverage (publishers to quote / pitch), Wikipedia presence, your site's coverage (`site_queries`) and citability hints — one call, partial failures per source; seeds that name several entities get `ambiguous` + `clarify` (ask before writing) |
 | `what_changed` | What moved since your last snapshot (1-90 days): new and promoted breakouts (*investigate now*), new rising (*consider*), cooled / dropped queries (*refresh existing post*, or *review* — verify with `interest_over_time` before retiring), rank moves and a `direction_now` flip — from the local observation archive. First run: `first_seen[]` (current state, *no history yet*); no snapshot old enough: compares with the oldest and says its real age |
 | `seasonality` | When demand peaks each year (5-year weekly data): `peak_months`, `seasonal_strength`, `next_peak`, `publish_by` (6 weeks before), one-sentence `insight` |
@@ -112,11 +112,15 @@ plan for a date / refresh / retire). A ready-made agent skill lives in [`SKILL.m
   `coverage_counts`), so `exclude_covered` can never hide an unanswered question. Tokens
   are compared after plural folding and a small tech synonym map (mac/macos,
   wp/wordpress, js/javascript …), so "claude code mac" is covered by a site query
-  "claude code macos"; `matched` names the site query behind each verdict. Feeding the raw
-  Search Console variants still helps.
-- `angle` is one of `how-to | comparison | listicle | definition | news` (or `null`) —
-  the title format the query suggests. Pair it with evidence: how-to → steps + numbers,
-  comparison → table + quotes, definition → cite a primary source, news → dated publisher quotes.
+  "claude code macos"; `matched` names the site query behind each verdict. Prefixes only
+  match on 6-letter stems ("code" is not "codex"), and a one-word head term inside a
+  longer site query ("claude" in "claude code macos") is `partial`, not covered. Feeding
+  the raw Search Console variants still helps.
+- `angle` is one of `how-to | comparison | listicle | definition | verdict | news` (or
+  `null`) — the title format the query suggests. Pair it with evidence: how-to → steps +
+  numbers, comparison → table + quotes, definition → cite a primary source, verdict
+  (yes/no questions: "is it worth it", "does it work") → the verdict first, the deciding
+  evidence, then caveats, news → dated publisher quotes.
 - Anything silently adjusted is reported: clamped limits add a `note`, empty results add a
   `reason`.
 - **Two trend labels.** `direction` compares the first and last third of the window
@@ -132,22 +136,25 @@ plan for a date / refresh / retire). A ready-made agent skill lives in [`SKILL.m
   `suspect_reason` (a flagged `.com` also flags the queries carrying its name as words);
   `discover_topics` moves them to `suspect[]`; `aeo_opportunities` ignores them. Google's
   `is_breakout` value is kept, only the trust changes.
-- **Off-topic rising queries.** For niche seeds a handful of searches is a huge % rise, so
-  Google's rising list can lead with things like "how to bake a cake" under an AI-tool seed
-  (prompts pasted into the search box). A rising query with no word in common with the
-  seed, the other seeds of the call or the seed's top queries is `off_topic: true`;
-  `discover_topics` moves it to `filtered_out[]` (with reason, growth and breakout flag)
-  and out of `topics`, `questions` and the score, and from two such items a `note`
-  suggests `category=` (5 = Computers & Electronics). A real neighbour that shares no word
-  with the seed ("moka pot" under "espresso") lands there too, so scan `filtered_out`
-  before dismissing it.
-- **Level shifts are flagged.** A sustained step in a series (the 4-week mean changes by
-  ≥ 30 % and stays there) is reported as `level_shift` in the keyword's summary with its
-  `date`, `change_pct`, `post_shift_change_pct` (what happened after the step) and
-  `growth_affected`; `interest_over_time` / `compare_keywords` add `warnings[]` and mark
-  a step shared by several keywords in the same week `likely_artifact` (a Google sampling
-  change, not demand). Growth and direction figures whose windows span the step overstate
-  the change: read the curve on each side of it.
+- **Off-topic related queries.** Under niche seeds Google lists unrelated searches ("how
+  to bake a cake" under an AI-tool seed) as breakouts from a tiny base and at values 0-3
+  in the top list. A breakout, or a top query below 10, that shares no word with the
+  seed, the call's other seeds or the seed's on-topic top queries is `off_topic: true`
+  (exact words after plural folding; generic words like make, work, best, github don't
+  count). `discover_topics` moves them to `filtered_out[]` (`list`, reason, growth or
+  popularity) and out of `topics`, `questions` and the score, with a `note` suggesting
+  `category=` from two items; `aeo_opportunities` lists them in `off_topic_dropped`;
+  `related_queries` flags them and keeps them out of `questions`. Measured risers ("moka
+  pot" +300 %) are never flagged. They do not enter the archive, and `what_changed`
+  re-applies the rules to older snapshots (`baseline_filtered`).
+- **Level shifts are flagged.** A sustained step (4-week mean changes ≥ 30 % and stays)
+  appears in the summary as `level_shifts[]` (each with `date`, `change_pct`,
+  `post_shift_change_pct`, `growth_affected`, `shared`) and `level_shift` (the largest).
+  `interest_over_time` / `compare_keywords` add `warnings[]`: a step shared by two or
+  more keywords in one week is `likely_artifact` (a Google sampling change; on
+  2026-07-12 five unrelated series stepped down 30-50 % at once). A `flattened` warning
+  means joint normalisation squashed a small keyword: fetch it alone. Growth and
+  direction figures spanning a step overstate the change; read the curve on each side.
 - **"popularity unknown" in `score_breakdown.demand`** is normal for rising-only items:
   Google gives a growth % but no popularity for them, so demand gets the minimum points.
   A top item rising from a very low base deserves a look at its curve (`interest_over_time`)
@@ -206,6 +213,9 @@ Point a client at the clone with
 | `TRENDZEIST_MAX_SERIES_POINTS` | `60` | Downsample interest curves to at most this many points (positive integer) |
 | `TRENDZEIST_RETRIES` | `3` | Retry attempts on transient errors |
 | `TRENDZEIST_BACKOFF` | `1.5` | Exponential backoff factor |
+| `TRENDZEIST_JITTER` | `0.5` | Random extra spacing between requests, as a fraction of the lane interval (`0.5` → up to +50 %; never below the minimum) |
+| `TRENDZEIST_COOLDOWN` | `60` | Seconds a source refuses *uncached* requests after an HTTP 429 (fail fast with `retry_after`); a `Retry-After` header wins when the 429 is seen directly (RSS, Autocomplete, News, Trends cookie), capped at 600; `0` disables |
+| `TRENDZEIST_STALE_FALLBACK` | `1` | Serve an expired cache entry (kept 7 days past expiry) when a fetch is rate limited, flagged `stale {age_days}`; `0` disables |
 | `TRENDZEIST_PROXIES` | — | Comma-separated proxy URLs. Rotated per request for explore calls; **RSS, Autocomplete, News and Wikipedia always use the first one** |
 | `TRENDZEIST_CACHE_DIR` | OS user cache dir | Persistent JSON cache location (`0700`); `off` to disable (also disables the archive) |
 | `TRENDZEIST_ARCHIVE` | `1` | `0` disables the observation archive (`what_changed` / `trend_history` / `recurring_topics` then report a `reason`) |
@@ -230,8 +240,22 @@ Point a client at the clone with
 - Google rate-limits the first burst of a session hardest. Start with 1–2 seeds in
   `discover_topics` / `aeo_opportunities`; a 429 on the trend-context step no longer
   aborts the call (related queries are still fetched), and skip messages say when to retry.
-- Question prefixes in `mine_questions` are English; for native-language questions in a
-  non-English market, pass a seed already phrased in that language.
+- `mine_questions` prefixes follow the request language (`hl`, from `geo` unless
+  `TRENDZEIST_HL` pins it): tables exist for pt, es, fr, de, it, pl and nl, and
+  `prefix_language` names the one used (`aeo_opportunities` mines with the same set). For
+  other languages the English set is used and `language_note` says so; pass a seed
+  already phrased in the market's language.
+  The verb-based realness points are English-only, so abroad only the literal
+  prefix + seed echo is filtered as padding.
+- After an HTTP 429 a source cools down (`TRENDZEIST_COOLDOWN`, default 60 s, or Google's
+  `Retry-After`): uncached requests to it fail fast with a retryable error that says when
+  to retry, `trendzeist_status.sources[]` shows `cooling_down` / `retry_after_s`, and every
+  result carries `_meta.rate_limited[]` while any source is cooling. Other sources keep
+  working. If the cache holds an expired copy of the refused query (kept 7 days), it is
+  served and the result carries a top-level `stale {age_days, note}`
+  (`TRENDZEIST_STALE_FALLBACK=0` turns that off). `interest_over_time` / `compare_keywords`
+  are one request for all keywords, so a 429 there has no per-keyword partial result;
+  `discover_topics` / `aeo_opportunities` report per-seed errors and `skipped`.
 - `related_topics` frequently returns nothing from Google; `related_queries` is reliable.
 - Google's legacy daily `trending_searches` endpoint is gone (404); `trending_now` uses the RSS feed.
 - `aeo_opportunities` is the most expensive call: worst case 1 + 11 requests per seed

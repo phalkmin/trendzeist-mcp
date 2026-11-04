@@ -261,8 +261,11 @@ def test_mapped_errors_drop_urls_tokens_and_stay_short():
         c._guarded(boom)
     text = str(exc.value)
     assert "token" not in text and "req=" not in text and len(text) < 250
-    assert text == "Google Trends request failed: HTTP 429 from trends.google.com after retries"
-    assert exc.value.retryable is True
+    # 0.6.1: a 429 behind urllib3's retries is a rate limit (and starts the cooldown).
+    assert text.startswith(
+        "Google Trends rate limit reached (HTTP 429 from trends.google.com after retries)."
+    )
+    assert exc.value.retryable is True and exc.value.retry_after == 60
     assert c.status()["last_error"] == text
 
 
@@ -494,7 +497,8 @@ def test_hub_shares_cache_and_stats_and_uses_one_google_lane():
 
 
 def test_source_get_maps_429_and_http_errors():
-    s = Source(Settings(min_interval=0), _TTLCache(None), Lane(0), CallStats())
+    # cooldown=0: the 429 must not make the following requests fail fast (0.6.1).
+    s = Source(Settings(min_interval=0, cooldown=0), _TTLCache(None), Lane(0), CallStats())
     with patch("requests.get", return_value=Mock(status_code=429, url="u", text="")):
         with pytest.raises(TrendsError, match="429"):
             s._guarded(lambda: s._get("https://x"))

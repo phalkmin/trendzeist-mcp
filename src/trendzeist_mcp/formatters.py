@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -21,7 +22,7 @@ SCALE_NOTE = "0-100 relative to the peak across all keywords in this query"
 # Title angles (roadmap N6). Order matters: the first matching rule wins, so the
 # more specific intents (comparison, definition, release questions) are checked
 # before the broad "how-to" catch-all; the generic news rule stays last.
-ANGLES: tuple[str, ...] = ("how-to", "comparison", "listicle", "definition", "news")
+ANGLES: tuple[str, ...] = ("how-to", "comparison", "listicle", "definition", "verdict", "news")
 _ANGLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         # "when X released / launched / comes out" is a date question, not a how-to.
@@ -48,10 +49,15 @@ _ANGLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        # Yes/no questions want a verdict, not steps; "can ..." asks about ability and stays how-to.
+        "verdict",
+        re.compile(r"^(is|are|was|were|does|do|did|should|will|would|could)\b", re.I),
+    ),
+    (
         "how-to",
         re.compile(
-            r"^(how\s+(to|do|does|can|long|much|many|often)|why|when|where|can|should|is|does|do"
-            r"|will|would|could)\b|\b(tutorial|guide|steps?|diy|recipe)\b",
+            r"^(how\s+(to|do|does|can|long|much|many|often)|why|when|where|can)\b"
+            r"|\b(tutorial|guide|steps?|diy|recipe)\b",
             re.I,
         ),
     ),
@@ -101,6 +107,13 @@ def is_question(text: str | None) -> bool:
 def normalise_query(text: str) -> str:
     """Canonical form for de-duplication: lowercase, no punctuation, single spaces."""
     return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
+
+def strip_accents(text: str) -> str:
+    """Drop diacritics ("cómo" -> "como"): Google Autocomplete answers an accented
+    prefix with unaccented completions as often as not, and users type both."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def extract_questions(
@@ -286,64 +299,151 @@ def _growth_note(growth: dict[str, float | None]) -> str | None:
     return GROWTH_NOTE if any(val is None for val in growth.values()) else None
 
 
-# Level shift (issue 4, 2026-11-03). On 2026-07-12 five unrelated 12-month series
-# stepped down 30-50 % in the same week and never came back while Search Console
-# showed no change: a Google sampling / normalisation change, not demand. Any growth
-# or direction figure whose windows straddle such a week mixes the artifact with the
-# real change, so the formatter detects sustained steps and says so.
+# Level shifts: a sustained step that growth windows spanning it would report as demand
+# (2026-07-12: five unrelated series stepped down 30-50 % at once, a Google sampling change).
 LEVEL_SHIFT_WINDOW = 4  # points on each side of the step
 LEVEL_SHIFT_MIN_CHANGE = 0.30  # relative change between the two window means
 LEVEL_SHIFT_HOLD = 0.15  # every later window must stay this far on the new side
+LEVEL_SHIFT_LOOKBACK = 12  # a level held this recently is a season/spike ending, not a shift
+LEVEL_SHIFT_MIN_MEAN = 2.0  # below this the series is flattened by joint normalisation
+FLATTENED_BY_MEAN = 30.0  # ... when another series in the call is above this
 
 
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values)
 
 
-def detect_level_shift(series: pd.Series) -> dict[str, Any] | None:
-    """Largest sustained step in a series, or ``None``.
+def _window_means(vals: list[float], w: int) -> list[float]:
+    """``means[j]`` = mean of ``vals[j:j+w]``."""
+    return [_mean(vals[j : j + w]) for j in range(len(vals) - w + 1)]
 
-    A step at point ``i`` needs: the 4-point mean after it differs from the 4-point
-    mean before it by >= 30 %; every later 4-point mean stays >= 15 % on the new
-    side (a spike or a season that reverts is not a shift); the level before the
-    step was itself steady (not the tail of a ramp or a spike); and the new level
-    is new (returning to an earlier level is a season ending, not a shift).
+
+def _step_shape_ok(vals: list[float], windows: list[float], i: int, w: int) -> tuple[float, float, float] | None:
+    """``(change, before, after)`` when the window means around ``i`` differ by >= 30 %,
+    the before window is steadier than the step and the new level was not held within
+    LEVEL_SHIFT_LOOKBACK points; else ``None``. Shared by both detectors."""
+    before, after = windows[i - w], windows[i]
+    if before <= 0:
+        return None
+    change = (after - before) / before
+    if abs(change) < LEVEL_SHIFT_MIN_CHANGE:
+        return None
+    if max(vals[i - w : i]) - min(vals[i - w : i]) > abs(after - before):
+        return None
+    for j in range(max(0, i - w - LEVEL_SHIFT_LOOKBACK), i - w):
+        if abs(windows[j] - after) / before < LEVEL_SHIFT_HOLD:
+            return None
+    return change, before, after
+
+
+def _locate_step(vals: list[float], i: int, w: int, sign: float) -> int:
+    """The week with the largest single change in the step's direction around ``i``."""
+    lo, hi = max(1, i - w + 1), min(len(vals) - 1, i + w - 1)
+    return max(range(lo, hi + 1), key=lambda k: sign * (vals[k] - vals[k - 1]))
+
+
+def _shift_record(series: pd.Series, vals: list[float], k: int, w: int) -> dict[str, Any]:
+    before = _mean(vals[max(0, k - w) : k])
+    after = _mean(vals[k : k + w])
+    post = vals[k:]
+    date = series.index[k]
+    return {
+        "date": _to_native(date) if isinstance(date, pd.Timestamp) else str(date),
+        "change_pct": round(100.0 * (after - before) / before, 1) if before > 0 else None,
+        "before_mean": round(before, 1),
+        "after_mean": round(after, 1),
+        "post_shift_change_pct": _pct_change(_mean(post[:w]), _mean(post[-w:])) if len(post) >= 2 * w else None,
+        "shared": False,
+        "_index": k,
+    }
+
+
+def _collapse_steps(series: pd.Series, vals: list[float], located: dict[int, float], w: int) -> list[dict[str, Any]]:
+    """``{week index: change}`` -> one record per step, steps closer than ``w`` merged
+    into the larger one, oldest first."""
+    kept: list[tuple[int, float]] = []
+    for k, change in sorted(located.items(), key=lambda kv: -abs(kv[1])):
+        if all(abs(k - other) >= w for other, _ in kept):
+            kept.append((k, change))
+    return [_shift_record(series, vals, k, w) for k, _ in sorted(kept)]
+
+
+def detect_level_shifts(series: pd.Series) -> list[dict[str, Any]]:
+    """Every sustained step in a series, oldest first.
+
+    Beyond :func:`_step_shape_ok`: every later window stays >= 15 % on the new side
+    and the level before was steady for 8 points (not a ramp). Steps are dated at
+    the largest single change in their window, so neighbouring candidates collapse.
     """
     vals = [float(x) for x in series.tolist()]
     n, w = len(vals), LEVEL_SHIFT_WINDOW
     if n < 2 * w:
-        return None
-    windows = [_mean(vals[j : j + w]) for j in range(n - w + 1)]  # windows[j] = mean of vals[j:j+w]
-    best: tuple[int, float, float, float] | None = None
+        return []
+    windows = _window_means(vals, w)
+    located: dict[int, float] = {}
     for i in range(w, n - w + 1):
-        before, after = windows[i - w], windows[i]
-        if before <= 0:
+        shape = _step_shape_ok(vals, windows, i, w)
+        if shape is None:
             continue
-        change = (after - before) / before
-        if abs(change) < LEVEL_SHIFT_MIN_CHANGE:
-            continue
+        change, before, _after = shape
         sign = 1.0 if change > 0 else -1.0
         if any(sign * (windows[j] - before) / before < LEVEL_SHIFT_HOLD for j in range(i + 1, n - w + 1)):
             continue  # reverted (or faded) later: not a sustained shift
-        if i >= 2 * w and windows[i - 2 * w] > 0 and abs(before - windows[i - 2 * w]) / windows[i - 2 * w] >= LEVEL_SHIFT_MIN_CHANGE:
+        prior = windows[i - 2 * w] if i >= 2 * w else before
+        if prior > 0 and abs(before - prior) / prior >= LEVEL_SHIFT_MIN_CHANGE:
             continue  # the "before" level is itself a jump (ramp or spike)
-        if any(abs(windows[j] - after) / before < LEVEL_SHIFT_HOLD for j in range(0, i - w)):
-            continue  # the series was already at this level earlier: a return, not a shift
-        if best is None or abs(change) > abs(best[1]):
-            best = (i, change, before, after)
-    if best is None:
+        k = _locate_step(vals, i, w, sign)
+        if abs(change) > abs(located.get(k, 0.0)):
+            located[k] = change
+    return _collapse_steps(series, vals, located, w)
+
+
+def detect_level_shift(series: pd.Series) -> dict[str, Any] | None:
+    """The largest sustained step of :func:`detect_level_shifts`, or ``None``."""
+    steps = detect_level_shifts(series)
+    if not steps:
         return None
-    i, change, before, after = best
-    post = vals[i:]
-    date = series.index[i]
-    return {
-        "date": _to_native(date) if isinstance(date, pd.Timestamp) else str(date),
-        "change_pct": round(100.0 * change, 1),
-        "before_mean": round(before, 1),
-        "after_mean": round(after, 1),
-        # What happened after the step: did the slide continue, or did it hold?
-        "post_shift_change_pct": _pct_change(_mean(post[:w]), _mean(post[-w:])) if len(post) >= 2 * w else None,
-    }
+    best = max(steps, key=lambda s: abs(s["change_pct"] or 0))
+    return {k: v for k, v in best.items() if k != "_index"}
+
+
+def shared_level_shifts(series_by_kw: dict[str, pd.Series]) -> list[dict[str, Any]]:
+    """Weeks where two or more series step the same way: ``[{index, direction, keywords}]``.
+
+    Looser than the per-series test on purpose (a shared step is evidence by itself):
+    a >= 30 % week-over-week change, :func:`_step_shape_ok`, and the next four points
+    on the new side. The rest of the series need not hold.
+    """
+    w = LEVEL_SHIFT_WINDOW
+    prepared: dict[str, tuple[list[float], list[float]]] = {}
+    for kw, series in series_by_kw.items():
+        vals = [float(x) for x in series.tolist()]
+        if len(vals) >= 2 * w:
+            prepared[kw] = (vals, _window_means(vals, w))
+    if len(prepared) < 2:
+        return []
+    n = min(len(vals) for vals, _ in prepared.values())
+    found: dict[tuple[int, str], list[str]] = {}
+    for k in range(w, n - w + 1):
+        for kw, (vals, windows) in prepared.items():
+            prev = vals[k - 1]
+            if prev <= 0 or abs(vals[k] - prev) / prev < LEVEL_SHIFT_MIN_CHANGE:
+                continue
+            shape = _step_shape_ok(vals, windows, k, w)
+            if shape is None:
+                continue
+            change, before, _after = shape
+            sign = 1.0 if change > 0 else -1.0
+            if sign * (vals[k] - prev) < 0:
+                continue
+            if any(sign * (v - before) / before < LEVEL_SHIFT_HOLD for v in vals[k : k + w]):
+                continue  # one of the next four points came back: a spike, not a step
+            found.setdefault((k, "up" if sign > 0 else "down"), []).append(kw)
+    return [
+        {"index": k, "direction": direction, "keywords": kws}
+        for (k, direction), kws in sorted(found.items())
+        if len(kws) >= 2
+    ]
 
 
 def _shift_affects_growth(series: pd.Series, shift_date: Any) -> bool:
@@ -354,41 +454,75 @@ def _shift_affects_growth(series: pd.Series, shift_date: Any) -> bool:
     return bool(pd.Timestamp(shift_date) > series.index.max() - span)
 
 
-def level_shift_warnings(shifts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """One warning per (week, direction) across the keywords of a call.
+def _index_step_days(index: Any) -> float:
+    """Median spacing of a time index in days (0 for a non-time index)."""
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
+        return 0.0
+    step = pd.Series(index).diff().dropna().median()
+    return float(step / pd.Timedelta(days=1))
 
-    Two or more series stepping the same way in the same week is the signature of
-    a source-wide sampling change (``likely_artifact``).
-    """
-    groups: dict[tuple[Any, str], list[str]] = {}
-    for kw, shift in shifts.items():
-        direction = "down" if shift["change_pct"] < 0 else "up"
-        groups.setdefault((shift["date"], direction), []).append(kw)
+
+def level_shift_warnings(
+    shifts: dict[str, list[dict[str, Any]]], tolerance_days: float = 0.0
+) -> list[dict[str, Any]]:
+    """One warning per step week and direction. Same-direction steps at most
+    ``tolerance_days`` apart group into one warning dated at the most common week;
+    two or more keywords in a group means ``likely_artifact``."""
+    entries: list[tuple[Any, str, str, float]] = []  # (timestamp, date, kw, change)
+    for kw, steps in shifts.items():
+        for s in steps:
+            if s.get("change_pct") is None:
+                continue
+            try:
+                ts = pd.Timestamp(s["date"])
+            except (TypeError, ValueError):
+                ts = None
+            entries.append((ts, s["date"], kw, float(s["change_pct"])))
     out: list[dict[str, Any]] = []
-    for (date, direction), kws in groups.items():
-        change = round(_mean([shifts[kw]["change_pct"] for kw in kws]), 1)
-        shared = len(kws) >= 2
-        if shared:
-            head = (
-                f"{len(kws)} series stepped {direction} together in the week of {date} "
-                f"({', '.join(kws)}) and stayed there; a shared step is usually a change in "
-                "Google's sampling, not in demand."
+    for direction in ("down", "up"):
+        mine = [e for e in entries if (e[3] < 0) == (direction == "down")]
+        mine.sort(key=lambda e: (e[0] is None, e[0] or 0, e[1]))
+        clusters: list[list[tuple[Any, str, str, float]]] = []
+        for e in mine:
+            last = clusters[-1][-1] if clusters else None
+            close = (
+                last is not None
+                and e[0] is not None
+                and last[0] is not None
+                and (e[0] - last[0]) <= pd.Timedelta(days=tolerance_days)
             )
-        else:
-            head = f"'{kws[0]}' stepped {direction} {abs(change):g}% in the week of {date} and stayed there."
-        out.append(
-            {
-                "type": "level_shift",
-                "date": date,
-                "direction": direction,
-                "change_pct": change,
-                "shared_by": kws,
-                "likely_artifact": shared,
-                "message": head
-                + " growth_3m, direction and direction_now figures whose windows span that "
-                "week overstate the change; read the curve on each side of it.",
-            }
-        )
+            if close or (last is not None and e[0] is None and last[1] == e[1]):
+                clusters[-1].append(e)
+            else:
+                clusters.append([e])
+        for cluster in clusters:
+            dates = Counter(e[1] for e in cluster)
+            week = min(dates, key=lambda d: (-dates[d], d))
+            kws = list(dict.fromkeys(e[2] for e in cluster))
+            change = round(_mean([e[3] for e in cluster]), 1)
+            shared = len(kws) >= 2
+            if shared:
+                head = (
+                    f"{len(kws)} series stepped {direction} together in the week of {week} "
+                    f"({', '.join(kws)}) and stayed there; a shared step is usually a change in "
+                    "Google's sampling, not in demand (or a season they all share)."
+                )
+            else:
+                head = f"'{kws[0]}' stepped {direction} {abs(change):g}% in the week of {week} and stayed there."
+            out.append(
+                {
+                    "type": "level_shift",
+                    "date": week,
+                    "direction": direction,
+                    "change_pct": change,
+                    "shared_by": kws,
+                    "likely_artifact": shared,
+                    "message": head
+                    + " growth_3m, direction and direction_now figures whose windows span that "
+                    "week overstate the change; read the curve on each side of it.",
+                }
+            )
+    out.sort(key=lambda w_: (str(w_["date"]), w_["direction"]))
     return out
 
 
@@ -457,7 +591,8 @@ def interest_over_time(
         complete = df.drop(columns=["isPartial"])
 
     summary: dict[str, Any] = {}
-    shifts: dict[str, dict[str, Any]] = {}
+    shifts: dict[str, list[dict[str, Any]]] = {}
+    shift_series: dict[str, pd.Series] = {}
     for kw in kws:
         if kw not in complete.columns:
             summary[kw] = {"available": False}
@@ -487,17 +622,55 @@ def interest_over_time(
         growth_note = _growth_note(growth)
         if growth_note:
             summary[kw]["growth_note"] = growth_note
-        shift = detect_level_shift(stats_series)
-        if shift:
-            shift["growth_affected"] = _shift_affects_growth(stats_series, shift["date"])
-            verb = "down" if shift["change_pct"] < 0 else "up"
-            shift["warning"] = (
-                f"Interest stepped {verb} {abs(shift['change_pct']):g}% in the week of "
-                f"{shift['date']} and stayed there"
-                + ("; growth_3m spans that step and overstates the change." if shift["growth_affected"] else ".")
+        if summary[kw]["mean"] >= LEVEL_SHIFT_MIN_MEAN:
+            shift_series[kw] = stats_series
+            shifts[kw] = detect_level_shifts(stats_series)
+
+    # A shared step is reported for every series, whatever the per-series rules said.
+    w = LEVEL_SHIFT_WINDOW
+    for shared in shared_level_shifts(shift_series):
+        for kw in shared["keywords"]:
+            vals = [float(x) for x in shift_series[kw].tolist()]
+            hit = next((s for s in shifts[kw] if abs(s["_index"] - shared["index"]) <= 1), None)
+            if hit is None:
+                hit = _shift_record(shift_series[kw], vals, shared["index"], w)
+                shifts[kw].append(hit)
+                shifts[kw].sort(key=lambda s: s["_index"])
+            hit["shared"] = True
+    for kw, steps in shifts.items():
+        if not steps:
+            continue
+        for step in steps:
+            step.pop("_index", None)
+            step["growth_affected"] = _shift_affects_growth(shift_series[kw], step["date"])
+            verb = "down" if (step["change_pct"] or 0) < 0 else "up"
+            step["warning"] = (
+                f"Interest stepped {verb} {abs(step['change_pct'] or 0):g}% in the week of "
+                f"{step['date']} and stayed there"
+                + ("; growth_3m spans that step and overstates the change." if step["growth_affected"] else ".")
+                + (" Other series in this call stepped the same week: likely a Google sampling change." if step["shared"] else "")
             )
-            summary[kw]["level_shift"] = shift
-            shifts[kw] = shift
+        summary[kw]["level_shifts"] = steps
+        summary[kw]["level_shift"] = max(steps, key=lambda s: abs(s["change_pct"] or 0))
+
+    warnings = level_shift_warnings(shifts, tolerance_days=_index_step_days(complete.index))
+    means = {kw: s["mean"] for kw, s in summary.items() if s.get("available")}
+    if means and max(means.values()) > FLATTENED_BY_MEAN:
+        flattened = [kw for kw, m in means.items() if m < LEVEL_SHIFT_MIN_MEAN]
+        if flattened:
+            big = max(means, key=means.get)  # type: ignore[arg-type]
+            warnings.append(
+                {
+                    "type": "flattened",
+                    "shared_by": flattened,
+                    "message": (
+                        f"Joint normalisation flattened {', '.join(flattened)} (mean below "
+                        f"{LEVEL_SHIFT_MIN_MEAN:g} while '{big}' is above {FLATTENED_BY_MEAN:g}): "
+                        "its curve, direction and any level shift cannot be read here. Fetch it "
+                        "in a separate call, or compare keywords of similar size."
+                    ),
+                }
+            )
 
     sampled = _downsample(complete, max_points)
     points: list[dict[str, Any]] = []
@@ -515,7 +688,7 @@ def interest_over_time(
         "original_points": int(len(complete)),
         "downsampled": len(sampled) != len(complete),
         "scale": SCALE_NOTE,
-        "warnings": level_shift_warnings(shifts),
+        "warnings": warnings,
     }
 
 
@@ -548,10 +721,8 @@ def mark_breakouts(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return items
 
 
-# Suspect rising queries (run-data 10.2). Search-manipulation campaigns attach one
-# name / brand to many unrelated queries so each shows up as a "Breakout" under
-# popular seeds. Google's number is kept (is_breakout), but composites keep these
-# out of the breakout bucket, the question lists and the score.
+# Suspect rising queries: manipulation campaigns attach one name to many unrelated
+# queries so each is a "Breakout". Google's number is kept; composites exclude them.
 _SUSPECT_MIN_ITEMS = 3
 _SUSPECT_MAX_OVERLAP = 0.34  # residual token Jaccard above this = genuinely related items
 _DOMAIN_RE = re.compile(r"(^|\s)([\w-]+)\s?\.\s?(com|net|org|io|co|app|ai|dev|xyz|info)(\s|$)")
@@ -628,10 +799,8 @@ def flag_suspects(
             domains.append((i, match.group(2).replace("-", "")))
             if i not in reasons:
                 reasons[i] = "domain-like rising query (looks like a site promoting itself)"
-    # The same campaign usually appends the domain's name, as separate words, to
-    # unrelated queries ("abrahamquirosvillalba .com" -> "... abraham quiros villalba").
-    # Any 2+ token run that concatenates to the label marks the query as a carrier;
-    # a single token is a brand word, not a name, and is left alone.
+    # The campaign appends the domain label as words ("abrahamquirosvillalba .com" ->
+    # "... abraham quiros villalba"); a 2+ token run is a name, a single token a brand word.
     for di, label in domains:
         for i, toks in enumerate(tokens_by_idx):
             if i == di or i in reasons:
@@ -659,24 +828,21 @@ def _token_run_for(tokens: list[str], label: str) -> str | None:
     return None
 
 
-# Off-topic rising queries (issue 1, 2026-11-03). Google's rising list for a seed
-# sometimes carries searches that share nothing with it (for AI-tool seeds: prompts
-# people paste into the search box, "how to bake a cake"). They rank first because
-# a handful of searches is a huge % rise from a tiny base. Composites keep them out of
-# topics, questions and the score and list them in ``filtered_out``.
-_OFF_TOPIC_MIN_PREFIX = 4
+# Off-topic queries: unrelated searches listed as breakouts from a tiny base ("how to
+# bake a cake" under an AI-tool seed) or at the bottom of the top list. Generic words
+# carry no relevance ("make" must not vouch for "how to make sushi"); seed words always do.
+_GENERIC_WORDS = frozenset(
+    "make work works working best free near download github login app apps online web "
+    "website page pdf video youtube reddit review reviews price cost cheap buy sale deal "
+    "guide tutorial example examples list ideas tips meaning".split()
+)
+OFF_TOPIC_TOP_MIN_VALUE = 10  # top junk sits at 0-3, real top queries at 15+
 
 
-def _tokens_match(a: str, b: str) -> bool:
-    """Same word, or one is a 4+ letter prefix of the other (claude/claudes, mac/macos)."""
-    if a == b:
-        return True
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    return len(short) >= _OFF_TOPIC_MIN_PREFIX and long_.startswith(short)
-
-
-def _related_to(tokens: set[str], vocabulary: set[str]) -> bool:
-    return any(_tokens_match(t, w) for t in tokens for w in vocabulary)
+def _content_tokens(text: str) -> set[str]:
+    """Normalised, plural-folded words minus stopwords. Exact matches only: a shared
+    prefix ("work" / "workflow", "code" / "codex") is not a shared word."""
+    return {_fold_token(t) for t in normalise_query(text).split() if t not in _STOPWORDS}
 
 
 def flag_off_topic(
@@ -685,26 +851,40 @@ def flag_off_topic(
     seed: str,
     context: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
-    """Mark rising items with no word in common with the seed, its top queries or
-    ``context`` (other seeds in the call) as ``off_topic`` / ``off_topic_reason``.
+    """Mark junk in both related lists as ``off_topic`` / ``off_topic_reason``.
 
-    Suspect (spam) items are left to :func:`flag_suspects`.
+    Relevant = shares a word with the seed, ``context`` (other seeds) or an on-topic
+    top query (one that shares a seed word or has value >= OFF_TOPIC_TOP_MIN_VALUE).
+    Flags low-value top queries in place and rising *breakouts* only: a measured
+    riser has a real base. Suspects are left to :func:`flag_suspects`.
     """
-    vocabulary = set(normalise_query(seed).split()) - _STOPWORDS
+    seed_vocab = _content_tokens(seed)
     for extra in context:
-        vocabulary |= set(normalise_query(extra).split()) - _STOPWORDS
+        seed_vocab |= _content_tokens(extra)
+    vocabulary = set(seed_vocab)
     for it in top:
-        vocabulary |= set(normalise_query(it.get("name") or "").split()) - _STOPWORDS
-    for it in rising:
-        if it.get("suspect"):
-            continue
-        tokens = set(normalise_query(it.get("name") or "").split()) - _STOPWORDS
-        if tokens and _related_to(tokens, vocabulary):
+        tokens = _content_tokens(it.get("name") or "")
+        value = float(it.get("value") or 0)
+        if tokens & seed_vocab or value >= OFF_TOPIC_TOP_MIN_VALUE:
+            vocabulary |= tokens - _GENERIC_WORDS
+    for it in top:
+        value = float(it.get("value") or 0)
+        if value >= OFF_TOPIC_TOP_MIN_VALUE or _content_tokens(it.get("name") or "") & vocabulary:
             continue
         it["off_topic"] = True
         it["off_topic_reason"] = (
-            f"no word in common with '{seed}' or its top related queries; likely an "
-            "unrelated search that rose from a tiny base"
+            f"no word in common with '{seed}' or its other top queries, and a top value of "
+            f"{value:g} (below {OFF_TOPIC_TOP_MIN_VALUE}): an unrelated search Google lists at the bottom"
+        )
+    for it in rising:
+        if it.get("suspect") or not it.get("is_breakout"):
+            continue
+        if _content_tokens(it.get("name") or "") & vocabulary:
+            continue
+        it["off_topic"] = True
+        it["off_topic_reason"] = (
+            f"no word in common with '{seed}' or its top related queries; a breakout from a "
+            "tiny base is usually an unrelated search"
         )
     return rising
 
@@ -712,7 +892,7 @@ def flag_off_topic(
 def split_off_topic(
     items: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """(on_topic, off_topic) partition of a flagged rising list."""
+    """(on_topic, off_topic) partition of a flagged related list (top or rising)."""
     return (
         [it for it in items if not it.get("off_topic")],
         [it for it in items if it.get("off_topic")],
@@ -913,6 +1093,15 @@ CITABILITY_HINTS: dict[str, dict[str, Any]] = {
         ],
         "structure": "what changed, when, who said so, what it means for the reader",
         "cite": "the original announcement plus two independent outlets, with dates",
+    },
+    "verdict": {
+        "evidence": [
+            "a one-line verdict with the deciding metric",
+            "the evidence that decides it: a test, a number or a dated first-hand report",
+            "the caveats: when the answer flips",
+        ],
+        "structure": "verdict first, then the deciding evidence, then caveats and alternatives",
+        "cite": "independent tests, official docs or specs, dated first-hand reports",
     },
 }
 
@@ -1139,18 +1328,28 @@ def _site_tokens(text: str) -> set[str]:
     return {_fold_token(t) for t in normalise_query(text).split()}
 
 
+SITE_PREFIX_MIN = 6  # "automat"/"automation" match, "code"/"codex" do not; short variants use the synonym map
+SITE_COVERED_MIN_SHARE = 0.6  # a one-word head term inside a longer site query is not covered
+
+
+def _site_tokens_match(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= SITE_PREFIX_MIN and long_.startswith(short)
+
+
 def _site_overlap(cand_tokens: set[str], site_tokens: set[str]) -> int:
-    """Candidate tokens with a match (equal, or 4+ letter prefix) in the site query."""
-    return sum(1 for t in cand_tokens if any(_tokens_match(t, s) for s in site_tokens))
+    """Candidate tokens with a match (equal, or a 6+ letter prefix) in the site query."""
+    return sum(1 for t in cand_tokens if any(_site_tokens_match(t, s) for s in site_tokens))
 
 
 def site_coverage(candidate: str, site_queries: list[str]) -> tuple[str, str | None]:
     """``(covered | partial | gap, matched_site_query)`` for one candidate topic.
 
-    Tokens are compared after lowercasing, punctuation stripping, plural folding and
-    a small synonym map (mac/macos, wp/wordpress...). covered: every candidate token
-    matches a token of one site query; partial: token Jaccard >= 0.6 with some site
-    query; gap: otherwise.
+    Tokens are normalised, plural-folded and synonym-mapped. covered: every candidate
+    token matches one site query and the candidate has 2+ words (or spans >= 60 % of
+    it); partial: a head term inside a longer query, or Jaccard >= 0.6; gap: the rest.
     """
     cand = normalise_query(candidate)
     if not cand or not site_queries:
@@ -1166,9 +1365,14 @@ def site_coverage(candidate: str, site_queries: list[str]) -> tuple[str, str | N
         toks = _site_tokens(norm)
         overlap = _site_overlap(cand_tokens, toks)
         if overlap == len(cand_tokens):
-            return "covered", sq
-        union = len(cand_tokens) + len(toks) - overlap
-        jac = overlap / union if union else 0.0
+            if len(cand_tokens) >= 2 or overlap / len(toks) >= SITE_COVERED_MIN_SHARE:
+                return "covered", sq
+            jac = 1.0  # head term inside a longer query: partial at most
+        else:
+            # Two candidate tokens can match one site token: cap so Jaccard stays <= 1.
+            inter = min(overlap, len(toks))
+            union = len(cand_tokens) + len(toks) - inter
+            jac = inter / union if union else 0.0
         if jac > best[0]:
             best = (jac, sq)
     if best[0] >= SITE_PARTIAL_JACCARD:

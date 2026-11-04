@@ -14,7 +14,9 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
+import random
 import re
 import tempfile
 import threading
@@ -47,6 +49,10 @@ MAX_MEMORY_ENTRIES = 256
 MAX_SERIES_POINTS = 60
 DISK_SWEEP_INTERVAL = 5 * 60
 HTTP_TIMEOUT = 10  # seconds, for plain ``requests`` calls made by sources
+# After a 429 a source refuses uncached work for ``Settings.cooldown`` (or ``Retry-After``,
+# capped); expired cache entries stay readable for STALE_GRACE as a flagged fallback.
+COOLDOWN_MAX = 10 * 60.0
+STALE_GRACE = 7 * 24 * 60 * 60
 _DF_TAG = "__dataframe__"
 _COOKIE_URL = "https://trends.google.com/?geo={geo}"
 
@@ -75,9 +81,21 @@ def hl_for_geo(geo: str, default: str = "en-US") -> str:
 class TrendsError(RuntimeError):
     """Raised for any upstream failure; message is safe to show the model."""
 
-    def __init__(self, message: str, *, retryable: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        rate_limited: bool = False,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.retryable = retryable
+        # True for an HTTP 429 (or a refusal during the cooldown it started).
+        self.rate_limited = rate_limited
+        # Seconds until the source accepts uncached requests again; None when no
+        # cooldown is in force (cooldown disabled, or not a rate limit).
+        self.retry_after = retry_after
 
 
 ERROR_TEXT_LIMIT = 200
@@ -110,6 +128,23 @@ def describe_exception(exc: BaseException) -> str:
     return text
 
 
+def _retry_after_header(response: Any) -> float | None:
+    """Seconds from a ``Retry-After`` header (delay form only); ``None`` when absent."""
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        return None  # HTTP-date form: rare from Google; fall back to the configured cooldown
+
+
 @dataclass
 class Settings:
     """Runtime settings, sourced from environment variables."""
@@ -132,6 +167,11 @@ class Settings:
     # Observation archive (0.5.0): TRENDZEIST_ARCHIVE=0 disables recording.
     archive_enabled: bool = True
     archive_days: int = 365
+    # Rate limiting: cooldown after a 429 (Retry-After wins), jitter on the lane interval,
+    # and whether a refused call may serve an expired cache entry as ``stale``.
+    cooldown: float = 60.0
+    jitter: float = 0.5
+    stale_fallback: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -167,6 +207,10 @@ class Settings:
             archive_enabled=env("TRENDZEIST_ARCHIVE", "1").strip().lower()
             not in {"0", "false", "no", "off"},
             archive_days=positive_int("TRENDZEIST_ARCHIVE_DAYS", 365),
+            cooldown=float(env("TRENDZEIST_COOLDOWN", "60")),
+            jitter=float(env("TRENDZEIST_JITTER", "0.5")),
+            stale_fallback=env("TRENDZEIST_STALE_FALLBACK", "1").strip().lower()
+            not in {"0", "false", "no", "off"},
         )
 
     def hl_for(self, geo: str) -> str:
@@ -207,7 +251,9 @@ class _TTLCache:
     """
 
     def __init__(self, cache_dir: Path | None = None, max_entries: int | None = None) -> None:
-        self._data: dict[str, tuple[float, Any]] = {}
+        # key -> (expires, stored, value). Expired entries linger for STALE_GRACE so a
+        # rate-limited call can serve them (``get_stale``); ``get`` never returns them.
+        self._data: dict[str, tuple[float, float, Any]] = {}
         self._lock = threading.Lock()
         self._dir = cache_dir
         self._max_entries = max_entries if max_entries is not None else MAX_MEMORY_ENTRIES
@@ -226,8 +272,8 @@ class _TTLCache:
         return self._dir / (hashlib.sha256(key.encode()).hexdigest() + ".json")
 
     def _evict_locked(self, now: float) -> None:
-        expired = [k for k, (exp, _) in self._data.items() if exp < now]
-        for k in expired:
+        dead = [k for k, (exp, _, _) in self._data.items() if exp + STALE_GRACE < now]
+        for k in dead:
             del self._data[k]
         while len(self._data) > self._max_entries:
             del self._data[next(iter(self._data))]
@@ -258,7 +304,7 @@ class _TTLCache:
             for p in self._dir.glob("*.json"):
                 try:
                     with p.open("r", encoding="utf-8") as fh:
-                        if float(json.load(fh)["expires"]) < now:
+                        if float(json.load(fh)["expires"]) + STALE_GRACE < now:
                             p.unlink(missing_ok=True)
                 except (OSError, ValueError, KeyError, TypeError):
                     p.unlink(missing_ok=True)
@@ -269,51 +315,76 @@ class _TTLCache:
         except OSError as exc:
             logger.debug("disk cache sweep failed: %s", exc)
 
-    def get(self, key: str) -> Any | None:
-        now = time.time()
+    def _lookup(self, key: str, now: float) -> tuple[float, float, Any] | None:
+        """Memory, then disk: ``(expires, stored, value)`` for any entry still kept
+        (fresh or within STALE_GRACE of expiry); ``None`` when absent or too old."""
         with self._lock:
             hit = self._data.get(key)
-            if hit is not None:
-                expires, value = hit
-                if expires >= now:
-                    return value
-                del self._data[key]
+            if hit is not None and hit[0] + STALE_GRACE < now:
+                del self._data[key]  # past the stale grace: gone, whoever asks
+                hit = None
+        if hit is not None and hit[0] >= now:
+            return hit
+        # Another process may have written a fresher disk copy: check before settling for stale.
         path = self._path(key)
         if path is None or not path.exists():
-            return None
+            return hit
         try:
             with path.open("r", encoding="utf-8") as fh:
                 envelope = json.load(fh)
             expires = float(envelope["expires"])
-            if expires < now:
+            if expires + STALE_GRACE < now:
                 path.unlink(missing_ok=True)
-                return None
+                return hit
+            if hit is not None and hit[0] >= expires:
+                return hit  # the disk copy is no newer than what memory already holds
+            # Pre-0.6.1 files carry no ``stored``; expiry is the closest known moment.
+            stored = float(envelope.get("stored", expires))
             value = _decode(envelope["value"])
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.debug("disk cache read failed for %s: %s", path, exc)
-            return None
+            return hit
         with self._lock:
-            self._data[key] = (expires, value)
+            self._data[key] = (expires, stored, value)
             self._evict_locked(now)
-        return value
+        return expires, stored, value
+
+    def get(self, key: str) -> Any | None:
+        now = time.time()
+        hit = self._lookup(key, now)
+        if hit is None or hit[0] < now:
+            return None
+        return hit[2]
+
+    def get_stale(self, key: str) -> tuple[Any, float] | None:
+        """``(value, age_seconds)`` for an entry whether or not it has expired.
+
+        For the rate-limit fallback: the last good answer beats no answer, as long as
+        the caller says how old it is. ``None`` when nothing is stored (or it is older
+        than STALE_GRACE).
+        """
+        now = time.time()
+        hit = self._lookup(key, now)
+        if hit is None:
+            return None
+        return hit[2], max(0.0, now - hit[1])
 
     def set(self, key: str, value: Any, ttl: float) -> None:
         now = time.time()
         expires = now + ttl
         with self._lock:
-            self._data[key] = (expires, value)
+            self._data[key] = (expires, now, value)
             self._evict_locked(now)
         path = self._path(key)
         if path is None:
             return
-        # Unique temp file per write: a shared ``.tmp`` name lets two writers
-        # (e.g. two server processes on the same cache dir) hold the same inode
-        # and corrupt the published file after the first ``os.replace``.
+        # Unique temp file per write: with a shared ``.tmp`` name two processes hold the
+        # same inode and corrupt the published file after the first ``os.replace``.
         tmp_name: str | None = None
         try:
             fd, tmp_name = tempfile.mkstemp(prefix=path.stem + ".", suffix=".tmp", dir=path.parent)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"expires": expires, "value": _encode(value)}, fh)
+                json.dump({"expires": expires, "stored": now, "value": _encode(value)}, fh)
             os.replace(tmp_name, path)
             tmp_name = None
         except (OSError, ValueError, TypeError) as exc:
@@ -351,17 +422,24 @@ class Lane:
     """One upstream host family (Google, Wikimedia): a lock that serialises its
     network requests plus the minimum spacing between them."""
 
-    def __init__(self, min_interval: float) -> None:
+    def __init__(self, min_interval: float, jitter: float = 0.0) -> None:
         self.min_interval = min_interval
+        # Random extra spacing as a fraction of ``min_interval``; never shortens the gap.
+        self.jitter = max(0.0, jitter)
         self.lock = threading.Lock()
         self._last_request = float("-inf")
 
+    def _spacing(self) -> float:
+        if not self.jitter:
+            return self.min_interval
+        return self.min_interval * (1.0 + random.random() * self.jitter)
+
     def wait(self) -> None:
-        """Sleep until ``min_interval`` has passed since the previous request.
+        """Sleep until the (jittered) ``min_interval`` has passed since the previous request.
 
         ``perf_counter``, not ``monotonic``: on Windows before Python 3.13 the
         latter ticks every ~15.6 ms, which lets the spacing fall short."""
-        wait = self.min_interval - (time.perf_counter() - self._last_request)
+        wait = self._spacing() - (time.perf_counter() - self._last_request)
         if wait > 0:
             time.sleep(wait)
         self._last_request = time.perf_counter()
@@ -381,9 +459,21 @@ class CallStats:
         self._local.requests = 0
         self._local.cache_hits = 0
         self._local.cache_misses = 0
+        self._local.stale_hits = 0
+        self._local.stale_age_s = 0.0
+        self._local.fresh = 0
 
     def count(self, attr: str) -> None:
         setattr(self._local, attr, getattr(self._local, attr, 0) + 1)
+
+    def fresh(self) -> int:
+        """Successful network fetches so far in this call: what the archive may record."""
+        return getattr(self._local, "fresh", 0)
+
+    def stale(self, age_s: float) -> None:
+        """Record an expired cache entry served because the upstream refused (0.6.1)."""
+        self.count("stale_hits")
+        self._local.stale_age_s = max(getattr(self._local, "stale_age_s", 0.0), age_s)
 
     def misses(self) -> int:
         """Cache misses so far in this call; lets tools record only fresh data."""
@@ -392,12 +482,17 @@ class CallStats:
     def meta(self) -> dict[str, Any]:
         hits = getattr(self._local, "cache_hits", 0)
         misses = getattr(self._local, "cache_misses", 0)
-        return {
+        meta: dict[str, Any] = {
             "requests_made": getattr(self._local, "requests", 0),
             "cache_hit": hits > 0 and misses == 0,
             "cache_hits": hits,
             "cache_misses": misses,
         }
+        stale = getattr(self._local, "stale_hits", 0)
+        if stale:
+            meta["stale_hits"] = stale
+            meta["stale_age_s"] = round(getattr(self._local, "stale_age_s", 0.0), 3)
+        return meta
 
 
 class Source:
@@ -422,6 +517,8 @@ class Source:
         self._last_error: str | None = None
         self._last_error_at: float | None = None
         self._last_ok: bool | None = None  # outcome order, not wall-clock order
+        # Wall-clock moment until which uncached requests are refused (after a 429).
+        self._cooldown_until: float = 0.0
 
     # ------------------------------------------------------------------ transport
     def _proxies(self) -> dict[str, str] | None:
@@ -467,14 +564,22 @@ class Source:
             else:
                 self._last_error, self._last_error_at = error, time.time()
 
+    def retry_after(self) -> float | None:
+        """Seconds left in the post-429 cooldown, or ``None`` when not cooling down."""
+        with self._health_lock:
+            left = self._cooldown_until - time.time()
+        return left if left > 0 else None
+
     def status(self) -> dict[str, Any]:
         """live = last network call succeeded; error = it failed; idle = none yet."""
         with self._health_lock:
             ok_at, err, err_at = self._last_success, self._last_error, self._last_error_at
             last_ok = self._last_ok
+            until = self._cooldown_until
         # Timestamps can tie (coarse Windows clocks), so the state comes from
         # the last recorded outcome rather than comparing them.
         state = "idle" if last_ok is None else "live" if last_ok else "error"
+        left = self.retry_after()
         return {
             "name": self.name,
             "label": self.label,
@@ -482,27 +587,62 @@ class Source:
             "last_success": _iso(ok_at),
             "last_error": err,
             "last_error_at": _iso(err_at),
+            "cooling_down": left is not None,
+            "retry_after_s": math.ceil(left) if left is not None else None,
+            "cooldown_until": _iso(until) if left is not None else None,
         }
 
     # ------------------------------------------------------------------ guard + cache
+    def _enter_cooldown(self, retry_after: float | None) -> tuple[float, str | None]:
+        """Start (or extend) the cooldown; returns ``(seconds, until_iso)``.
+
+        ``TRENDZEIST_COOLDOWN=0`` disables it (``(0, None)``) unless Google itself sent
+        a ``Retry-After``; a positive value is clamped to ``[1, COOLDOWN_MAX]``.
+        """
+        seconds = float(self.settings.cooldown) if retry_after is None else float(retry_after)
+        if seconds <= 0:
+            return 0.0, None
+        seconds = min(max(seconds, 1.0), COOLDOWN_MAX)
+        until = time.time() + seconds
+        with self._health_lock:
+            self._cooldown_until = max(self._cooldown_until, until)
+            until = self._cooldown_until
+        return seconds, _iso(until)
+
+    def _rate_limited(self, exc: BaseException, retry_after: float | None, detail: str = "") -> TrendsError:
+        seconds, until = self._enter_cooldown(retry_after)
+        what = detail or "HTTP 429"
+        if until is None:
+            advice = "Wait a minute before retrying; cached results remain available."
+        else:
+            advice = (
+                f"Cooling down for {math.ceil(seconds)} s (until {until}); uncached "
+                f"{self.label} requests fail fast until then, cached results remain available."
+            )
+        return TrendsError(
+            f"{self.label} rate limit reached ({what}). {advice}",
+            retryable=True,
+            rate_limited=True,
+            retry_after=seconds if until is not None else None,
+        )
+
     def _map_error(self, exc: BaseException) -> TrendsError | None:
         """Translate an upstream exception; ``None`` means re-raise unchanged."""
         if isinstance(exc, TooManyRequestsError):
             self._reset()
-            return TrendsError(
-                f"{self.label} rate limit reached (HTTP 429). Wait a minute before "
-                "retrying; cached results from earlier calls remain available.",
-                retryable=True,
-            )
+            return self._rate_limited(exc, _retry_after_header(getattr(exc, "response", None)))
         if isinstance(exc, InvalidParameterError):
             return TrendsError(
                 f"{self.label} rejected the request parameters: {describe_exception(exc)}"
             )
         if isinstance(exc, (ResponseError, DownloadError, requests.RequestException)):
             self._reset()
-            return TrendsError(
-                f"{self.label} request failed: {describe_exception(exc)}", retryable=True
-            )
+            detail = describe_exception(exc)
+            # urllib3 retried a 429 for us and gave up ("Max retries exceeded ... too many
+            # 429 error responses"): the quota is just as exhausted as on a direct 429.
+            if (status := _STATUS_RE.search(detail)) and status.group(1) == "429":
+                return self._rate_limited(exc, None, detail)
+            return TrendsError(f"{self.label} request failed: {detail}", retryable=True)
         if isinstance(exc, (ValueError, KeyError, IndexError, TypeError)):
             return TrendsError(f"Unexpected response from {self.label}: {describe_exception(exc)}")
         return None
@@ -511,8 +651,21 @@ class Source:
         """Run ``fn`` under the lane lock with error mapping and health tracking.
 
         Throttling happens per HTTP request inside the fetchers, not per operation.
+        While the source is cooling down after a 429, ``fn`` is not called at all:
+        the caller gets a retryable error carrying ``retry_after`` instead.
         """
         with self._lane.lock:
+            left = self.retry_after()
+            if left is not None:
+                with self._health_lock:
+                    until = _iso(self._cooldown_until)
+                raise TrendsError(
+                    f"{self.label} is cooling down after an HTTP 429 (retry in "
+                    f"{math.ceil(left)} s, at {until}); cached results remain available.",
+                    retryable=True,
+                    rate_limited=True,
+                    retry_after=left,
+                )
             try:
                 result = fn()
             except Exception as exc:  # noqa: BLE001 - mapped or re-raised below
@@ -542,10 +695,24 @@ class Source:
                 return again
             self._stats.count("cache_misses")
             value = fn()
+            # Only a fetch that *succeeded* is a fresh observation (tools archive on
+            # ``fresh``, not on misses: a miss answered stale must not be archived).
+            self._stats.count("fresh")
             self._cache.set(key, value, ttl)
             return value
 
-        return self._guarded(fetch_and_store)
+        try:
+            return self._guarded(fetch_and_store)
+        except TrendsError as exc:
+            if not (exc.rate_limited and self.settings.stale_fallback):
+                raise
+            stale = self._cache.get_stale(key)
+            if stale is None:
+                raise
+            value, age = stale
+            logger.debug("serving stale cache entry %s (%.0f s old): %s", key, age, exc)
+            self._stats.stale(age)
+            return value
 
 
 class _QuietTrendReq(TrendReq):
@@ -582,12 +749,9 @@ class _QuietTrendReq(TrendReq):
         return {k: v for k, v in response.cookies.items() if k == "NID"}
 
     def _get_data(self, url: str, method: str = TrendReq.GET_METHOD, **kwargs: Any) -> dict:
-        # With proxies, upstream refreshes the cookie *inside* ``_get_data`` and
-        # fires the data request immediately after, so the two HTTP calls are
-        # not spaced. Do the cookie fetch ourselves (throttled), throttle again,
-        # then run the parent with the proxy list hidden so it does not repeat
-        # the cookie fetch. The proxy is passed explicitly and rotated afterwards
-        # to keep upstream's rotation semantics.
+        # With proxies, upstream refreshes the cookie inside ``_get_data`` right before the
+        # data request, unspaced. Fetch the cookie ourselves (throttled), throttle again,
+        # run the parent with the proxy list hidden, then rotate the proxy as upstream would.
         if self.proxies:
             self.cookies = self._get_google_cookie()
             proxy = {"https": self.proxies[self.proxy_index]}
@@ -602,10 +766,8 @@ class _QuietTrendReq(TrendReq):
         return super()._get_data(url, method, **kwargs)
 
     def build_payload(self, *args: Any, **kwargs: Any) -> None:
-        # Upstream ``_get_tokens`` only *overwrites* these widgets when Google
-        # returns them; a response lacking TIMESERIES / GEO_MAP would leave the
-        # previous query's widget in place and mislabel its data with the new
-        # keywords. Always start from a clean slate.
+        # Upstream only overwrites these widgets when Google returns them; a response
+        # without TIMESERIES / GEO_MAP would relabel the previous query's data.
         self.interest_over_time_widget = {}
         self.interest_by_region_widget = {}
         self.related_topics_widget_list = []
@@ -708,9 +870,15 @@ class TrendsClient(Source):
     def has_cached_related_queries(
         self, keyword: str, timeframe: str, geo: str, category: int, gprop: str
     ) -> bool:
-        """True when :meth:`related_queries` would be served without hitting Google."""
+        """True when :meth:`related_queries` would be served without hitting Google.
+
+        With the stale fallback on, an expired copy counts too: during a cooldown the
+        request is refused and that copy is what the caller would get (flagged stale).
+        """
         key = self._explore_key("rq", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
-        return self._cache.get(key) is not None
+        if self._cache.get(key) is not None:
+            return True
+        return bool(self.settings.stale_fallback) and self._cache.get_stale(key) is not None
 
     def related_queries(
         self, keyword: str, timeframe: str, geo: str, category: int, gprop: str

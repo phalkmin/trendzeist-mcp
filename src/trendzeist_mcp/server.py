@@ -229,9 +229,10 @@ def discover_topics(
 @server.tool()
 def mine_questions(seed: str, geo: str = "", limit: int = 30) -> dict[str, Any]:
     """Long-tail questions people type about a seed, from Google Autocomplete
-    ('how to', 'why', 'what is', 'vs' ... expansions), de-duplicated and tagged
-    with a title angle. Feeds FAQ sections and answer-engine (AEO) content.
-    Up to ~16 throttled requests per call; results cached 24 h. limit: 1-100."""
+    ('how to', 'why', 'what is', 'vs' ... expansions; localised prefixes for
+    pt/es/fr/de/it/pl/nl follow geo's language, see prefix_language), de-duplicated
+    and tagged with a title angle. Feeds FAQ sections and answer-engine (AEO)
+    content. Up to ~16 throttled requests per call; results cached 24 h. limit: 1-100."""
     return _tool(tools.mine_questions)(seed, geo, limit)
 
 
@@ -361,7 +362,7 @@ def blog_ideas_from_trends(topic: str, audience: str = "general readers", geo: s
         f"geo='{geo}', timeframe='today 3-m'). Note each topic's angle and the "
         "`questions` list.\n"
         "2. Pick the most promising breakout/rising topics plus 2-3 evergreen ones; "
-        "aim for a mix of angles (how-to, comparison, listicle, definition, news).\n"
+        "aim for a mix of angles (how-to, comparison, listicle, definition, verdict, news).\n"
         f"3. Call mine_questions on the 1-2 strongest seeds (geo='{geo}') to collect "
         "FAQ / answer-engine questions for each idea.\n"
         "4. Validate 3-5 finalists with compare_keywords or interest_over_time "

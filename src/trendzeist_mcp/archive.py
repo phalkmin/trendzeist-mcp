@@ -235,17 +235,14 @@ class Archive:
         top: list[dict[str, Any]],
         rising_clean: list[dict[str, Any]],
     ) -> str | None:
-        """Complete top + *clean* rising lists (suspects never enter the archive).
-
-        Callers must pass the full lists Google returned, not a display-limited
-        slice, so that two snapshots are comparable regardless of ``limit``.
-        """
+        """Store the complete top + rising lists (not a display-limited slice, so
+        snapshots stay comparable); suspect and off-topic items are skipped."""
         rows: list[tuple] = []
         for rank, it in enumerate(top, 1):
-            if it.get("name"):
+            if it.get("name") and not it.get("off_topic"):
                 rows.append(("top_query", it["name"], _num(it.get("value")), rank, None))
         for rank, it in enumerate(rising_clean, 1):
-            if it.get("suspect") or not it.get("name"):
+            if it.get("suspect") or it.get("off_topic") or not it.get("name"):
                 continue
             status = "breakout" if it.get("is_breakout") else "rising"
             rows.append(("rising_query", it["name"], _num(it.get("value")), rank, status))

@@ -42,21 +42,109 @@ _QUESTION_PREFIXES: tuple[str, ...] = (
     "how to", "how do", "how much", "how long", "why", "what is", "what are", "when",
     "where", "which", "can", "should", "is", "does", "vs",
 )
-# Realness ranking for mined questions (issue 5, 2026-11-03): Autocomplete answers a
-# rare prefix + seed by padding it with one token ("how long llms.txt last"). A real
-# question carries a verb (or compares), is specific, and comes back under more than
-# one prefix. The verb list is deliberately small: auxiliaries plus the verbs people
-# use about tools; a missing verb only costs points unless the completion is also bare.
+# Realness score for mined questions: a verb or comparison word, specificity and a
+# second prefix beat Autocomplete padding ("how long llms.txt last"). Small verb list on purpose.
 _QUESTION_HIT_POINTS = 3
 _QUESTION_VERBS = frozenset(
     "is are was were be been do does did can could should would will has have had need "
-    "needs work works working use used using add adding install installing create "
-    "creating make making mean means matter matters help helps cost costs take takes "
-    "support supports run runs exist exists generate write check test validate read get "
-    "set configure enable disable build fix improve affect allow require requires "
-    "replace replaces compare".split()
+    "needs work works working worked use used using add adding added install installing "
+    "installed create creating created make making made mean means meant matter matters "
+    "help helps helped cost costs take takes took taken support supports supported run "
+    "runs running exist exists existed generate generated write written check checked "
+    "test tested validate validated read get got set configure configured enable enabled "
+    "disable disabled build built fix fixed improve improved affect affects allow allowed "
+    "require requires required replace replaces replaced compare compared "
+    # short verbs and participles ("where llms.txt stored", "where llms.txt go")
+    "go goes going gone went store stored stores put placed place located locate live "
+    "lives find found look looks looking come comes came done host hosted serve served "
+    "apply applies applied appear appears show shows shown update updated change changed "
+    "load loaded point points see start started stop stopped end ends open opened save "
+    "saved keep kept call called send sent handle handles parse parsed index indexed crawl "
+    "crawled crawls fetch fetched cache cached ignore ignored block blocked follow follows "
+    "followed respect respected".split()
 )
 _COMPARISON_WORDS = frozenset({"vs", "versus", "or", "better", "difference", "alternative", "alternatives"})
+
+# Question prefixes per UI language as ``(prefix, angle)``; the angle stands in for the
+# English-only ``classify_angle``. "vs" closes every list. Other languages use English.
+_LOCAL_PREFIXES: dict[str, tuple[tuple[str, str], ...]] = {
+    "pt": (
+        ("como", "how-to"), ("como fazer", "how-to"), ("por que", "how-to"),
+        ("o que é", "definition"), ("quando", "how-to"), ("onde", "how-to"),
+        ("qual", "comparison"), ("quanto custa", "how-to"), ("vale a pena", "verdict"),
+        ("vs", "comparison"),
+    ),
+    "es": (
+        ("cómo", "how-to"), ("por qué", "how-to"), ("qué es", "definition"),
+        ("cuándo", "how-to"), ("dónde", "how-to"), ("cuál", "comparison"),
+        ("cuánto cuesta", "how-to"), ("vale la pena", "verdict"), ("se puede", "how-to"),
+        ("vs", "comparison"),
+    ),
+    "fr": (
+        ("comment", "how-to"), ("pourquoi", "how-to"), ("qu'est-ce que", "definition"),
+        ("c'est quoi", "definition"), ("quand", "how-to"), ("où", "how-to"),
+        ("quel", "comparison"), ("combien coûte", "how-to"), ("est-ce que", "verdict"),
+        ("vs", "comparison"),
+    ),
+    "de": (
+        ("wie", "how-to"), ("warum", "how-to"), ("was ist", "definition"),
+        ("wann", "how-to"), ("wo", "how-to"), ("welche", "comparison"),
+        ("wie viel kostet", "how-to"), ("kann man", "how-to"), ("lohnt sich", "verdict"),
+        ("vs", "comparison"),
+    ),
+    "it": (
+        ("come", "how-to"), ("perché", "how-to"), ("cos'è", "definition"),
+        ("quando", "how-to"), ("dove", "how-to"), ("quale", "comparison"),
+        ("quanto costa", "how-to"), ("si può", "how-to"), ("conviene", "verdict"),
+        ("vs", "comparison"),
+    ),
+    "pl": (
+        ("jak", "how-to"), ("dlaczego", "how-to"), ("co to jest", "definition"),
+        ("kiedy", "how-to"), ("do kiedy", "how-to"), ("gdzie", "how-to"),
+        ("ile", "how-to"), ("ile kosztuje", "how-to"), ("czy", "verdict"),
+        ("który", "comparison"), ("vs", "comparison"),
+    ),
+    "nl": (
+        ("hoe", "how-to"), ("waarom", "how-to"), ("wat is", "definition"),
+        ("wanneer", "how-to"), ("waar", "how-to"), ("welke", "comparison"),
+        ("hoeveel kost", "how-to"), ("kan je", "how-to"), ("vs", "comparison"),
+    ),
+}
+
+
+def question_prefixes(hl: str) -> tuple[str, tuple[str, ...]]:
+    """``(language, prefixes)`` for a UI language: the localised table when there is one,
+    otherwise ``("en", _QUESTION_PREFIXES)``."""
+    lang = (hl or "en").split("-")[0].lower()
+    table = _LOCAL_PREFIXES.get(lang)
+    if table is None:
+        return "en", _QUESTION_PREFIXES
+    return lang, tuple(prefix for prefix, _ in table)
+
+
+def composite_prefixes(hl: str, english: tuple[str, ...]) -> tuple[str, ...]:
+    """A capped prefix set for composites, in the request language.
+
+    ``english`` is the composite's own English subset (its request budget); for a
+    language with a localised table the same number of prefixes is taken from the
+    head of that table, keeping "vs" last, so the budget is unchanged.
+    """
+    lang, table = question_prefixes(hl)
+    if lang == "en":
+        return english
+    body = [p for p in table if p != "vs"][: max(0, len(english) - 1)]
+    return (*body, "vs")
+
+
+def _local_angles(lang: str) -> dict[str, str]:
+    """Folded (normalised, unaccented) prefix -> angle for a localised language (empty
+    for English/custom). Folded because Autocomplete returns "como" for "cómo"."""
+    return {_fold(p): a for p, a in _LOCAL_PREFIXES.get(lang, ())}
+
+
+def _fold(text: str) -> str:
+    """Comparison form for completions: normalised and accent-stripped."""
+    return fmt.strip_accents(fmt.normalise_query(text))
 
 
 def _setting(hub: Hub, name: str, default: Any) -> Any:
@@ -88,6 +176,18 @@ def finalize(hub: Hub, out: dict[str, Any]) -> dict[str, Any]:
     meta = getattr(hub, "call_meta", None)
     if callable(meta):
         out["_meta"] = meta()
+        # Stale fallback: label old data where the model looks, not only in _meta.
+        if out["_meta"].get("stale_hits"):
+            age_days = round(float(out["_meta"].get("stale_age_s", 0)) / 86400, 1)
+            out["stale"] = {
+                "age_days": age_days,
+                "note": (
+                    f"Part of this result is stale: the source hit its rate limit (HTTP 429) "
+                    f"and an expired cache entry up to {age_days} days old was served "
+                    "instead. Fine for ideation; re-run after _meta.rate_limited[].retry_after_s "
+                    "for current numbers."
+                ),
+            }
     return out
 
 
@@ -101,11 +201,14 @@ def fetch_recording(hub: Hub, fetch: Callable[[], T], record: Callable[[T], Any]
     """
     archive = getattr(hub, "archive", None)
     stats = getattr(hub, "stats", None)
-    before = stats.misses() if stats is not None and hasattr(stats, "misses") else None
+    # ``fresh`` excludes misses served from a stale entry (not an observation); older
+    # stats objects only have ``misses``.
+    probe = getattr(stats, "fresh", None) or getattr(stats, "misses", None)
+    before = probe() if callable(probe) else None
     result = fetch()
     if archive is None:
         return result
-    after = stats.misses() if before is not None else None
+    after = probe() if before is not None else None
     if before is None or (after is not None and after > before):
         record(result)
     return result
@@ -185,15 +288,10 @@ def fetch_related(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Related queries as ``(top, rising)`` in Google's order; archives on a miss.
 
-    ``rising`` items carry ``growth_pct`` / ``is_breakout`` and, where detected,
-    ``suspect`` / ``suspect_reason`` (split with ``fmt.split_suspects``) or
-    ``off_topic`` / ``off_topic_reason`` (split with ``fmt.split_off_topic``).
-    ``context`` lists the other seeds of a composite call: a rising query that
-    mentions one of them is on topic.
-
-    Suspect detection and the archive both see the *complete* lists Google
-    returned; ``limit`` is applied only to what is handed back, so a caller's
-    display limit can never make ``what_changed`` report invented drops.
+    Items may carry ``suspect`` / ``off_topic`` flags (+ ``_reason``); split with
+    ``fmt.split_suspects`` / ``fmt.split_off_topic``. ``context`` = the call's other
+    seeds, which count as on topic. Flagging and the archive see the complete lists;
+    ``limit`` only trims the return value, so a display limit cannot fake drops.
     """
 
     def fetch() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -208,7 +306,7 @@ def fetch_related(
         if cat or gp:
             return
         top, rising = pair
-        hub.archive.record_related(kw, g, tf, top, fmt.split_suspects(rising)[0])
+        hub.archive.record_related(kw, g, tf, top, rising)  # drops suspect / off-topic itself
 
     top, rising = fetch_recording(hub, fetch, record)
     return top[:limit], rising[:limit]
@@ -249,7 +347,8 @@ def compare_keywords(
         "warnings": data.get("warnings", []),
     }
     for row in out["ranking"]:
-        if summary[row["keyword"]].get("level_shift"):
+        if summary[row["keyword"]].get("level_shifts"):
+            row["level_shifts"] = summary[row["keyword"]]["level_shifts"]
             row["level_shift"] = summary[row["keyword"]]["level_shift"]
     out.update(fmt.compare_interpretation(out["ranking"], unavailable=len(out["unavailable"])))
     if not out["ranking"]:
@@ -282,18 +381,20 @@ def related_queries(
     top, rising = fetch_related(hub, kw, tf, g, cat, gp, lim)
     fmt.tag_angles(top)
     fmt.tag_angles(rising)
+    clean_top, off_top = fmt.split_off_topic(top)
     clean_rising, suspects = fmt.split_suspects(rising)
-    clean_rising, off_topic = fmt.split_off_topic(clean_rising)
+    clean_rising, off_rising = fmt.split_off_topic(clean_rising)
+    off_topic = off_top + off_rising
     out: dict[str, Any] = {
         "query": _query_meta(hub, [kw], tf, g, cat, gp),
         "top": top,
         "rising": rising,
-        "questions": fmt.extract_questions(("rising", clean_rising), ("top", top), limit=lim),
+        "questions": fmt.extract_questions(("rising", clean_rising), ("top", clean_top), limit=lim),
         "available": bool(top or rising),
         "notes": {
             "top": "value = relative popularity 0-100 among related searches",
             "rising": "value = % growth vs. previous period; is_breakout = >5000% (new/exploding)",
-            "angle": "title angle: how-to | comparison | listicle | definition | news | null",
+            "angle": "title angle: how-to | comparison | listicle | definition | verdict | news | null",
             "questions": "question-shaped related searches (rising first), deduplicated",
         },
     }
@@ -307,9 +408,10 @@ def related_queries(
     if off_topic:
         out["off_topic_count"] = len(off_topic)
         out["notes"]["off_topic"] = (
-            "rising items with off_topic=true share no word with the seed or its top "
-            "queries (unrelated searches rising from a tiny base); they are excluded from "
-            "questions. Pass category= to narrow Google's related queries."
+            "items with off_topic=true share no word with the seed or its on-topic top "
+            "queries: rising breakouts from a tiny base, and top queries Google lists at a "
+            "value below 10 (the same junk often appears in both lists). They are excluded "
+            "from questions. Pass category= to narrow Google's related queries."
         )
     note = v.limit_note(limit, lim)
     if note:
@@ -568,17 +670,33 @@ def mine_questions(
     geo: str = "",
     limit: int = 30,
     *,
-    prefixes: tuple[str, ...] = _QUESTION_PREFIXES,
+    prefixes: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Expand a seed through Google Autocomplete into question-shaped long-tail queries.
 
     Each prefix ("how to", "why", ...) is one throttled request; the seed alone
     is queried first so the model gets *something* even when a 429 interrupts
     the expansion. Partial results are returned with the failure in ``errors``.
+    Prefixes follow the request language (``question_prefixes``) unless the caller
+    passes its own.
     """
     kw = v.validate_keyword(seed)
     g = v.validate_geo(geo)
     lim = v.validate_limit(limit, default=30, maximum=100)
+    hl = _hl_for(hub, g)
+    if prefixes is None:
+        lang, prefixes = question_prefixes(hl)
+    else:
+        lang = "custom"
+    localised = lang not in ("en", "custom")
+    local_angles = _local_angles(lang)
+    # Question words anywhere in a completion count for a localised language: for the
+    # bare seed Google puts them *after* the seed ("wakacje składkowe do kiedy").
+    local_q_re = (
+        re.compile(r"\b(" + "|".join(re.escape(p) for p in sorted(local_angles, key=len, reverse=True)) + r")\b")
+        if local_angles
+        else None
+    )
 
     seen: dict[str, dict[str, Any]] = {}
     hit_prefixes: dict[str, set[str]] = {}
@@ -591,8 +709,8 @@ def mine_questions(
     per_prefix = max(3, math.ceil(lim / len(prefixes)))
     # The seed must survive as whole words: Autocomplete completes an unfinished
     # last token ("wordpress ai" -> "wordpress airplay"), which is off-topic.
-    seed_re = re.compile(rf"\b{re.escape(fmt.normalise_query(kw))}s?\b")
-    seed_tokens = set(fmt.normalise_query(kw).split())
+    seed_re = re.compile(rf"\b{re.escape(_fold(kw))}s?\b")
+    seed_tokens = set(_fold(kw).split())
 
     def absorb(prefix: str, suggestions: list[str]) -> None:
         taken = 0
@@ -600,36 +718,43 @@ def mine_questions(
             if taken >= per_prefix:
                 break
             text = " ".join(text.split())
-            norm = fmt.normalise_query(text)
+            # Folded: "cómo hacer" and "como hacer" are one question, in any language.
+            norm = _fold(text)
             if not norm:
                 continue
             if norm in seen:
-                # Surfacing under a second prefix is evidence people really type it
-                # (a duplicate inside one answer is not).
+                # A second prefix is evidence people type it; a duplicate in one answer is not.
                 if prefix not in hit_prefixes[norm]:
                     hit_prefixes[norm].add(prefix)
                     seen[norm]["prefix_hits"] += 1
                     seen[norm]["score"] += _QUESTION_HIT_POINTS
                 continue
-            if not (fmt.is_question(text) or prefix == "vs"):
+            norm_prefix = _fold(prefix)
+            local_hit = local_q_re.search(norm) if local_q_re is not None else None
+            # Whole-word prefix match: "is espresso bad" yes, "israel espresso" no.
+            starts_with_prefix = bool(norm_prefix) and (
+                norm == norm_prefix or norm.startswith(norm_prefix + " ")
+            )
+            is_q = prefix == "vs" or fmt.is_question(text) or starts_with_prefix or local_hit is not None
+            if not is_q:
                 continue
             if not seed_re.search(norm):
                 continue
             tokens = norm.split()
-            prefix_tokens = set(prefix.split())
+            prefix_tokens = set(norm_prefix.split())
             extra = [t for t in tokens if t not in seed_tokens and t not in prefix_tokens]
-            has_verb = any(t in _QUESTION_VERBS for t in tokens)
             comparison = prefix == "vs" or any(t in _COMPARISON_WORDS for t in tokens)
-            if not has_verb and not comparison and len(extra) <= 1:
-                # "how long llms.txt last", "when llms.txt file": Autocomplete padded the
-                # prefix with the seed; nobody types this as a question.
-                filtered_out.append(
-                    {
-                        "question": text,
-                        "prefix": prefix or None,
-                        "reason": "no verb and at most one word beyond prefix + seed (Autocomplete padding)",
-                    }
-                )
+            if localised:
+                # The verb list is English: abroad only the bare prefix + seed echo is padding.
+                has_verb = False
+                padding = not comparison and not extra
+                reason = "nothing beyond prefix + seed (Autocomplete padding)"
+            else:
+                has_verb = any(t in _QUESTION_VERBS for t in tokens)
+                padding = not has_verb and not comparison and len(extra) <= 1
+                reason = "no verb and at most one word beyond prefix + seed (Autocomplete padding)"
+            if padding:
+                filtered_out.append({"question": text, "prefix": prefix or None, "reason": reason})
                 continue
             score = _QUESTION_HIT_POINTS
             if has_verb:
@@ -640,9 +765,20 @@ def mine_questions(
                 score += 1
             if len(extra) >= 2:
                 score += 1
+            if prefix == "vs":
+                angle = "comparison"
+            elif localised:
+                angle = (
+                    local_angles.get(norm_prefix)
+                    or (local_angles.get(local_hit.group(1)) if local_hit else None)
+                    or fmt.classify_angle(text)
+                    or "how-to"
+                )
+            else:
+                angle = fmt.classify_angle(text) or "how-to"
             entry = {
                 "question": text,
-                "angle": fmt.classify_angle(text) or ("comparison" if prefix == "vs" else "how-to"),
+                "angle": angle,
                 "prefix": prefix or None,
                 "prefix_hits": 1,
                 "score": score,
@@ -687,12 +823,13 @@ def mine_questions(
         by_angle[q["angle"]] = by_angle.get(q["angle"], 0) + 1
 
     out: dict[str, Any] = {
-        "query": {"seed": kw, "geo": g or "worldwide", "hl": _hl_for(hub, g)},
+        "query": {"seed": kw, "geo": g or "worldwide", "hl": hl},
         "questions": questions,
         "count": len(questions),
         "by_angle": by_angle,
         "filtered_out": filtered_out,
         "filtered_count": len(filtered_out),
+        "prefix_language": lang,
         "prefixes_queried": prefixes_done,
         "errors": errors,
         "guidance": (
@@ -711,12 +848,12 @@ def mine_questions(
             "Expansion stopped early because Google is rate limiting; results above "
             "are complete for the prefixes listed in prefixes_queried."
         )
-    if not out["query"]["hl"].lower().startswith("en"):
+    if lang == "en" and not hl.lower().startswith("en"):
         out["language_note"] = (
-            "Question prefixes are English, so expansions are English-biased even though "
-            "Autocomplete ran with hl=" + out["query"]["hl"] + ". For native-language "
-            "questions pass a seed already phrased in that language (e.g. 'como fazer "
-            "espresso')."
+            f"No localised question prefixes for hl={hl}; the English set was used, so "
+            "expansions are English-biased even though Autocomplete ran in that language. "
+            "Pass a seed already phrased in the market's language, or pass your own "
+            "prefixes. Localised sets exist for: " + ", ".join(sorted(_LOCAL_PREFIXES)) + "."
         )
     if not questions and not errors:
         out["reason"] = (
@@ -920,7 +1057,8 @@ def compare_channels(
             )
             if summary.get("growth_3m") is None and summary.get("growth_note"):
                 block["growth_note"] = summary["growth_note"]
-            if summary.get("level_shift"):
+            if summary.get("level_shifts"):
+                block["level_shifts"] = summary["level_shifts"]
                 block["level_shift"] = summary["level_shift"]
         channels[name] = block
 
@@ -994,8 +1132,26 @@ def _fmt_day(ts: str | None) -> str | None:
     return ts[:10] if ts else None
 
 
+def _clean_snapshot_rows(
+    rows: list[dict[str, Any]], seed: str, context: Iterable[str] = ()
+) -> tuple[list[dict[str, Any]], int]:
+    """``(clean_rows, removed)`` after re-applying today's suspect / off-topic rules:
+    older snapshots hold junk that would come back as "dropped" or "promoted"."""
+    top = [{"name": r["item"], "value": r["value"], "_row": r} for r in rows if r["kind"] == "top_query"]
+    rising = [
+        {"name": r["item"], "value": r["value"], "is_breakout": r["status"] == "breakout", "_row": r}
+        for r in rows
+        if r["kind"] == "rising_query"
+    ]
+    fmt.flag_suspects(rising, top, seed)
+    fmt.flag_off_topic(rising, top, seed, context)
+    junk = {id(it["_row"]) for it in top + rising if it.get("suspect") or it.get("off_topic")}
+    kept = [r for r in rows if id(r) not in junk]
+    return kept, len(rows) - len(kept)
+
+
 def _seed_changes(
-    hub: Hub, archive: Any, seed: str, g: str, since_days: int
+    hub: Hub, archive: Any, seed: str, g: str, since_days: int, context: Iterable[str] = ()
 ) -> dict[str, Any]:
     """Compare the newest related-queries snapshot with one >= since_days older."""
     report: dict[str, Any] = {"seed": seed}
@@ -1016,8 +1172,7 @@ def _seed_changes(
             f"baseline recorded {_fmt_day(oldest['observed_at'])}; rerun after {rerun} (or lower since_days)."
         )
         if oldest["id"] == latest["id"]:
-            # First run: nothing to compare with yet, but the current state is still
-            # actionable. List it as first_seen instead of returning an empty meeting.
+            # First run: no comparison yet, but the current state is still actionable.
             report["first_run"] = True
             report["first_seen"] = [
                 {
@@ -1056,6 +1211,10 @@ def _seed_changes(
             "below Google's threshold."
         )
         return report
+    now_rows, _ = _clean_snapshot_rows(now_rows, seed, context)
+    base_rows, base_filtered = _clean_snapshot_rows(base_rows, seed, context)
+    if base_filtered:
+        report["baseline_filtered"] = base_filtered
 
     now_rising = {r["item"]: r for r in now_rows if r["kind"] == "rising_query"}
     base_rising = {r["item"]: r for r in base_rows if r["kind"] == "rising_query"}
@@ -1174,7 +1333,8 @@ def what_changed(
             "breakouts and rising queries ('... (no history yet)'), and the week-over-week "
             "comparison starts on the rerun date in reason. baseline_note means no snapshot "
             "was since_days old yet, so the comparison used a younger one (its real age is "
-            "in baseline_age_days)."
+            "in baseline_age_days). baseline_filtered counts rows of the older snapshot that "
+            "today's spam / off-topic rules removed before comparing."
         ),
     }
     if archive is None:
@@ -1195,7 +1355,9 @@ def what_changed(
             except TrendsError as exc:
                 out["errors"].append({"step": f"related_queries:{seed}", "error": str(exc)})
                 cooling = cooling or exc.retryable
-        out["seeds"].append(_seed_changes(hub, archive, seed, g, days))
+        out["seeds"].append(
+            _seed_changes(hub, archive, seed, g, days, context=[s for s in kws if s != seed])
+        )
     out["available"] = any("counts" in s for s in out["seeds"])
     if cooling:
         out["partial"] = "Google rate limited this call; comparisons use the newest stored snapshot."
@@ -1404,9 +1566,8 @@ def recurring_topics(
             "data; run what_changed weekly to build it."
         )
     else:
-        # Coverage is how far back the archive itself reaches for this geo (not the
-        # oldest rising row, which is always inside the window). Clamped to [0, d]:
-        # a future-stamped oldest row is not coverage.
+        # How far back the archive reaches for this geo, clamped to [0, d] (a
+        # future-stamped row is not coverage).
         oldest = parse_ts(archive.oldest(g))
         coverage = max(0, min(d, (datetime.now(timezone.utc) - oldest).days)) if oldest else None
         out["coverage_days"] = coverage
@@ -1442,9 +1603,10 @@ def recurring_topics(
         topics.sort(key=lambda t: (t["episodes"], t["last_breakout"] or ""), reverse=True)
         out["topics"] = topics[:lim]
         if not topics:
+            lower = f"min_episodes={me - 1}, " if me > 2 else ""
             out["reason"] = (
-                f"No topic broke out {me}+ times in the window; try min_episodes=2 or a "
-                "longer window."
+                f"No topic broke out {me}+ times in the window; try {lower}a longer window, "
+                "or more frequent polling (weekly what_changed runs are what separates episodes)."
             )
         out["guidance"] = (
             "An episode is a separate run of 'breakout' status (a run ends when a later "
@@ -1481,7 +1643,10 @@ def trendzeist_status(hub: Hub) -> dict[str, Any]:
             "tz": s.tz,
             "min_interval_s": s.min_interval,
             "wiki_min_interval_s": s.wiki_min_interval,
+            "jitter": s.jitter,
             "retries": s.retries,
+            "cooldown_s": s.cooldown,
+            "stale_fallback": s.stale_fallback,
             "ttl_s": {"explore": s.explore_ttl, "rss": s.rss_ttl, "static": s.static_ttl},
             "max_memory_entries": s.max_memory_entries,
             "max_series_points": s.max_series_points,

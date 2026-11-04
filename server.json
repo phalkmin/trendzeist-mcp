@@ -3,7 +3,7 @@
   "name": "io.github.phalkmin/trendzeist-mcp",
   "title": "Trendzeist – Google Trends for content ideation",
   "description": "Free, keyless MCP for content ideation and AEO: Google Trends topics and questions, Google News coverage, Wikipedia attention, an AEO opportunity finder and citable-answer briefs. No API key.",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "websiteUrl": "https://phalkmin.me/en/trendzeist-google-trends-mcp/",
   "repository": {
     "url": "https://github.com/phalkmin/trendzeist-mcp",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "trendzeist-mcp",
-      "version": "0.6.0",
+      "version": "0.6.1",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [
@@ -30,6 +30,13 @@
           "isRequired": false,
           "format": "number",
           "default": "2.0"
+        },
+        {
+          "name": "TRENDZEIST_COOLDOWN",
+          "description": "Seconds a source refuses uncached requests after an HTTP 429 (fail fast with retry_after; a Retry-After header wins when seen; 0 disables).",
+          "isRequired": false,
+          "format": "number",
+          "default": "60"
         },
         {
           "name": "TRENDZEIST_WIKI_MIN_INTERVAL",

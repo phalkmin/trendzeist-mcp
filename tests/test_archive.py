@@ -200,7 +200,11 @@ class _FakeTrends:
         self.stats.count("cache_misses")
         self.stats.count("requests")
         self.cache[key] = fetch()
+        self.stats.count("fresh")  # a fetch that succeeded (0.6.1: what the archive records)
         return self.cache[key]
+
+    def retry_after(self):
+        return None
 
     def related_queries(self, kw, tf, geo, cat, gprop):
         return self._cached(("rq", kw, tf, geo), lambda: {

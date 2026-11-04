@@ -51,7 +51,9 @@ def test_flag_off_topic_marks_queries_sharing_nothing_with_seed_or_top():
     assert flags == [True, True, False, False, True]
     assert "no word in common" in rising[0]["off_topic_reason"]
     # Punctuation in the seed must not hide a match ("llms.txt" ~ "llms txt").
-    rising = [{"name": "llms txt vs robots txt", "value": 100}, {"name": "what is a roth ira", "value": 100}]
+    rising = fmt.mark_breakouts(
+        [{"name": "llms txt vs robots txt", "value": 9000}, {"name": "what is a roth ira", "value": 9000}]
+    )
     fmt.flag_off_topic(rising, [], "llms.txt")
     assert [bool(it.get("off_topic")) for it in rising] == [False, True]
     # Already-suspect items are left to the spam heuristic.

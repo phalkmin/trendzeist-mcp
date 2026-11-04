@@ -247,10 +247,12 @@ def test_interest_by_region_explains_empty_results():
 
 def test_mine_questions_expands_dedupes_and_tags():
     client = FakeClient()
-    out = tools.mine_questions(client, "espresso", geo="br", limit=6)
-    assert out["query"] == {"seed": "espresso", "geo": "BR", "hl": "pt-BR"}
-    assert client.calls[0] == ("ac", "espresso", "BR")
-    assert client.calls[1] == ("ac", "how to espresso", "BR")
+    # 0.6.1: prefixes follow the geo's language, so the English flow is tested on US.
+    out = tools.mine_questions(client, "espresso", geo="us", limit=6)
+    assert out["query"] == {"seed": "espresso", "geo": "US", "hl": "en-US"}
+    assert out["prefix_language"] == "en"
+    assert client.calls[0] == ("ac", "espresso", "US")
+    assert client.calls[1] == ("ac", "how to espresso", "US")
     assert out["count"] == 6 and len(out["questions"]) == 6
     texts = [q["question"] for q in out["questions"]]
     assert texts[0] == "how to make espresso" and "what is espresso" in texts
@@ -263,8 +265,7 @@ def test_mine_questions_expands_dedupes_and_tags():
     assert out["prefixes_queried"] == ["(seed)", "how to", "how do"]
     # Ranked by realness: the "how do" questions carry a verb, the "how to" ones do not.
     assert [q["prefix"] for q in out["questions"]] == [None, None, "how do", "how do", "how to", "how to"]
-    assert "hl=pt-BR" in out["language_note"]
-    assert "language_note" not in tools.mine_questions(FakeClient(), "espresso", geo="US", limit=3)
+    assert "language_note" not in out
 
 
 def test_mine_questions_vs_prefix_and_rate_limit_partial():

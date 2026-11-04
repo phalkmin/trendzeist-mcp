@@ -46,7 +46,11 @@ def test_disk_cache_respects_expiry(tmp_path):
     c1.set("k", "v", ttl=0.01)
     time.sleep(0.05)
     assert _TTLCache(tmp_path).get("k") is None
-    assert list(tmp_path.glob("*.json")) == []
+    # 0.6.1: the expired file is kept (within STALE_GRACE) for the rate-limit fallback.
+    assert len(list(tmp_path.glob("*.json"))) == 1
+    c1.set("old", "v", ttl=-(client_mod.STALE_GRACE + 1))
+    assert _TTLCache(tmp_path).get("old") is None
+    assert len(list(tmp_path.glob("*.json"))) == 1  # beyond the grace: dropped on read
 
 
 @pytest.mark.parametrize("garbage", [b"garbage", b'{"expires": null}', b'{"value": 1}', b"[]"])
@@ -126,7 +130,7 @@ def test_expired_disk_files_are_swept(tmp_path, monkeypatch):
     monkeypatch.setattr(client_mod, "DISK_SWEEP_INTERVAL", 0)
     c = _TTLCache(tmp_path)
     for i in range(5):
-        c.set(f"old{i}", i, ttl=-1)
+        c.set(f"old{i}", i, ttl=-(client_mod.STALE_GRACE + 1))  # past the stale grace
     c.set("fresh", 1, ttl=60)
     assert len(list(tmp_path.glob("*.json"))) == 1
 

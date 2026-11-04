@@ -66,7 +66,8 @@ def _trend_block(trend: dict[str, Any]) -> dict[str, Any]:
     }
     if block["growth_3m"] is None and trend.get("growth_note"):
         block["growth_note"] = trend["growth_note"]
-    if trend.get("level_shift"):
+    if trend.get("level_shifts"):
+        block["level_shifts"] = trend["level_shifts"]
         block["level_shift"] = trend["level_shift"]
     return block
 
@@ -116,11 +117,11 @@ def _seed_context(
     if not cooling:
         try:
             top, rising = tools.fetch_related(hub, seed, tf, g, 0, "", 25, context=context)
-            # Suspect (spam-like) and off-topic rising items never become questions
-            # or breakouts.
+            # Suspect and off-topic items from either list never become questions or breakouts.
+            top, off_top = fmt.split_off_topic(top)
             rising, _ = fmt.split_suspects(rising)
-            rising, off_topic = fmt.split_off_topic(rising)
-            off_topic_names = [it["name"] for it in off_topic]
+            rising, off_rising = fmt.split_off_topic(rising)
+            off_topic_names = [it["name"] for it in off_top + off_rising]
             for q in fmt.extract_questions(
                 ("rising", rising), ("top", top), limit=_QUESTIONS_PER_SEED
             ):
@@ -137,8 +138,13 @@ def _seed_context(
             cooling = cooling or exc.retryable
 
     if not cooling:
+        # Same budget as _AEO_PREFIXES, in the market's language (issue #3).
         mined = tools.mine_questions(
-            hub, seed, g, limit=_QUESTIONS_PER_SEED, prefixes=_AEO_PREFIXES
+            hub,
+            seed,
+            g,
+            limit=_QUESTIONS_PER_SEED,
+            prefixes=tools.composite_prefixes(tools._hl_for(hub, g), _AEO_PREFIXES),
         )
         for q in mined["questions"]:
             found.append(

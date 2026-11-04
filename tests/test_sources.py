@@ -91,7 +91,8 @@ def test_news_edition_ignores_pinned_trends_language():
 
 
 def test_news_errors_map_to_trends_error():
-    hub = _hub()
+    # cooldown=0 so the 429 does not make the next request fail fast (0.6.1).
+    hub = Hub(Settings(min_interval=0, wiki_min_interval=0, cooldown=0), cache_dir=None)
     with patch("requests.get", return_value=_resp(status=429)):
         with pytest.raises(TrendsError, match="Google News rate limit"):
             hub.news.articles("x", "US")

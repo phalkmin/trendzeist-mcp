@@ -4,6 +4,78 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-11-04
+
+Rate limits, languages (GitHub #3, #4) and the tutorial re-check (issues 7-11). Additive;
+`schema_version` stays 3.
+
+### Added
+- **Localised question prefixes** (#3): `mine_questions` and `aeo_opportunities` use the
+  request language's prefixes for pt, es, fr, de, it, pl, nl (`jak` / `kiedy` / `ile` for
+  `geo=PL`), each carrying its angle. `prefix_language` names the table (`custom` when
+  prefixes were passed); `language_note` only when a language has no table. Bare-seed
+  completions with a question word anywhere are kept; only the literal prefix + seed echo
+  is filtered as padding.
+- **Cooldown after HTTP 429** (#4): a refused source rejects uncached work for
+  `TRENDZEIST_COOLDOWN` seconds (default 60; a `Retry-After` header wins, capped at 10 min;
+  `0` disables) with a retryable error that says how long to wait (`retry_after`,
+  `rate_limited`). Cached results and other sources keep answering. Surfaced in
+  `trendzeist_status.sources[]` (`cooling_down`, `retry_after_s`, `cooldown_until`) and
+  `_meta.rate_limited[]`.
+- **Stale-cache fallback** (#4): a rate-limited fetch serves an expired cache copy (kept
+  7 days) and says so: `_meta.stale_hits`, `_meta.stale_age_s`, top-level
+  `stale {age_days, note}`. Stale reads never create archive snapshots.
+  `TRENDZEIST_STALE_FALLBACK=0` disables.
+- **Jittered pacing**: `TRENDZEIST_JITTER` (default `0.5`) adds up to +50 % random spacing
+  to `TRENDZEIST_MIN_INTERVAL`.
+- **`verdict` angle**: yes/no questions ("is llms.txt worth it", "does it work") are
+  `verdict`, not `how-to`, with their own `citability_hints`; the localised yes/no
+  prefixes (`czy`, `vale a pena`, `lohnt sich`, `conviene`, `est-ce que`) carry it.
+  "can …" stays how-to.
+- **`level_shifts[]`** on every trend summary: every sustained step, oldest first, with
+  `shared`, `growth_affected` and `warning`; `level_shift` stays the largest. Also on
+  `compare_keywords.ranking[]`, `compare_channels.channels[]` and the `aeo_opportunities`
+  trend block. A `flattened` warning when joint normalisation squashed a keyword (mean
+  below 2) next to a big one (above 30).
+
+### Fixed
+- **Junk through the top list** (issue 7): Google lists the same junk in the top list at
+  values 0-3, so it vouched for itself; "make" and the work/workflow prefix vouched for
+  "how to make sushi" / "best laptop for work". A top query now contributes words only
+  when it shares one with the seeds or has value ≥ 10; generic words never count;
+  matching is exact after plural folding. Low-value top junk is flagged too
+  (`filtered_out[].list`, `off_topic_dropped`, `related_queries.top[]`) and earns no
+  breakout points. Only rising breakouts can be off-topic: measured risers ("moka pot"
+  +300 %) are no longer flagged.
+- **Off-topic rows in the archive** (issue 8): they came back as `promoted`, `dropped` or
+  recurring. `record_related` skips them like suspects; `what_changed` re-applies both
+  rules to older snapshots (`baseline_filtered`).
+- **Head terms were "covered"** (issue 9): "codex" matched "code" through the prefix rule
+  and "claude" was covered by "claude code macos". Prefixes need a 6-letter stem; a
+  candidate inside a longer site query is covered only with 2+ words or 60 % of that
+  query, otherwise `partial` with `matched`.
+- **`level_shift` missed the shared July step** (issue 10): only the largest step per
+  series was returned, a "new level" rule rejected steps back to an earlier level, dates
+  sat on the window boundary and grouping needed identical dates. Now every step is
+  returned, the lookback is 12 points, steps are dated at the largest single change,
+  warnings group within one bucket, and a cross-series single-week test reports a shared
+  step as `likely_artifact` regardless of the per-series rules. Black Friday spikes still
+  produce nothing.
+- (issue 11) the off-topic note respects a passed `category`; the `recurring_topics`
+  reason no longer repeats `min_episodes`; the padding filter knows short verbs and
+  participles ("where llms.txt stored").
+- (0.6.0 regression) `site_coverage` Jaccard could exceed 1 when two candidate tokens
+  matched one site token: "claude code vs codex" vs "claude code" is `gap`, not `partial`.
+- During a cooldown `discover_topics` skipped seeds whose only cached copy had expired
+  although the stale fallback would have served it.
+- An expired in-memory cache entry no longer hides a fresher disk copy written by another
+  process.
+
+### Notes
+- `interest_over_time` / `compare_keywords` are one request for all keywords, so there is
+  no per-keyword partial result; composites report per-seed errors, `skipped` and
+  `_meta.rate_limited`.
+
 ## [0.6.0] - 2026-11-04
 
 "Knows *which one* and *what keeps coming back*". Additive; `schema_version` stays 3.

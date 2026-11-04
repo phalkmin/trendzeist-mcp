@@ -8,6 +8,7 @@ the per-call counters and the settings.
 
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -224,8 +225,8 @@ class Hub:
             Path(resolved) if resolved else None, max_entries=self.settings.max_memory_entries
         )
         self.stats = CallStats()
-        self._google = Lane(self.settings.min_interval)
-        self._wikimedia = Lane(self.settings.wiki_min_interval)
+        self._google = Lane(self.settings.min_interval, self.settings.jitter)
+        self._wikimedia = Lane(self.settings.wiki_min_interval, self.settings.jitter)
         self.trends = TrendsClient(self.settings, self.cache, self._google, self.stats)
         self.autocomplete = AutocompleteSource(self.settings, self.cache, self._google, self.stats)
         self.news = GoogleNewsSource(self.settings, self.cache, self._google, self.stats)
@@ -251,6 +252,15 @@ class Hub:
         err = self.archive.call_error()
         if err:
             meta["archive_error"] = err
+        # Which sources are refusing uncached work right now, and for how long (0.6.1):
+        # lets an agent decide between waiting and falling back without another call.
+        cooling = [
+            {"source": s.name, "retry_after_s": math.ceil(left)}
+            for s in self.sources
+            if (left := s.retry_after()) is not None
+        ]
+        if cooling:
+            meta["rate_limited"] = cooling
         return meta
 
     def statuses(self) -> list[dict[str, Any]]:

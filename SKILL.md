@@ -14,13 +14,11 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
 1. **Discover** — `discover_topics(seed_keywords=[1-5 seeds], geo, timeframe="today 3-m")`.
    Start a session with 1-2 seeds (Google 429s the first burst hardest). Read `topics[]`
    (signal: breakout > rising > evergreen; `angle`: how-to | comparison | listicle |
-   definition | news) and `questions[]`. Ignore `suspect[]`: those rising queries look
-   like injected spam and must not become posts. `filtered_out[]` holds rising queries
-   that share no word with the seeds or their top queries (usually unrelated searches
-   rising from a tiny base, "how to bake a cake" under an AI-tool seed); they are out of
-   the ranking and the score. Skim the list: a real neighbour can land there too. A
-   `note` suggesting `category=` means Google's rising list for these seeds is noisy
-   (5 = Computers & Electronics). A seed report with `ambiguous` names
+   definition | verdict | news) and `questions[]`. Ignore `suspect[]`: injected spam, never
+   a post. `filtered_out[]` holds queries that share no word with the seeds ("how to bake a
+   cake" under an AI-tool seed), kept out of the ranking; skim it, a real neighbour can land
+   there. A `note` suggesting `category=` means Google's lists are noisy (5 = Computers &
+   Electronics). A seed report with `ambiguous` names
    several Google entities (Apple the company vs the fruit): follow `clarify` and **ask
    the user which one before writing**; the data was fetched for the plain text. An
    `ambiguity_note` means the check could not be trusted (skipped after a 429, or the
@@ -41,10 +39,11 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
    `direction` is the whole window; **`direction_now` is the recent slope and decides
    "write about it now"**. `direction: new` + `direction_now: falling` = a topic that
    spiked and faded; say so instead of calling it rising. A `growth_note` explains a
-   `null` growth field (too short a timeframe). A `level_shift` on a keyword (or a
-   `warnings[]` entry shared by several keywords, `likely_artifact: true`) means the
-   series stepped to a new level in one week and stayed there: a Google sampling change
-   until proven otherwise. Quote `level_shift.warning`, judge the curve after the step
+   `null` growth field (too short a timeframe). `level_shifts[]` on a keyword lists every
+   week the series stepped to a new level and stayed there (`level_shift` is the largest);
+   a `warnings[]` entry shared by several keywords (`likely_artifact: true`) is a Google
+   sampling change until proven otherwise, and a `flattened` warning means a small
+   keyword must be fetched alone. Quote the step's `warning`, judge the curve after it
    (`post_shift_change_pct`), and do not quote a `growth_3m` that spans it as demand
    change. `compare_keywords` names a `winner`
    (a rising challenger beats a falling or dead leader) with a `reason`, a `role` and
@@ -85,7 +84,8 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
   is `covered` (every question answered: refresh) / `partial` (some unanswered, see
   `coverage_counts`) / `gap` (new page); `matched` names the site query behind the
   verdict. Matching folds plurals and common abbreviations (mac/macos, wp/wordpress), but
-  still pass the raw query variants. `exclude_covered=true` drops only fully covered
+  still pass the raw query variants; a one-word head term inside a longer site query is
+  `partial`, not covered. `exclude_covered=true` drops only fully covered
   clusters. Without `site_queries` the `gap` score component is neutral.
 - **Score.** Read `score_breakdown.<component>.reason`, not the number alone; compare
   within one call only. `momentum_seed` says which seed's trend fed a shared topic.
@@ -104,8 +104,10 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
 - `breakout` = brand-new or exploding demand (time-sensitive). `rising` = growing.
   `evergreen` = consistently popular (pillar content). A rising item with `suspect: true`
   (one unrelated name repeated across breakouts, or a `.com`) is manipulation, not demand.
-  One with `off_topic: true` shares no word with the seed; it is usually noise rising from
-  a tiny base, occasionally a real neighbour. `score_breakdown.demand` saying "popularity
+  A breakout (or a top query below value 10) with `off_topic: true` shares no word with
+  the seed or its on-topic top queries; it is usually noise from a tiny base, occasionally
+  a real neighbour. Rising items with a measured growth figure are never flagged.
+  `score_breakdown.demand` saying "popularity
   unknown" is normal for rising-only items: check the curve before building on one.
 - `coverage` in `news_coverage`: none / low / moderate / high over 30 days. High = crowded;
   low with rising search interest = open field.
@@ -113,6 +115,7 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
   definition page can become the reference.
 - Angle -> evidence: how-to = steps + numbers; comparison = table + quotes; listicle =
   criterion + a source per item; definition = one-sentence definition + primary source;
+  verdict (yes/no questions) = the verdict first, the deciding evidence, then caveats;
   news = dated publisher quotes.
 
 ## Budget rules
@@ -120,9 +123,12 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
 - Google rate-limits hard. Prefer `discover_topics` (1 + N requests, plus one cached
   entity-ambiguity lookup per seed the first time it is seen) over N separate
   `related_queries` calls; reuse cached results (`_meta.cache_hit`).
-- If a tool error says HTTP 429, wait a minute. Cached queries still answer.
-  `trendzeist_status` (free) shows which source is erroring; Wikipedia keeps working
-  during a Google cool-down.
+- If a tool error says HTTP 429, the source is cooling down: the error (and
+  `trendzeist_status.sources[].retry_after_s`, free) says how many seconds to wait, and
+  every result carries `_meta.rate_limited[]` while that lasts. Cached queries still
+  answer; a result with a top-level `stale {age_days}` was served from an expired cache
+  copy, which is fine for ideation but not for quoting numbers. Autocomplete, News and
+  Wikipedia keep working during a Trends cool-down.
 - Do not loop `mine_questions` over many seeds in one turn; 3 seeds is ~50 requests.
   `aeo_opportunities` is worst case 1 + 11 requests per seed (10 + the ambiguity lookup).
   `compare_channels` is 5 requests; `what_changed` is 1 + N; `seasonality` is 1;

@@ -70,11 +70,9 @@ def discover_topics(
     filtered_out: list[dict[str, Any]] = []
     ambiguous_seeds: list[str] = []
 
-    # One interest_over_time call covers up to 5 seeds -> cheap trend context on a
-    # fixed 12-month window (so direction_now / growth_3m are meaningful whatever
-    # timeframe the related queries use). It is enrichment only: if it fails we
-    # still try the first seed's related queries, and only enter cooling-down
-    # (skip uncached seeds) once a related_queries request itself is refused.
+    # One interest_over_time call gives 12-month trend context for all seeds. It is
+    # enrichment only: a failure here does not start cooling down; a refused
+    # related_queries request does.
     cooling_down = False
     has_cache = getattr(hub.trends, "has_cached_related_queries", None)
 
@@ -118,24 +116,29 @@ def discover_topics(
                     "reason": item["suspect_reason"],
                 }
             )
-        rising, off_topic = fmt.split_off_topic(rising)
-        for item in off_topic:
-            filtered_out.append(
-                {
-                    "topic": item["name"],
-                    "kind": "off_topic",
-                    "growth_pct": item.get("growth_pct"),
-                    "is_breakout": item.get("is_breakout", False),
-                    "source_seed": seed,
-                    "reason": item["off_topic_reason"],
-                }
-            )
+        # Junk arrives through both lists: low-value top queries and breakouts from nothing.
+        top, off_top = fmt.split_off_topic(top)
+        rising, off_rising = fmt.split_off_topic(rising)
+        for list_name, items in (("top", off_top), ("rising", off_rising)):
+            for item in items:
+                filtered_out.append(
+                    {
+                        "topic": item["name"],
+                        "kind": "off_topic",
+                        "list": list_name,
+                        "growth_pct": item.get("growth_pct"),
+                        "popularity": item.get("value") if list_name == "top" else None,
+                        "is_breakout": item.get("is_breakout", False),
+                        "source_seed": seed,
+                        "reason": item["off_topic_reason"],
+                    }
+                )
         report["rising_count"] = len(rising)
         report["top_count"] = len(top)
         if flagged:
             report["suspect_count"] = len(flagged)
-        if off_topic:
-            report["off_topic_count"] = len(off_topic)
+        if off_top or off_rising:
+            report["off_topic_count"] = len(off_top) + len(off_rising)
         for q in fmt.extract_questions(("rising", rising), ("top", top), limit=per_seed):
             norm = fmt.normalise_query(q["question"])
             if norm not in question_keys:
@@ -255,9 +258,10 @@ def discover_topics(
             "question-shaped searches (FAQ / answer-engine candidates); expand them with "
             "mine_questions. suspect = rising queries that look like injected spam "
             "(kept out of topics and questions; do not write about them). filtered_out = "
-            "rising queries with no word in common with the seeds or their top queries "
-            "(kept out of topics, questions and scores; Google's number is in growth_pct, "
-            "judge them yourself before writing about one). Cross-check "
+            "related queries with no word in common with the seeds or their on-topic top "
+            "queries (list says which Google list they came from; kept out of topics, "
+            "questions and scores; Google's number is in growth_pct / popularity, judge them "
+            "yourself before writing about one). Cross-check "
             "finalists with interest_over_time; seeds[].trend.direction_now is the "
             "recent slope over the last 12 months. score / score_breakdown rank within "
             "this call only (see score_note)."
@@ -273,13 +277,7 @@ def discover_topics(
         v.limit_note(max_per_seed, per_seed, name="max_per_seed"),
         f"site_queries truncated to {v.MAX_SITE_QUERIES}; {site_dropped} dropped." if site_dropped else None,
         f"{covered_dropped} covered topic(s) removed (exclude_covered=true)." if covered_dropped else None,
-        (
-            f"{len(filtered_out)} rising queries looked unrelated to the seeds and were moved to "
-            "filtered_out; pass category= (e.g. 5, Computers & Electronics) to narrow Google's "
-            "related queries."
-        )
-        if len(filtered_out) >= OFF_TOPIC_NOTE_MIN
-        else None,
+        _off_topic_note(len(filtered_out), cat) if len(filtered_out) >= OFF_TOPIC_NOTE_MIN else None,
     ]
     notes = [n for n in notes if n]
     if notes:
@@ -287,6 +285,20 @@ def discover_topics(
     if ambiguous_seeds:
         out["ambiguous_seeds"] = ambiguous_seeds
     return out
+
+
+def _off_topic_note(count: int, category: int) -> str:
+    """The category hint only makes sense when no category was passed (issue 11)."""
+    if category:
+        return (
+            f"{count} related queries looked unrelated to the seeds even within this category "
+            f"({category}) and were moved to filtered_out; scan it before dismissing them."
+        )
+    return (
+        f"{count} related queries looked unrelated to the seeds and were moved to "
+        "filtered_out; pass category= (e.g. 5, Computers & Electronics) to narrow Google's "
+        "related queries."
+    )
 
 
 def _merge(candidates: dict[str, dict[str, Any]], cand: dict[str, Any]) -> None:
