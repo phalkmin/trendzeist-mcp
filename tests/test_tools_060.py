@@ -265,15 +265,15 @@ def test_aeo_opportunities_skips_check_when_cooling():
 
 def test_trend_history_no_longer_double_counts_across_seeds(tmp_path):
     client = ArchiveClient(tmp_path)
-    _seed_archive(client.archive, "coffee", "", 5, top=[], rising=[("cold brew", "breakout")])
-    _seed_archive(client.archive, "iced coffee", "", 4, top=[], rising=[("cold brew", "breakout")])
+    _seed_archive(client.archive, "coffee", "", 5, top=["cold brew"], rising=[("cold brew", "breakout")])
+    _seed_archive(client.archive, "iced coffee", "", 4, top=["cold brew"], rising=[("cold brew", "breakout")])
     assert tools.trend_history(client, "cold brew")["breakout_episodes"] == 1
 
 
 def test_episodes_under_two_seeds_weeks_apart_count_twice(tmp_path):
     client = ArchiveClient(tmp_path)
-    _seed_archive(client.archive, "coffee", "", 30, top=[], rising=[("cold brew", "breakout")])
-    _seed_archive(client.archive, "iced coffee", "", 9, top=[], rising=[("cold brew", "breakout")])
+    _seed_archive(client.archive, "coffee", "", 30, top=["cold brew"], rising=[("cold brew", "breakout")])
+    _seed_archive(client.archive, "iced coffee", "", 9, top=["cold brew"], rising=[("cold brew", "breakout")])
     assert tools.trend_history(client, "cold brew")["breakout_episodes"] == 2
 
 
@@ -306,7 +306,8 @@ def test_same_second_snapshots_keep_insertion_order(tmp_path):
     def rec(ts, breakout):
         with patch("trendzeist_mcp.archive._now", return_value=ts):
             c.archive.record_related(
-                "coffee", "", "today 3-m", [],
+                "coffee", "", "today 3-m",
+                [{"name": "cold brew", "value": 50}] if breakout else [],
                 [{"name": "cold brew", "value": 9000, "is_breakout": True}] if breakout else [],
             )
 
@@ -323,16 +324,16 @@ def test_overlapping_runs_under_new_seeds_are_one_episode(tmp_path):
     """Review F8: adding seeds to a live breakout must not manufacture recurrence."""
     c = ArchiveClient(tmp_path)
     for d in (50, 40, 30):
-        _seed_archive(c.archive, "coffee", "", d, top=[], rising=[("cold brew", "breakout")])
-    _seed_archive(c.archive, "tea", "", 40, top=[], rising=[("cold brew", "breakout")])
-    _seed_archive(c.archive, "matcha", "", 30, top=[], rising=[("cold brew", "breakout")])
+        _seed_archive(c.archive, "coffee", "", d, top=["cold brew"], rising=[("cold brew", "breakout")])
+    _seed_archive(c.archive, "tea", "", 40, top=["cold brew"], rising=[("cold brew", "breakout")])
+    _seed_archive(c.archive, "matcha", "", 30, top=["cold brew"], rising=[("cold brew", "breakout")])
     assert tools.recurring_topics(c, min_episodes=2)["topics"] == []
     assert tools.trend_history(c, "cold brew")["breakout_episodes"] == 1
     # ... but a genuinely separate run (gap > 7 days after the last breakout) still counts.
-    _seed_archive(c.archive, "coffee", "", 29, top=[], rising=[])
-    _seed_archive(c.archive, "tea", "", 29, top=[], rising=[])
-    _seed_archive(c.archive, "matcha", "", 29, top=[], rising=[])
-    _seed_archive(c.archive, "tea", "", 10, top=[], rising=[("cold brew", "breakout")])
+    _seed_archive(c.archive, "coffee", "", 29, top=["coffee maker"], rising=[])
+    _seed_archive(c.archive, "tea", "", 29, top=["coffee maker"], rising=[])
+    _seed_archive(c.archive, "matcha", "", 29, top=["coffee maker"], rising=[])
+    _seed_archive(c.archive, "tea", "", 10, top=["cold brew"], rising=[("cold brew", "breakout")])
     assert tools.trend_history(c, "cold brew")["breakout_episodes"] == 2
 
 
@@ -364,7 +365,8 @@ def test_malformed_stored_timestamp_type_is_reported_not_raised(tmp_path):
     # continuous run. No crash, and the result is still JSON-native.
     conn.execute(
         "UPDATE snapshots SET observed_at=? WHERE snapshot_id IN "
-        "(SELECT snapshot_id FROM observations WHERE kind='top_query')",
+        "(SELECT snapshot_id FROM observations WHERE kind='top_query') "
+        "AND snapshot_id NOT IN (SELECT snapshot_id FROM observations WHERE kind='rising_query')",
         (b"garbage",),
     )
     conn.commit()
@@ -386,7 +388,7 @@ def test_malformed_stored_timestamp_type_is_reported_not_raised(tmp_path):
 def _episodes(archive, seed, item, days_list):
     """A breakout of ``item`` under ``seed`` at each of ``days_list``, separated by gaps."""
     for d in days_list:
-        _seed_archive(archive, seed, "", d, top=[], rising=[(item, "breakout")])
+        _seed_archive(archive, seed, "", d, top=[item], rising=[(item, "breakout")])
         _seed_archive(archive, seed, "", d - 1, top=[item], rising=[])  # run ends
 
 
@@ -394,7 +396,7 @@ def test_recurring_topics_lists_items_with_enough_episodes(tmp_path):
     c = ArchiveClient(tmp_path)
     _episodes(c.archive, "coffee", "cold brew", [80, 50, 20])
     _episodes(c.archive, "coffee", "espresso tonic", [40, 10])
-    _seed_archive(c.archive, "tea", "", 60, top=[], rising=[("cold brew", "breakout")])  # 4th, under tea
+    _seed_archive(c.archive, "tea", "", 60, top=["cold brew"], rising=[("cold brew", "breakout")])  # 4th, under tea
     out = tools.recurring_topics(c)
     assert [t["topic"] for t in out["topics"]] == ["cold brew"]
     t = out["topics"][0]
@@ -409,8 +411,8 @@ def test_recurring_topics_lists_items_with_enough_episodes(tmp_path):
 def test_recurring_topics_merges_same_week_across_seeds(tmp_path):
     c = ArchiveClient(tmp_path)
     for seed, d in (("coffee", 30), ("iced coffee", 28), ("coffee", 10)):
-        _seed_archive(c.archive, seed, "", d, top=[], rising=[("cold brew", "breakout")])
-        _seed_archive(c.archive, seed, "", d - 1, top=[], rising=[])
+        _seed_archive(c.archive, seed, "", d, top=["cold brew"], rising=[("cold brew", "breakout")])
+        _seed_archive(c.archive, seed, "", d - 1, top=["coffee maker"], rising=[])
     out = tools.recurring_topics(c, min_episodes=2)
     assert out["topics"][0]["episodes"] == 2
 
@@ -418,7 +420,7 @@ def test_recurring_topics_merges_same_week_across_seeds(tmp_path):
 def test_recurring_topics_agrees_with_trend_history(tmp_path):
     c = ArchiveClient(tmp_path)
     _episodes(c.archive, "coffee", "cold brew", [80, 50, 20])
-    _seed_archive(c.archive, "tea", "", 49, top=[], rising=[("cold brew", "breakout")])
+    _seed_archive(c.archive, "tea", "", 49, top=["cold brew"], rising=[("cold brew", "breakout")])
     rt = tools.recurring_topics(c, min_episodes=2)["topics"][0]["episodes"]
     assert rt == tools.trend_history(c, "cold brew")["breakout_episodes"] == 3
 
@@ -484,9 +486,9 @@ def test_recurring_topics_empty_seed_list_means_no_filter(tmp_path):
 def test_restart_within_merge_window_under_one_seed_is_one_episode(tmp_path):
     """Pinned: the merge covers every start, same seed included (a 3-day flicker is noise)."""
     c = ArchiveClient(tmp_path)
-    _seed_archive(c.archive, "coffee", "", 10, top=[], rising=[("cold brew", "breakout")])
-    _seed_archive(c.archive, "coffee", "", 9, top=[], rising=[("cold brew", "rising")])
-    _seed_archive(c.archive, "coffee", "", 7, top=[], rising=[("cold brew", "breakout")])
+    _seed_archive(c.archive, "coffee", "", 10, top=["cold brew"], rising=[("cold brew", "breakout")])
+    _seed_archive(c.archive, "coffee", "", 9, top=["cold brew"], rising=[("cold brew", "rising")])
+    _seed_archive(c.archive, "coffee", "", 7, top=["cold brew"], rising=[("cold brew", "breakout")])
     assert tools.trend_history(c, "cold brew")["breakout_episodes"] == 1
 
 

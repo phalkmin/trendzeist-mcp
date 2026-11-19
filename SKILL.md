@@ -84,8 +84,8 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
   is `covered` (every question answered: refresh) / `partial` (some unanswered, see
   `coverage_counts`) / `gap` (new page); `matched` names the site query behind the
   verdict. Matching folds plurals and common abbreviations (mac/macos, wp/wordpress), but
-  still pass the raw query variants; a one-word head term inside a longer site query is
-  `partial`, not covered. `exclude_covered=true` drops only fully covered
+  still pass the raw query variants; any broader head term inside a longer, narrower site
+  query is `partial`, not covered. `exclude_covered=true` drops only fully covered
   clusters. Without `site_queries` the `gap` score component is neutral.
 - **Score.** Read `score_breakdown.<component>.reason`, not the number alone; compare
   within one call only. `momentum_seed` says which seed's trend fed a shared topic.
@@ -93,8 +93,8 @@ as MCP tools. No API key. Every result carries `schema_version` and `_meta`
   recurring topic, build a durable page (`breakout_observations` is just polling count).
 - **What keeps coming back?** `recurring_topics(geo, days=90, min_episodes=3)` (free,
   archive only) lists topics with repeated breakout episodes and the seeds they appeared
-  under. Two breakouts are only separable when a poll between them saw the topic *not*
-  breaking out, so counts are a lower bound; `coverage_days` + `note` say when the archive
+  under. Two breakouts are only separable when a non-empty poll between them saw the topic
+  *not* breaking out (empty responses are inconclusive), so counts are a lower bound; `coverage_days` + `note` say when the archive
   is younger than the window. Recurring is not big: check volume with `compare_keywords`.
 - Prompt `weekly_review(seeds, geo, site_queries)` runs this as a content meeting and
   outputs PUBLISH NOW / PLAN FOR <date> / REFRESH / RETIRE.

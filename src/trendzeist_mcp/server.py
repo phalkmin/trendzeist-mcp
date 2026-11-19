@@ -6,10 +6,11 @@ import logging
 import os
 import threading
 from functools import wraps
-from typing import Any, Callable
+from typing import Annotated, Any, Callable
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import Field
 
 from . import __version__, tools
 from . import formatters as fmt
@@ -128,18 +129,41 @@ def compare_keywords(
 
 @server.tool()
 def related_queries(
-    keyword: str,
-    timeframe: str = "today 3-m",
-    geo: str = "",
-    category: int = 0,
-    gprop: str = "",
-    limit: int = 25,
+    keyword: Annotated[str, Field(description="Search phrase or Google Trends entity mid.")],
+    timeframe: Annotated[
+        str,
+        Field(
+            description=(
+                "Trends window; default 'today 3-m'. Use a longer window for durable topics. "
+                "Also accepts 'now 1-H', 'now 4-H', 'now 1-d', 'now 7-d', 'today 1-m', "
+                "'today 12-m', 'today 5-y', 'all', or 'YYYY-MM-DD YYYY-MM-DD'."
+            )
+        ),
+    ] = "today 3-m",
+    geo: Annotated[
+        str,
+        Field(description="'' = worldwide; otherwise an ISO country ('US', 'BR') or region ('US-CA')."),
+    ] = "",
+    category: Annotated[
+        int,
+        Field(description="0 = all categories; use list_categories to find an ID that narrows results."),
+    ] = 0,
+    gprop: Annotated[
+        str,
+        Field(description="Search property: '' = web, or 'news', 'youtube', 'images', 'froogle' (Shopping)."),
+    ] = "",
+    limit: Annotated[
+        int,
+        Field(description="Items returned per top/rising list and the questions cap: 1-50; default 25."),
+    ] = 25,
 ) -> dict[str, Any]:
-    """Top and rising search queries related to a keyword. 'rising' includes %
-    growth and is_breakout (>5000%); every item carries a title `angle`, and
-    `questions` lists the question-shaped ones. Rising items flagged suspect=true look
-    like injected spam (one name across unrelated queries, or a domain) and are left
-    out of `questions`. Best single source of fresh blog angles."""
+    """Find fresh search-query angles for one keyword. Returns top and rising
+    searches with growth, breakout flags, title angles and question-shaped queries;
+    suspect or off-topic items are marked. Use related_topics for Knowledge-Graph
+    themes, suggest_keywords to disambiguate a term, mine_questions for broader
+    Autocomplete FAQ mining, and discover_topics for ranked multi-seed ideation.
+    Values are relative, not absolute search volume; validate finalists with
+    interest_over_time."""
     return _tool(tools.related_queries)(keyword, timeframe, geo, category, gprop, limit)
 
 
@@ -253,7 +277,7 @@ def aeo_opportunities(
     point). site_queries = queries the site already ranks for (fill from a Search
     Console MCP or page titles); clusters then carry coverage covered / partial / gap
     and exclude_covered drops covered ones. Spam-like rising queries are ignored.
-    Up to ~1+10 requests per seed; partial failures per source in `errors`. A seed
+    Up to 1 + 11 requests per seed; partial failures per source in `errors`. A seed
     report with 'ambiguous' names several Google entities (e.g. Apple the company vs
     the fruit): ask the user before writing, then re-run with a more specific phrase
     (a mid only works for Google Trends, not for News / Wikipedia / Autocomplete).

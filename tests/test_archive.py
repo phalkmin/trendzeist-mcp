@@ -183,6 +183,134 @@ def test_archive_errors_never_raise(tmp_path):
     assert a.status()["last_error"]
 
 
+def test_archive_failed_observation_write_rolls_back_snapshot(tmp_path):
+    a = Archive(tmp_path / "a.sqlite3")
+    conn = a._connect()
+    conn.execute(
+        "CREATE TRIGGER fail_observation BEFORE INSERT ON observations "
+        "WHEN NEW.item='explode' BEGIN SELECT RAISE(ABORT, 'forced observation failure'); END"
+    )
+    conn.commit()
+
+    a.begin_call()
+    failed = a.record_related(
+        "coffee", "", "today 3-m",
+        [{"name": "before failure", "value": 1}, {"name": "explode", "value": 2}], [],
+    )
+    assert failed is None and "write" in a.call_error()
+
+    conn.execute("DROP TRIGGER fail_observation")
+    good = a.record_related("coffee", "", "today 3-m", [{"name": "good", "value": 1}], [])
+    assert good is not None
+    assert [s["id"] for s in a.snapshots("coffee", "", GROUP_RELATED, "today 3-m")] == [good]
+    assert [(r[3], r[4]) for r in _rows(a)] == [("top_query", "good")]
+
+
+@pytest.mark.parametrize(
+    ("kind", "item", "status", "message"),
+    [
+        (b"top_query", "valid", None, "malformed stored text"),
+        ("top_query", b"valid", None, "malformed stored text"),
+        ("top_query", "valid", b"invalid", "invalid non-null status"),
+    ],
+)
+def test_archive_observations_skip_malformed_text_and_status(tmp_path, kind, item, status, message):
+    a = Archive(tmp_path / "a.sqlite3")
+    sid = a.record_related("coffee", "", "today 3-m", [], [])
+    conn = a._connect()
+    conn.execute(
+        "INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (sid, _ts(0), "", "coffee", "today 3-m", kind, item, None, 1, status),
+    )
+    conn.commit()
+
+    a.begin_call()
+    assert a.observations(sid) == []
+    assert message in a.last_error
+    assert a.call_error() == a.last_error
+
+
+def test_archive_observations_skip_malformed_numeric_fields(tmp_path):
+    a = Archive(tmp_path / "a.sqlite3")
+    sid = a.record_trend("coffee", "", "today 12-m", {
+        "available": True, "direction": "new", "direction_now": "rising", "growth_3m": 1,
+    })
+    conn = a._connect()
+    conn.executemany(
+        "INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?)",
+        [
+            (sid, _ts(0), "", "coffee", "today 12-m", kind, "bad", value, rank, None)
+            for kind, value, rank in [
+                ("top_query", "bad value", 1),
+                ("top_query", None, "bad rank"),
+                ("top_query", None, None),
+                ("rising_query", None, None),
+            ]
+        ],
+    )
+    conn.commit()
+
+    a.begin_call()
+    rows = a.observations(sid)
+    assert {r["kind"] for r in rows} == {"direction", "direction_now", "growth_3m"}
+    assert all(r["rank"] is None for r in rows)
+    assert "malformed numeric value/rank" in a.last_error
+    assert a.call_error() == a.last_error
+
+
+def test_archive_migrates_source_item_count_from_item_count(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE snapshots ("
+        "snapshot_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, grp TEXT NOT NULL, "
+        "seed TEXT NOT NULL, geo TEXT NOT NULL, timeframe TEXT NOT NULL, item_count INTEGER NOT NULL)"
+    )
+    observed_at = _ts(1)
+    conn.execute(
+        "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?)",
+        ("legacy", observed_at, GROUP_RELATED, "coffee", "", "today 3-m", 3),
+    )
+    conn.commit()
+    conn.close()
+
+    a = Archive(path)
+    assert a.snapshots("coffee", "", GROUP_RELATED, "today 3-m") == [{
+        "id": "legacy", "observed_at": observed_at, "item_count": 3, "source_item_count": 3,
+    }]
+
+
+def test_archive_related_source_count_distinguishes_filtered_from_empty(tmp_path):
+    a = Archive(tmp_path / "a.sqlite3")
+    a.record_related(
+        "filtered", "", "today 3-m",
+        [{"name": ""}, {"name": "off topic", "off_topic": True}],
+        [{"name": "suspect", "suspect": True}, {"name": "off topic", "off_topic": True}],
+    )
+    a.record_related("empty", "", "today 3-m", [], [])
+
+    filtered = a.snapshots("filtered", "", GROUP_RELATED, "today 3-m")[0]
+    empty = a.snapshots("empty", "", GROUP_RELATED, "today 3-m")[0]
+    assert (filtered["item_count"], filtered["source_item_count"]) == (0, 4)
+    assert (empty["item_count"], empty["source_item_count"]) == (0, 0)
+
+
+def test_archive_latest_and_baseline_exclude_future_snapshots(tmp_path):
+    a = Archive(tmp_path / "a.sqlite3")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    old = (now - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    current = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    future = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    s_old = related_at(a, old, "coffee", "", ["old"], [])
+    s_current = related_at(a, current, "coffee", "", ["current"], [])
+    related_at(a, future, "coffee", "", ["future"], [])
+
+    with patch("trendzeist_mcp.archive._now", return_value=current):
+        latest, baseline = a.latest_and_baseline("coffee", "", GROUP_RELATED, "today 3-m", 7)
+    assert latest["id"] == s_current
+    assert baseline["id"] == s_old
+
+
 # ---- integration with the Hub / tools ---------------------------------------
 
 
@@ -299,3 +427,28 @@ def test_rising_items_filters_kind_window_and_seeds(tmp_path):
     assert {r["kind"] for r in rows} == {"rising_query"}
     assert [r["item"] for r in a.rising_items("", 90, ["Coffee "])] == ["cold brew"]
     assert a.rising_items("US", 90) == []
+
+
+def test_archive_malformed_writer_values_never_raise(tmp_path):
+    archive = Archive(tmp_path / "archive.sqlite3")
+
+    assert archive.record_related("seed", "", "today 3-m", [{"name": 123}], []) is None
+    assert "write" in archive.last_error
+    assert archive.record_trending("US", [{"title": 123}]) is None
+    assert archive.record_questions("seed", "", [{"question": 123}]) is None
+
+
+def test_archive_history_skips_malformed_numeric_and_timestamp_values(tmp_path):
+    archive = Archive(tmp_path / "archive.sqlite3")
+    archive.record_related("seed", "", "today 3-m", [{"name": "topic", "value": 100}], [])
+    conn = archive._connect()
+    conn.execute("UPDATE observations SET rank='bad'")
+    conn.commit()
+
+    assert archive.history("topic", "", 30) == []
+    assert archive.call_error() is not None
+
+    conn.execute("UPDATE observations SET observed_at=X'80'")
+    conn.commit()
+    assert archive.first_seen("topic", "") is None
+    assert "first_seen" in archive.last_error

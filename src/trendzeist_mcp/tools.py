@@ -70,8 +70,10 @@ _COMPARISON_WORDS = frozenset({"vs", "versus", "or", "better", "difference", "al
 _LOCAL_PREFIXES: dict[str, tuple[tuple[str, str], ...]] = {
     "pt": (
         ("como", "how-to"), ("como fazer", "how-to"), ("por que", "how-to"),
-        ("o que é", "definition"), ("quando", "how-to"), ("onde", "how-to"),
-        ("qual", "comparison"), ("quanto custa", "how-to"), ("vale a pena", "verdict"),
+        ("o que é", "definition"), ("quais são", "definition"), ("quando", "how-to"),
+        ("onde", "how-to"), ("qual", "comparison"), ("quais", "comparison"),
+        ("quanto", "how-to"), ("quanta", "how-to"), ("quanto custa", "how-to"),
+        ("vale a pena", "verdict"),
         ("vs", "comparison"),
     ),
     "es": (
@@ -122,6 +124,20 @@ def question_prefixes(hl: str) -> tuple[str, tuple[str, ...]]:
     return lang, tuple(prefix for prefix, _ in table)
 
 
+def unsupported_language_note(hl: str) -> str | None:
+    """Explain the English fallback for locales without a question-prefix table."""
+    lang = (hl or "en").split("-")[0].lower()
+    if lang == "en" or lang in _LOCAL_PREFIXES:
+        return None
+    return (
+        f"No localised question prefixes for hl={hl}; the English set was used, so "
+        "expansions are English-biased even though Autocomplete ran in that language. "
+        "Pass a seed already phrased in the market's language. Localised sets exist for: "
+        + ", ".join(sorted(_LOCAL_PREFIXES))
+        + "."
+    )
+
+
 def composite_prefixes(hl: str, english: tuple[str, ...]) -> tuple[str, ...]:
     """A capped prefix set for composites, in the request language.
 
@@ -155,6 +171,23 @@ def _hl_for(hub: Hub, geo: str) -> str:
     settings = getattr(hub, "settings", None)
     hl_for = getattr(settings, "hl_for", None)
     return hl_for(geo) if callable(hl_for) else "en-US"
+
+
+def source_cooling_after(source: Any, exc: TrendsError) -> bool:
+    """Whether an error left the real source in an active post-429 cooldown."""
+    if not exc.rate_limited:
+        return False
+    retry_after = getattr(source, "retry_after", None)
+    return retry_after() is not None if callable(retry_after) else True
+
+
+def stop_reason_after(source: Any, exc: TrendsError) -> str | None:
+    """Why composite Google work should stop, or ``None`` when it may continue."""
+    if not exc.retryable:
+        return None
+    if not exc.rate_limited:
+        return "transport"
+    return "rate_limited" if source_cooling_after(source, exc) else None
 
 
 def _query_meta(
@@ -215,13 +248,26 @@ def fetch_recording(hub: Hub, fetch: Callable[[], T], record: Callable[[T], Any]
 
 
 def _record_trend_summaries(
-    hub: Hub, summary: dict[str, Any], geo: str, timeframe: str, category: int, gprop: str
+    hub: Hub,
+    summary: dict[str, Any],
+    geo: str,
+    timeframe: str,
+    category: int,
+    gprop: str,
+    warnings: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Archive one trend snapshot per keyword; only plain web / all-category series."""
+    """Archive readable trend labels from plain web / all-category series."""
     if category or gprop:
         return
+    flattened = {
+        kw
+        for warning in warnings or []
+        if warning.get("type") == "flattened"
+        for kw in warning.get("shared_by", [])
+    }
     for kw, s in summary.items():
-        hub.archive.record_trend(kw, geo, timeframe, s)
+        if kw not in flattened:
+            hub.archive.record_trend(kw, geo, timeframe, s)
 
 
 def _common(timeframe: str, geo: str, category: int, gprop: str) -> tuple[str, str, int, str]:
@@ -271,7 +317,9 @@ def fetch_trend(
         lambda: fmt.interest_over_time(
             hub.trends.interest_over_time(kws, tf, g, cat, gp), kws, max_points=max_points
         ),
-        lambda out: _record_trend_summaries(hub, out["summary"], g, tf, cat, gp),
+        lambda out: _record_trend_summaries(
+            hub, out["summary"], g, tf, cat, gp, out.get("warnings", [])
+        ),
     )
 
 
@@ -298,8 +346,8 @@ def fetch_related(
         res = hub.trends.related_queries(kw, tf, g, cat, gp)
         top = fmt.related_list(res.get("top"), None, label="query")
         rising = fmt.mark_breakouts(fmt.related_list(res.get("rising"), None, label="query"))
-        fmt.flag_suspects(rising, top, kw)
         fmt.flag_off_topic(rising, top, kw, context)
+        fmt.flag_suspects(rising, top, kw)
         return top, rising
 
     def record(pair: tuple[list[dict[str, Any]], list[dict[str, Any]]]) -> None:
@@ -378,9 +426,11 @@ def related_queries(
     kw = v.validate_keyword(keyword)
     tf, g, cat, gp = _common(timeframe, geo, category, gprop)
     lim = v.validate_limit(limit, default=25, maximum=50)
+    lang, _ = question_prefixes(_hl_for(hub, g))
+    local_angles = _local_angles(lang)
     top, rising = fetch_related(hub, kw, tf, g, cat, gp, lim)
-    fmt.tag_angles(top)
-    fmt.tag_angles(rising)
+    fmt.tag_angles(top, local_angles=local_angles)
+    fmt.tag_angles(rising, local_angles=local_angles)
     clean_top, off_top = fmt.split_off_topic(top)
     clean_rising, suspects = fmt.split_suspects(rising)
     clean_rising, off_rising = fmt.split_off_topic(clean_rising)
@@ -389,7 +439,9 @@ def related_queries(
         "query": _query_meta(hub, [kw], tf, g, cat, gp),
         "top": top,
         "rising": rising,
-        "questions": fmt.extract_questions(("rising", clean_rising), ("top", clean_top), limit=lim),
+        "questions": fmt.extract_questions(
+            ("rising", clean_rising), ("top", clean_top), limit=lim, local_angles=local_angles
+        ),
         "available": bool(top or rising),
         "notes": {
             "top": "value = relative popularity 0-100 among related searches",
@@ -540,10 +592,13 @@ AMBIGUITY_HL_NOTE = (
 AMBIGUITY_SKIPPED_NOTE = "Entity ambiguity check skipped: rate limited earlier in this call."
 
 
-def note_ambiguity_skipped(report: dict[str, Any]) -> None:
-    """Composites call this instead of :func:`flag_ambiguity` while cooling down, so a
-    seed report that lost its ``ambiguous`` field between two runs says why."""
-    report["ambiguity_note"] = AMBIGUITY_SKIPPED_NOTE
+def note_ambiguity_skipped(report: dict[str, Any], reason: str = "rate_limited") -> None:
+    """Explain why a composite skipped the entity-ambiguity enrichment."""
+    report["ambiguity_note"] = (
+        AMBIGUITY_SKIPPED_NOTE
+        if reason == "rate_limited"
+        else "Entity ambiguity check skipped: an upstream request failed earlier in this call."
+    )
 
 
 def flag_ambiguity(
@@ -601,9 +656,10 @@ def trending_now(
     g = v.validate_geo(geo) or "US"
     arts = v.validate_limit(max_articles, default=3, maximum=10) if max_articles else 0
     flt = v.validate_topic_filter(topic_filter)
+    fetch_articles = 10 if flt else arts
     items = fetch_recording(
         hub,
-        lambda: hub.trends.trending_rss(g, arts),
+        lambda: hub.trends.trending_rss(g, fetch_articles),
         lambda items: hub.archive.record_trending(
             g, [{"title": it.get("title"), "traffic": it.get("traffic")} for it in items]
         ),
@@ -690,11 +746,14 @@ def mine_questions(
         lang = "custom"
     localised = lang not in ("en", "custom")
     local_angles = _local_angles(lang)
-    # Question words anywhere in a completion count for a localised language: for the
-    # bare seed Google puts them *after* the seed ("wakacje składkowe do kiedy").
+    # Question forms may appear after a bare seed ("wakacje ... do kiedy").
+    # Ambiguous one-word forms only count at the completion's start.
+    midquery_prefixes = [
+        p for p in local_angles if " " in p or p not in {"como", "come", "wie"}
+    ]
     local_q_re = (
-        re.compile(r"\b(" + "|".join(re.escape(p) for p in sorted(local_angles, key=len, reverse=True)) + r")\b")
-        if local_angles
+        re.compile(r"\b(" + "|".join(re.escape(p) for p in sorted(midquery_prefixes, key=len, reverse=True)) + r")\b")
+        if midquery_prefixes
         else None
     )
 
@@ -706,13 +765,15 @@ def mine_questions(
     prefixes_done: list[str] = []
     # Spread the budget across prefixes so a small limit still yields a mix of
     # angles instead of ten "how to ..." variants from the first request.
-    per_prefix = max(3, math.ceil(lim / len(prefixes)))
+    per_prefix = max(3, math.ceil(lim / max(1, len(prefixes))))
     # The seed must survive as whole words: Autocomplete completes an unfinished
     # last token ("wordpress ai" -> "wordpress airplay"), which is off-topic.
     seed_re = re.compile(rf"\b{re.escape(_fold(kw))}s?\b")
     seed_tokens = set(_fold(kw).split())
 
-    def absorb(prefix: str, suggestions: list[str]) -> None:
+    fresh_questions: set[str] = set()
+
+    def absorb(prefix: str, suggestions: list[str], fresh: bool) -> None:
         taken = 0
         for position, text in enumerate(suggestions, 1):
             if taken >= per_prefix:
@@ -723,6 +784,8 @@ def mine_questions(
             if not norm:
                 continue
             if norm in seen:
+                if fresh:
+                    fresh_questions.add(norm)
                 # A second prefix is evidence people type it; a duplicate in one answer is not.
                 if prefix not in hit_prefixes[norm]:
                     hit_prefixes[norm].add(prefix)
@@ -787,13 +850,10 @@ def mine_questions(
             hit_prefixes[norm] = {prefix}
             taken += 1
             questions.append(entry)
+            if fresh:
+                fresh_questions.add(norm)
 
-    stopped = False
-    fetched_fresh = False
-
-    def mark_fresh(_: Any) -> None:
-        nonlocal fetched_fresh
-        fetched_fresh = True
+    stopped_reason: str | None = None
 
     for prefix in ("", *prefixes):
         if len(questions) >= lim:
@@ -801,23 +861,31 @@ def mine_questions(
         # Trailing space: ask Google for the *next* word instead of completing the
         # seed's last token.
         query = f"{prefix} {kw} ".lstrip() if prefix != "vs" else f"{kw} vs "
+        request_fresh = False
+
+        def mark_fresh(_: Any) -> None:
+            nonlocal request_fresh
+            request_fresh = True
+
         try:
             absorb(
                 prefix,
                 fetch_recording(hub, lambda: hub.autocomplete.suggest(query, g), mark_fresh),
+                request_fresh,
             )
             prefixes_done.append(prefix or "(seed)")
         except TrendsError as exc:
             errors.append({"prefix": prefix or "(seed)", "error": str(exc)})
-            if exc.retryable:
-                stopped = True
+            stopped_reason = stop_reason_after(hub.autocomplete, exc)
+            if stopped_reason:
                 break
 
     # Most real-looking first; ties keep Autocomplete's order (stable sort).
     questions.sort(key=lambda q: -q["score"])
     questions = questions[:lim]
-    if fetched_fresh and questions and getattr(hub, "archive", None) is not None:
-        hub.archive.record_questions(kw, g, questions)
+    fresh = [q for q in questions if _fold(q["question"]) in fresh_questions]
+    if fresh and getattr(hub, "archive", None) is not None:
+        hub.archive.record_questions(kw, g, fresh)
     by_angle: dict[str, int] = {}
     for q in questions:
         by_angle[q["angle"]] = by_angle.get(q["angle"], 0) + 1
@@ -843,18 +911,20 @@ def mine_questions(
             "primary source; news: dated publisher quotes)."
         ),
     }
-    if stopped:
+    if stopped_reason:
+        out["partial_reason"] = stopped_reason
+        cause = (
+            "Google is rate limiting"
+            if stopped_reason == "rate_limited"
+            else "a Google request failed"
+        )
         out["partial"] = (
-            "Expansion stopped early because Google is rate limiting; results above "
+            f"Expansion stopped early because {cause}; results above "
             "are complete for the prefixes listed in prefixes_queried."
         )
-    if lang == "en" and not hl.lower().startswith("en"):
-        out["language_note"] = (
-            f"No localised question prefixes for hl={hl}; the English set was used, so "
-            "expansions are English-biased even though Autocomplete ran in that language. "
-            "Pass a seed already phrased in the market's language, or pass your own "
-            "prefixes. Localised sets exist for: " + ", ".join(sorted(_LOCAL_PREFIXES)) + "."
-        )
+    language_note = unsupported_language_note(hl) if lang == "en" else None
+    if language_note:
+        out["language_note"] = language_note
     if not questions and not errors:
         out["reason"] = (
             "Autocomplete produced no question-shaped suggestions for this seed. Try a "
@@ -1032,17 +1102,17 @@ def compare_channels(
     channels: dict[str, dict[str, Any]] = {}
     skipped: list[str] = []
     errors: list[dict[str, str]] = []
-    cooling = False
+    stop_reason: str | None = None
     for gprop, name in fmt.CHANNELS:
-        if cooling:
+        if stop_reason:
             skipped.append(name)
             continue
         try:
             summary = fetch_trend(hub, [kw], tf, g, 0, gprop)["summary"].get(kw, {"available": False})
         except TrendsError as exc:
             errors.append({"step": f"interest_over_time:{name}", "error": str(exc)})
-            if exc.retryable:
-                cooling = True
+            stop_reason = stop_reason_after(hub.trends, exc)
+            if stop_reason:
                 skipped.append(name)
             continue
         block: dict[str, Any] = {"available": bool(summary.get("available"))}
@@ -1095,10 +1165,18 @@ def compare_channels(
         ),
     }
     if skipped:
-        out["partial"] = (
-            "Google started rate limiting during this call; channels listed in skipped were not "
-            "fetched. Retry in ~60 s for the missing ones."
-        )
+        if stop_reason == "rate_limited":
+            retry_after = getattr(hub.trends, "retry_after", None)
+            seconds = retry_after() if callable(retry_after) else 60
+            wait = f"~{max(1, round(seconds))} s" if seconds is not None else "later"
+            out["partial"] = (
+                "Google started rate limiting during this call; channels listed in skipped were not "
+                f"fetched. Retry in {wait} for the missing ones."
+            )
+        else:
+            out["partial"] = (
+                "A Google request failed during this call; channels listed in skipped were not fetched."
+            )
     if not channels:
         out["reason"] = "No channel returned data; see errors."
     return out
@@ -1143,11 +1221,35 @@ def _clean_snapshot_rows(
         for r in rows
         if r["kind"] == "rising_query"
     ]
-    fmt.flag_suspects(rising, top, seed)
     fmt.flag_off_topic(rising, top, seed, context)
+    fmt.flag_suspects(rising, top, seed)
     junk = {id(it["_row"]) for it in top + rising if it.get("suspect") or it.get("off_topic")}
     kept = [r for r in rows if id(r) not in junk]
     return kept, len(rows) - len(kept)
+
+
+def _clean_archived_item_rows(
+    archive: Any,
+    rows: list[dict[str, Any]],
+    *,
+    context: Iterable[str] = (),
+    memo: dict[str, set[tuple[str, str]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Filter item history using each complete snapshot's current cleanup rules."""
+    clean_by_snapshot = memo if memo is not None else {}
+    targets: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        targets.setdefault(row["snapshot_id"], []).append(row)
+    for snapshot_id, item_rows in targets.items():
+        if snapshot_id not in clean_by_snapshot:
+            full = archive.observations(snapshot_id)
+            cleaned, _ = _clean_snapshot_rows(full, item_rows[0]["seed"], context)
+            clean_by_snapshot[snapshot_id] = {(r["kind"], r["item"]) for r in cleaned}
+    return [
+        row
+        for row in rows
+        if (row["kind"], row["item"]) in clean_by_snapshot[row["snapshot_id"]]
+    ]
 
 
 def _seed_changes(
@@ -1174,6 +1276,11 @@ def _seed_changes(
         if oldest["id"] == latest["id"]:
             # First run: no comparison yet, but the current state is still actionable.
             report["first_run"] = True
+            rows, filtered = _clean_snapshot_rows(
+                archive.observations(latest["id"]), seed, context
+            )
+            if filtered:
+                report["first_run_filtered"] = filtered
             report["first_seen"] = [
                 {
                     "topic": r["item"],
@@ -1182,7 +1289,7 @@ def _seed_changes(
                     "action": (ACTION_INVESTIGATE if r["status"] == "breakout" else ACTION_CONSIDER)
                     + " (no history yet)",
                 }
-                for r in archive.observations(latest["id"])
+                for r in rows
                 if r["kind"] == "rising_query"
             ]
             return report
@@ -1201,20 +1308,34 @@ def _seed_changes(
     base_rows = archive.observations(baseline["id"])
     report["current_items"] = latest["item_count"]
     report["baseline_items"] = baseline["item_count"]
-    if latest["item_count"] == 0 or baseline["item_count"] == 0:
-        # One side is an empty answer from Google: comparing would call everything
-        # new or dropped. Say so instead.
-        side = "current" if latest["item_count"] == 0 else "baseline"
+    if len(now_rows) != latest["item_count"] or len(base_rows) != baseline["item_count"]:
         report["reason"] = (
-            f"The {side} snapshot has no related queries (Google returned nothing); no "
-            "comparison is possible. If this persists, search volume for the seed has fallen "
-            "below Google's threshold."
+            "A snapshot contained malformed rows and is incomplete; no comparison is possible. "
+            "See _meta.archive_error."
         )
         return report
-    now_rows, _ = _clean_snapshot_rows(now_rows, seed, context)
+    now_rows, current_filtered = _clean_snapshot_rows(now_rows, seed, context)
     base_rows, base_filtered = _clean_snapshot_rows(base_rows, seed, context)
+    if current_filtered:
+        report["current_filtered"] = current_filtered
     if base_filtered:
         report["baseline_filtered"] = base_filtered
+    if not now_rows or not base_rows:
+        # Comparing an empty usable side would call everything new or dropped.
+        side = "current" if not now_rows else "baseline"
+        snap = latest if side == "current" else baseline
+        source_count = snap.get("source_item_count", snap["item_count"])
+        detail = (
+            "no related queries left after spam / off-topic filtering"
+            if source_count
+            else "no related queries (Google returned nothing)"
+        )
+        report["reason"] = f"The {side} snapshot has {detail}; no comparison is possible."
+        if not source_count:
+            report["reason"] += (
+                " If this persists, search volume for the seed has fallen below Google's threshold."
+            )
+        return report
 
     now_rising = {r["item"]: r for r in now_rows if r["kind"] == "rising_query"}
     base_rising = {r["item"]: r for r in base_rows if r["kind"] == "rising_query"}
@@ -1343,24 +1464,34 @@ def what_changed(
         return out
 
     # Refresh current data through the normal (recording) paths first.
-    cooling = False
+    stop_reason: str | None = None
     try:
         fetch_trend(hub, kws, TREND_TIMEFRAME, g)
     except TrendsError as exc:
         out["errors"].append({"step": "interest_over_time", "error": str(exc)})
     for seed in kws:
-        if not cooling:
+        if not stop_reason:
             try:
-                fetch_related(hub, seed, RELATED_TIMEFRAME, g, 0, "", 25)
+                fetch_related(
+                    hub,
+                    seed,
+                    RELATED_TIMEFRAME,
+                    g,
+                    0,
+                    "",
+                    25,
+                    context=[s for s in kws if s != seed],
+                )
             except TrendsError as exc:
                 out["errors"].append({"step": f"related_queries:{seed}", "error": str(exc)})
-                cooling = cooling or exc.retryable
+                stop_reason = stop_reason_after(hub.trends, exc)
         out["seeds"].append(
             _seed_changes(hub, archive, seed, g, days, context=[s for s in kws if s != seed])
         )
     out["available"] = any("counts" in s for s in out["seeds"])
-    if cooling:
-        out["partial"] = "Google rate limited this call; comparisons use the newest stored snapshot."
+    if stop_reason:
+        cause = "Google rate limited" if stop_reason == "rate_limited" else "A Google request failed"
+        out["partial"] = f"{cause} this call; comparisons use the newest stored snapshot."
     note = v.limit_note(since_days, days, name="since_days")
     if note:
         out["note"] = note
@@ -1376,14 +1507,16 @@ def _pair_episode_runs(
     """``(start, last_seen)`` of each breakout run for an item under one (seed, timeframe).
 
     ``rows`` are this item's rising rows under the pair; ``all_snapshots`` are every
-    related snapshot of that pair in the window, **chronological** (a snapshot where
-    the item is not a breakout ends the run). Polling the same breakout three times
-    is one run.
+    related snapshot of that pair in the window, **chronological**. A non-empty
+    snapshot where the item is not a breakout ends the run; an empty response is
+    inconclusive. Polling the same breakout three times is one run.
     """
     breakout_ids = {r["snapshot_id"] for r in rows if r["status"] == "breakout"}
     runs: list[tuple[str, str]] = []
     inside = False
     for snap in all_snapshots:
+        if snap.get("source_item_count", snap.get("item_count", 1)) == 0:
+            continue
         is_breakout = snap["id"] in breakout_ids
         if is_breakout:
             if inside:
@@ -1475,6 +1608,9 @@ def trend_history(hub: Hub, keyword: str, geo: str = "", days: int = 90) -> dict
     key = fmt.normalise_query(kw)
     as_seed = [r for r in rows if r["seed"] == key]
     as_item = [r for r in rows if r["item"] == key and r["seed"] != key]
+    as_item = _clean_archived_item_rows(
+        archive, as_item, context=sorted({r["seed"] for r in as_item})
+    )
 
     # One timeline per timeframe: a 5-y label and a 12-m label on the same day are
     # different facts, not the same fact twice.
@@ -1581,11 +1717,16 @@ def recurring_topics(
         for r in rows:
             by_item.setdefault(r["item"], []).append(r)
         topics = []
+        cleanup_memo: dict[str, set[tuple[str, str]]] = {}
+        context = sorted({r["seed"] for r in rows})
         for item, item_rows in by_item.items():
             # Cheap pre-filter: fewer breakout observations than episodes wanted can
             # never qualify, and never needs the snapshot headers.
             if sum(1 for r in item_rows if r["status"] == "breakout") < me:
                 continue
+            item_rows = _clean_archived_item_rows(
+                archive, item_rows, context=context, memo=cleanup_memo
+            )
             starts = _episode_starts(item_rows, snapshots_for)
             if len(starts) < me:
                 continue

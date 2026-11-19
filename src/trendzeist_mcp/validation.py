@@ -33,8 +33,8 @@ _RELATIVE_TIMEFRAMES: frozenset[str] = frozenset(
 )
 _DATE_RANGE_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{4}-\d{2}-\d{2}$")
 _GEO_RE = re.compile(r"^[A-Z]{2}(-[A-Z0-9]{1,3})?$")
-# Wikipedia subdomains: 'en', 'pt', 'zh-yue', 'simple', 'be-tarask' ... (2-12 chars).
-_LANG_RE = re.compile(r"^[a-z]{2,10}(-[a-z]{2,8})?$")
+# Wikipedia subdomains: 'en', 'zh-yue', 'zh-min-nan', 'be-tarask' ...
+_LANG_RE = re.compile(r"^[a-z]{2,10}(?:-[a-z]{2,10})*$")
 
 
 class ValidationError(ValueError):
@@ -123,7 +123,7 @@ def validate_lang(lang: str) -> str:
     if not isinstance(lang, str):
         raise ValidationError("lang must be a string")
     code = lang.strip().lower()
-    if not code or len(code) > 12 or not _LANG_RE.match(code):
+    if not code or len(code) > 20 or not _LANG_RE.match(code):
         raise ValidationError(
             "invalid lang. Use a Wikipedia language edition code such as 'en', 'pt', "
             "'de', 'zh-yue' or 'simple'"

@@ -91,7 +91,7 @@ class FakeClient:
         query = query.strip()  # the tool sends a trailing space (10.3); the fake ignores it
         self.calls.append(("ac", query, geo))
         if query in self.autocomplete_fail:
-            raise TrendsError("429", retryable=True)
+            raise TrendsError("429", retryable=True, rate_limited=True)
         if query == "espresso":  # bare seed: mixed suggestions
             return ["espresso machine", "how to make espresso", "what is espresso"]
         return [
@@ -112,7 +112,7 @@ class FakeClient:
     def related_queries(self, kw, tf, geo, cat, gprop):
         self.calls.append(("rq", kw))
         if kw == self.fail_seed:
-            raise TrendsError("rate limited", retryable=True)
+            raise TrendsError("rate limited", retryable=True, rate_limited=True)
         return {
             "top": pd.DataFrame({"query": [f"{kw} machine", "shared topic"], "value": [100, 40]}),
             "rising": pd.DataFrame(
@@ -499,31 +499,33 @@ def test_discover_topics_rate_limit_still_serves_cached_seeds():
     assert any(t["source_seeds"] == ["latte"] for t in out["topics"])
 
 
-def test_discover_topics_iot_rate_limit_still_tries_related_queries():
-    """10.5: the trend step is enrichment; its 429 must not kill the main output."""
-
+def test_discover_topics_iot_rate_limit_skips_uncached_related_queries():
     class IotFails(FakeClient):
         def interest_over_time(self, keywords, tf, geo, cat, gprop):
-            raise TrendsError("429", retryable=True)
+            raise TrendsError("429", retryable=True, rate_limited=True)
 
     client = IotFails()
     out = discover_topics(client, ["espresso", "latte"])
+    assert out["errors"][0] == {"step": "interest_over_time", "error": "429"}
+    assert [c for c in client.calls if c[0] == "rq"] == []
+    assert all(s["trend"] == {"available": False} and "skipped" in s for s in out["seeds"])
+    assert out["topics"] == []
+
+
+def test_discover_topics_iot_rate_limit_still_serves_cached_related_queries():
+    class IotFailsWithCache(FakeClient):
+        def interest_over_time(self, keywords, tf, geo, cat, gprop):
+            raise TrendsError("429", retryable=True, rate_limited=True)
+
+        def has_cached_related_queries(self, kw, tf, geo, cat, gprop):
+            return True
+
+    client = IotFailsWithCache()
+    out = discover_topics(client, ["espresso", "latte"])
     assert out["errors"] == [{"step": "interest_over_time", "error": "429"}]
     assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso"), ("rq", "latte")]
-    assert all(s["trend"] == {"available": False} and "skipped" not in s for s in out["seeds"])
+    assert all("skipped" not in s for s in out["seeds"])
     assert out["counts"]["breakout"] == 2
-
-
-def test_discover_topics_iot_then_related_429_enters_cooldown():
-    class BothFail(FakeClient):
-        def interest_over_time(self, keywords, tf, geo, cat, gprop):
-            raise TrendsError("429", retryable=True)
-
-    client = BothFail(fail_seed="espresso")
-    out = discover_topics(client, ["espresso", "latte", "mocha"])
-    assert [c for c in client.calls if c[0] == "rq"] == [("rq", "espresso")]
-    assert out["seeds"][1]["skipped"].endswith("Retry in ~60 s with 1-2 seeds.")
-    assert "skipped" in out["seeds"][2] and out["topics"] == []
 
 
 def test_discover_topics_trend_context_uses_12_months():
@@ -716,7 +718,7 @@ class AeoClient(FakeClient):
     def related_queries(self, kw, tf, geo, cat, gprop):
         self.calls.append(("rq", kw))
         if kw == self.fail_seed:
-            raise TrendsError("rate limited", retryable=True)
+            raise TrendsError("rate limited", retryable=True, rate_limited=True)
         return {
             "top": pd.DataFrame({"query": [f"what is {kw}", f"{kw} machine"], "value": [90, 50]}),
             "rising": pd.DataFrame(
@@ -799,18 +801,19 @@ def test_aeo_opportunities_scores_recent_slope_not_whole_window():
         assert m["points"] in (0, 10) and "falling" in m["reason"]  # only the breakout bonus survives
 
 
-def test_aeo_opportunities_iot_429_does_not_skip_seed_requests():
+def test_aeo_opportunities_iot_429_skips_google_but_keeps_wikipedia():
     class IotFails(AeoClient):
         def interest_over_time(self, keywords, tf, geo, cat, gprop):
-            raise TrendsError("429", retryable=True)
+            raise TrendsError("429", retryable=True, rate_limited=True)
 
     client = IotFails()
     out = aeo_opportunities(client, ["espresso"])
     kinds = [c[0] for c in client.calls]
-    assert kinds.count("rq") == 1 and "ac" in kinds and "news" in kinds
+    assert kinds.count("rq") == 0 and "ac" not in kinds and "news" not in kinds
+    assert "wiki_search" in kinds
     assert out["errors"] == [{"step": "interest_over_time", "error": "429"}]
-    assert "partial" not in out and "skipped" not in out["seeds"][0]
-    assert out["opportunities"][0]["trend"] == {"available": False}
+    assert "partial" in out and "skipped" in out["seeds"][0]
+    assert out["opportunities"] == []
 
 
 def test_aeo_opportunities_google_cooldown_keeps_wikipedia():

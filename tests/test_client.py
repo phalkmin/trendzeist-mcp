@@ -542,3 +542,27 @@ def test_suggestions_are_shaped_to_title_type_mid():
         {"title": "Apple", "type": "Fruit", "mid": "/m/1"},
         {"title": "Apple", "type": None, "mid": None},
     ]
+
+
+def test_geo_explore_does_not_leak_locale_into_suggestions_or_categories():
+    c = _client()
+    with patch("requests.get", return_value=_cookie_response()), patch.object(
+        TrendReq, "_get_tokens"
+    ):
+        c._explore(["cafe"], "today 3-m", "BR", 0, "")
+
+    languages = []
+    with patch.object(
+        TrendReq,
+        "suggestions",
+        side_effect=lambda keyword: languages.append(c._trend_req.hl) or [],
+    ):
+        c.suggestions("cafe")
+    with patch.object(
+        TrendReq,
+        "categories",
+        side_effect=lambda: languages.append(c._trend_req.hl) or {},
+    ):
+        c.categories()
+
+    assert languages == ["en-US", "en-US"]

@@ -122,7 +122,7 @@ def test_flag_suspects_domain_label_needs_two_or_more_tokens_to_link():
 def test_site_coverage_matches_near_variants():
     assert fmt.site_coverage("claude code mac", ["claude code macos"]) == ("covered", "claude code macos")
     assert fmt.site_coverage("claude code skill", ["claude code skills"]) == ("covered", "claude code skills")
-    assert fmt.site_coverage("wp mcp", ["wordpress mcp server"]) == ("covered", "wordpress mcp server")
+    assert fmt.site_coverage("wp mcp", ["wordpress mcp server"]) == ("partial", "wordpress mcp server")
     assert fmt.site_coverage("wordpress mcp", ["wordpress ai integration"]) == ("gap", None)
     # Jaccard threshold stays 0.6 (conservative): one shared token out of three is a gap.
     assert fmt.site_coverage("claude code mac setup", ["claude code macos"]) == ("partial", "claude code macos")

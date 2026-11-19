@@ -37,7 +37,7 @@ _ANGLE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
         "comparison",
         re.compile(
             r"\b(vs\.?|versus|compared?\s+to|comparison|difference\s+between|alternatives?\s+to"
-            r"|better\s+than|or)\b",
+            r"|better\s+than|or(?!\s+not\b))\b",
             re.I,
         ),
     ),
@@ -83,25 +83,61 @@ QUESTION_RE = re.compile(
 )
 
 
-def classify_angle(text: str | None) -> str | None:
-    """Tag a query/title with a content angle, or ``None`` when no rule matches."""
+def _local_angle(text: str, local_angles: dict[str, str] | None) -> str | None:
+    """Angle for a local prefix; only unambiguous multiword prefixes match mid-query."""
+    if not local_angles:
+        return None
+    folded = strip_accents(normalise_query(text))
+    for prefix, angle in sorted(local_angles.items(), key=lambda item: len(item[0]), reverse=True):
+        norm_prefix = strip_accents(normalise_query(prefix))
+        if not norm_prefix:
+            continue
+        if " " in norm_prefix:
+            if re.search(rf"\b{re.escape(norm_prefix)}\b", folded):
+                return angle
+        elif folded == norm_prefix or folded.startswith(norm_prefix + " "):
+            return angle
+    return None
+
+
+def classify_angle(
+    text: str | None, local_angles: dict[str, str] | None = None
+) -> str | None:
+    """Tag a query/title with a content angle, or ``None`` when no rule matches.
+
+    Local prefix mappings take precedence over the English rules.
+    """
     if not text:
         return None
+    local = _local_angle(text, local_angles)
+    if local is not None:
+        return local
     for angle, rule in _ANGLE_RULES:
         if rule.search(text):
             return angle
     return None
 
 
-def tag_angles(items: list[dict[str, Any]], key: str = "name") -> list[dict[str, Any]]:
+def tag_angles(
+    items: list[dict[str, Any]],
+    key: str = "name",
+    local_angles: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """Add ``angle`` to every item in place (from ``item[key]``)."""
     for it in items:
-        it["angle"] = classify_angle(it.get(key))
+        it["angle"] = classify_angle(it.get(key), local_angles)
     return items
 
 
-def is_question(text: str | None) -> bool:
-    return bool(text) and QUESTION_RE.match(text.strip()) is not None
+def is_question(text: str | None, local_angles: dict[str, str] | None = None) -> bool:
+    if not text:
+        return False
+    question_angles = {
+        prefix: angle
+        for prefix, angle in (local_angles or {}).items()
+        if strip_accents(normalise_query(prefix)) != "vs"
+    }
+    return QUESTION_RE.match(text.strip()) is not None or _local_angle(text, question_angles) is not None
 
 
 def normalise_query(text: str) -> str:
@@ -117,28 +153,32 @@ def strip_accents(text: str) -> str:
 
 
 def extract_questions(
-    *sources: tuple[str, list[dict[str, Any]]], limit: int
+    *sources: tuple[str, list[dict[str, Any]]],
+    limit: int,
+    local_angles: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Collect question-shaped queries from related lists.
 
     ``sources`` are ``(label, items)`` pairs in priority order (e.g. rising
-    before top). Duplicates are removed by normalised form; the first source
-    that mentions a question keeps it.
+    before top). Duplicates are removed by normalised form (accent-folded for localised
+    questions); the first source that mentions a question keeps it.
     """
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for source, items in sources:
         for it in items:
             name = (it.get("name") or "").strip()
-            if not is_question(name):
+            if not is_question(name, local_angles):
                 continue
             norm = normalise_query(name)
+            if local_angles:
+                norm = strip_accents(norm)
             if not norm or norm in seen:
                 continue
             seen.add(norm)
             entry: dict[str, Any] = {
                 "question": name,
-                "angle": classify_angle(name) or "how-to",
+                "angle": classify_angle(name, local_angles) or "how-to",
                 "source": source,
                 "value": it.get("value"),
             }
@@ -261,9 +301,10 @@ GROWTH_NOTE = (
 
 
 def _pct_change(before: float, after: float) -> float | None:
-    if before <= 0:
+    if not math.isfinite(before) or not math.isfinite(after) or before <= 0:
         return None  # growth from zero is undefined
-    return round(100.0 * (after - before) / before, 1)
+    change = 100.0 * (after - before) / before
+    return round(change, 1) if math.isfinite(change) else None
 
 
 def _growth_windows(series: pd.Series) -> dict[str, float | None]:
@@ -377,11 +418,11 @@ def detect_level_shifts(series: pd.Series) -> list[dict[str, Any]]:
     """
     vals = [float(x) for x in series.tolist()]
     n, w = len(vals), LEVEL_SHIFT_WINDOW
-    if n < 2 * w:
+    if n < 3 * w:
         return []
     windows = _window_means(vals, w)
     located: dict[int, float] = {}
-    for i in range(w, n - w + 1):
+    for i in range(2 * w, n - w + 1):
         shape = _step_shape_ok(vals, windows, i, w)
         if shape is None:
             continue
@@ -389,7 +430,7 @@ def detect_level_shifts(series: pd.Series) -> list[dict[str, Any]]:
         sign = 1.0 if change > 0 else -1.0
         if any(sign * (windows[j] - before) / before < LEVEL_SHIFT_HOLD for j in range(i + 1, n - w + 1)):
             continue  # reverted (or faded) later: not a sustained shift
-        prior = windows[i - 2 * w] if i >= 2 * w else before
+        prior = windows[i - 2 * w]
         if prior > 0 and abs(before - prior) / prior >= LEVEL_SHIFT_MIN_CHANGE:
             continue  # the "before" level is itself a jump (ramp or spike)
         k = _locate_step(vals, i, w, sign)
@@ -411,20 +452,20 @@ def shared_level_shifts(series_by_kw: dict[str, pd.Series]) -> list[dict[str, An
     """Weeks where two or more series step the same way: ``[{index, direction, keywords}]``.
 
     Looser than the per-series test on purpose (a shared step is evidence by itself):
-    a >= 30 % week-over-week change, :func:`_step_shape_ok`, and the next four points
-    on the new side. The rest of the series need not hold.
+    a >= 30 % week-over-week change, :func:`_step_shape_ok`, a steady prior level,
+    and the next four points on the new side. The rest of the series need not hold.
     """
     w = LEVEL_SHIFT_WINDOW
     prepared: dict[str, tuple[list[float], list[float]]] = {}
     for kw, series in series_by_kw.items():
         vals = [float(x) for x in series.tolist()]
-        if len(vals) >= 2 * w:
+        if len(vals) >= 3 * w:
             prepared[kw] = (vals, _window_means(vals, w))
     if len(prepared) < 2:
         return []
     n = min(len(vals) for vals, _ in prepared.values())
     found: dict[tuple[int, str], list[str]] = {}
-    for k in range(w, n - w + 1):
+    for k in range(2 * w, n - w + 1):
         for kw, (vals, windows) in prepared.items():
             prev = vals[k - 1]
             if prev <= 0 or abs(vals[k] - prev) / prev < LEVEL_SHIFT_MIN_CHANGE:
@@ -433,6 +474,9 @@ def shared_level_shifts(series_by_kw: dict[str, pd.Series]) -> list[dict[str, An
             if shape is None:
                 continue
             change, before, _after = shape
+            prior = windows[k - 2 * w]
+            if prior > 0 and abs(before - prior) / prior >= LEVEL_SHIFT_MIN_CHANGE:
+                continue
             sign = 1.0 if change > 0 else -1.0
             if sign * (vals[k] - prev) < 0:
                 continue
@@ -446,8 +490,12 @@ def shared_level_shifts(series_by_kw: dict[str, pd.Series]) -> list[dict[str, An
     ]
 
 
-def _shift_affects_growth(series: pd.Series, shift_date: Any) -> bool:
-    """True when the step falls inside the two windows growth_3m compares."""
+def _shift_affects_growth(
+    series: pd.Series, shift_date: Any, growth_3m: float | None
+) -> bool:
+    """True when growth_3m exists and its comparison windows span the step."""
+    if growth_3m is None:
+        return False
     if not isinstance(series.index, pd.DatetimeIndex):
         return True
     span = pd.Timedelta(days=2 * _GROWTH_WINDOWS["growth_3m"])
@@ -518,8 +566,9 @@ def level_shift_warnings(
                     "shared_by": kws,
                     "likely_artifact": shared,
                     "message": head
-                    + " growth_3m, direction and direction_now figures whose windows span that "
-                    "week overstate the change; read the curve on each side of it.",
+                    + " Direction and direction_now figures whose windows span that week may "
+                    "overstate the change; growth_3m is affected too when available. Read the "
+                    "curve on each side of it.",
                 }
             )
     out.sort(key=lambda w_: (str(w_["date"]), w_["direction"]))
@@ -548,6 +597,12 @@ def _insight(
     if direction == "insufficient_data":
         return f"Too few data points to judge the trend for '{kw}'."
     if direction == "no_interest":
+        if any(vals):
+            tail = f", peaking at {peak} on {peak_date}" if peak is not None and peak_date else ""
+            return (
+                f"Interest in '{kw}' rose from zero and returned to zero during the period"
+                f"{tail} (no_interest)."
+            )
         return f"'{kw}' shows no measurable search interest in this period."
     first, last = _thirds(vals)
     if first > 0:
@@ -598,11 +653,28 @@ def interest_over_time(
             summary[kw] = {"available": False}
             continue
         series = complete[kw]
+        if not isinstance(series, pd.Series):
+            summary[kw] = {"available": False}
+            continue
         stats_series = series
         if partial_flags is not None and int((~partial_flags).sum()) >= 3:
             stats_series = series[~partial_flags]
-        vals = [float(v) for v in stats_series.tolist()]
-        peak_idx = stats_series.idxmax() if len(stats_series) else None
+        clean: list[tuple[Any, float]] = []
+        for idx, value in stats_series.items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(number):
+                clean.append((idx, number))
+        stats_series = pd.Series(
+            [value for _, value in clean], index=[idx for idx, _ in clean], dtype=float
+        )
+        if stats_series.empty:
+            summary[kw] = {"available": False}
+            continue
+        vals = stats_series.tolist()
+        peak_idx = stats_series.idxmax()
         direction = _direction(vals)
         direction_now = _direction_now(vals)
         peak = _to_native(stats_series.max()) if len(stats_series) else None
@@ -642,7 +714,9 @@ def interest_over_time(
             continue
         for step in steps:
             step.pop("_index", None)
-            step["growth_affected"] = _shift_affects_growth(shift_series[kw], step["date"])
+            step["growth_affected"] = _shift_affects_growth(
+                shift_series[kw], step["date"], summary[kw]["growth_3m"]
+            )
             verb = "down" if (step["change_pct"] or 0) < 0 else "up"
             step["warning"] = (
                 f"Interest stepped {verb} {abs(step['change_pct'] or 0):g}% in the week of "
@@ -748,12 +822,12 @@ def flag_suspects(
     """Mark rising items that look like injected spam with ``suspect`` / ``suspect_reason``.
 
     A marker (2-3-token shingle) is suspicious when it is not part of the seed,
-    appears in at least three rising items, never appears in the top list, and the
-    items carrying it have little else in common. Domain-like items (``brand .com``)
-    are flagged on their own.
+    appears in at least three rising items, never appears in an on-topic top item,
+    and the items carrying it have little else in common. Domain-like items
+    (``brand .com``) are flagged on their own.
     """
     seed_tokens = set(normalise_query(seed).split())
-    top_text = " ".join(normalise_query(t.get("name") or "") for t in top)
+    top_text = " ".join(normalise_query(t.get("name") or "") for t in top if not t.get("off_topic"))
     tokens_by_idx: list[list[str]] = []
     carriers: dict[tuple[str, ...], list[int]] = {}
     for i, it in enumerate(rising):
@@ -1159,9 +1233,15 @@ def seasonality_profile(series: pd.Series, today: date | None = None) -> dict[st
     s = series.astype(float)
     years = s.index.year
     counts = s.groupby(years).count()
-    full_years = [
-        int(y) for y, n in counts.items() if n >= _FULL_YEAR_MIN_POINTS and s[years == y].sum() > 0
-    ]
+    full_years: list[int] = []
+    for y, n in counts.items():
+        year_s = s[years == y]
+        if (
+            n >= _FULL_YEAR_MIN_POINTS
+            and year_s.index.month.nunique() == 12
+            and year_s.sum() > 0
+        ):
+            full_years.append(int(y))
     out["years_analysed"] = len(full_years)
     # Profile, strength and index all come from the same full-year subset: a partial
     # year's four January weeks must not be able to overturn three complete years.
@@ -1267,9 +1347,29 @@ FORMAT_HINTS: dict[str, str] = {
 CHANNEL_NOISE_FLOOR = 5.0
 
 
+def _channel_eligible(channel: dict[str, Any]) -> bool:
+    return bool(
+        channel.get("available", True)
+        and (channel.get("mean", CHANNEL_NOISE_FLOOR) or 0) >= CHANNEL_NOISE_FLOOR
+        and channel.get("growth_3m") is not None
+    )
+
+
 def channel_insight(channels: dict[str, dict[str, Any]], fastest: str | None) -> str:
-    """One sentence comparing the fastest-growing channel with web search."""
+    """One sentence comparing eligible channels with sufficient interest and growth data."""
+    eligible = {name: channel for name, channel in channels.items() if _channel_eligible(channel)}
+    if fastest not in eligible:
+        fastest = max(eligible, key=lambda name: eligible[name]["growth_3m"]) if eligible else None
     if not fastest:
+        has_interest = any(
+            channel.get("available", True) and (channel.get("mean") or 0) >= CHANNEL_NOISE_FLOOR
+            for channel in channels.values()
+        )
+        if has_interest:
+            return (
+                "No channel with enough interest has growth_3m data, so channel momentum "
+                "cannot be compared; choose a format by audience fit and retry with a longer timeframe."
+            )
         return (
             "No channel shows enough interest (mean >= 5) to compare growth; the topic is "
             "too small or too new for a format decision."
@@ -1279,23 +1379,25 @@ def channel_insight(channels: dict[str, dict[str, Any]], fastest: str | None) ->
         return "n/a" if x is None else f"{x:+.0f}%"
 
     label = "Web search" if fastest == "web" else fastest.capitalize()
-    fg = channels[fastest].get("growth_3m") or 0.0
-    wg = (channels.get("web") or {}).get("growth_3m")
-    vs_web = "" if fastest == "web" else f" vs {pct(wg)} on web search"
+    fg = channels[fastest]["growth_3m"]
+    web = channels.get("web") or {}
+    wg = web.get("growth_3m") if _channel_eligible(web) else None
+    vs_web = "" if fastest == "web" or wg is None else f" vs {pct(wg)} on web search"
     hint = FORMAT_HINTS[fastest]
     # "Fastest" among declining channels is "declining least": say so, and do not
     # dress a shrinking topic up as a format opportunity.
     if fg <= -5:
         return (
-            f"Every channel is declining over the last quarter; {label} is falling least "
-            f"({pct(fg)}{vs_web}). This is a refresh / consolidation signal, not a launch "
-            f"signal; if you do publish, the least-bad format is a {hint}."
+            f"Every channel is declining over the last quarter among those with sufficient "
+            f"interest and growth data; {label} is falling least ({pct(fg)}{vs_web}). This is a "
+            f"refresh / consolidation signal, not a launch signal; if you do publish, the "
+            f"least-bad format is a {hint}."
         )
     if fg < 5:
         return (
-            f"No channel is growing meaningfully over the last quarter ({label} is flat at "
-            f"{pct(fg)}{vs_web}). Choose the format by audience fit rather than momentum; "
-            f"default: {hint}."
+            f"No channel is growing meaningfully over the last quarter among those with "
+            f"sufficient interest and growth data ({label} is flat at {pct(fg)}{vs_web}). "
+            f"Choose the format by audience fit rather than momentum; default: {hint}."
         )
     if fastest == "web":
         return f"Web search grows fastest ({pct(fg)} over the last quarter); lead with a {hint}."
@@ -1329,7 +1431,6 @@ def _site_tokens(text: str) -> set[str]:
 
 
 SITE_PREFIX_MIN = 6  # "automat"/"automation" match, "code"/"codex" do not; short variants use the synonym map
-SITE_COVERED_MIN_SHARE = 0.6  # a one-word head term inside a longer site query is not covered
 
 
 def _site_tokens_match(a: str, b: str) -> bool:
@@ -1347,9 +1448,9 @@ def _site_overlap(cand_tokens: set[str], site_tokens: set[str]) -> int:
 def site_coverage(candidate: str, site_queries: list[str]) -> tuple[str, str | None]:
     """``(covered | partial | gap, matched_site_query)`` for one candidate topic.
 
-    Tokens are normalised, plural-folded and synonym-mapped. covered: every candidate
-    token matches one site query and the candidate has 2+ words (or spans >= 60 % of
-    it); partial: a head term inside a longer query, or Jaccard >= 0.6; gap: the rest.
+    Tokens are normalised, plural-folded and synonym-mapped. covered: exact text or
+    token-equivalent variants; partial: a strict subset inside a longer site query,
+    or Jaccard >= 0.6; gap: the rest.
     """
     cand = normalise_query(candidate)
     if not cand or not site_queries:
@@ -1365,9 +1466,9 @@ def site_coverage(candidate: str, site_queries: list[str]) -> tuple[str, str | N
         toks = _site_tokens(norm)
         overlap = _site_overlap(cand_tokens, toks)
         if overlap == len(cand_tokens):
-            if len(cand_tokens) >= 2 or overlap / len(toks) >= SITE_COVERED_MIN_SHARE:
+            if len(cand_tokens) == len(toks):
                 return "covered", sq
-            jac = 1.0  # head term inside a longer query: partial at most
+            jac = 1.0  # strict subset inside a longer query: partial at most
         else:
             # Two candidate tokens can match one site token: cap so Jaccard stays <= 1.
             inter = min(overlap, len(toks))
@@ -1389,7 +1490,7 @@ SCORE_MAX: dict[str, int] = {"demand": 25, "momentum": 25, "freshness": 15, "gap
 SCORE_NOTE = (
     "score is a transparent 0-100 heuristic; score_breakdown gives points, max and the "
     "reason per component: demand 25 (questions found or top-query popularity), momentum 25 "
-    "(seed direction_now: rising 15 / stable or new 8 / falling 0 / unknown 5; +10 breakout, "
+    "(seed direction_now: rising 15 / stable or new 8 / falling or no_interest 0 / unknown 5; +10 breakout, "
     "+5 rising query), freshness 15 (Google News: 10 if covered this week, +5 if 10+ articles "
     "in 30 days; 0 when news was not fetched), gap 20 (vs. site_queries: gap 20 / partial 10 / "
     "covered 0; neutral 10 without site_queries), aeo 15 (question-shaped 5; definition angle "
@@ -1431,7 +1532,7 @@ def opportunity_score(
     else:
         parts["demand"] = _component(5, 25, "rising-only item: popularity unknown")
 
-    base = {"rising": 15, "stable": 8, "new": 8, "falling": 0}
+    base = {"rising": 15, "stable": 8, "new": 8, "falling": 0, "no_interest": 0}
     if direction_now in base:
         pts, why = base[direction_now], f"seed direction_now {direction_now}"
     else:

@@ -15,9 +15,17 @@ _SIGNAL_ORDER = {"breakout": 0, "rising": 1, "evergreen": 2}
 _DIRECTION_RANK = {"rising": 3, "new": 2, "stable": 2, "falling": 0, "no_interest": 0}
 # Seed trend context window; see aeo.TREND_TIMEFRAME for the rationale.
 TREND_TIMEFRAME = tools.TREND_TIMEFRAME
-SKIP_MESSAGE = (
-    "Not fetched: Google is rate limiting this session. Retry in ~60 s with 1-2 seeds."
-)
+
+
+def _skip_message(hub: Hub, reason: str = "rate_limited") -> str:
+    if reason == "transport":
+        return "Not fetched: a Google request failed earlier in this call. Retry with 1-2 seeds."
+    retry_after = getattr(hub.trends, "retry_after", None)
+    seconds = retry_after() if callable(retry_after) else 60
+    wait = f"~{max(1, round(seconds))} s" if seconds is not None else "later"
+    return f"Not fetched: Google is rate limiting this session. Retry in {wait} with 1-2 seeds."
+
+
 # From this many off-topic rising queries the note suggests narrowing with category=.
 OFF_TOPIC_NOTE_MIN = 2
 
@@ -60,20 +68,21 @@ def discover_topics(
     )
     per_seed = v.validate_limit(max_per_seed, default=15, maximum=50)
     site, site_dropped = v.validate_site_queries(site_queries)
+    lang, _ = tools.question_prefixes(tools._hl_for(hub, g))
+    local_angles = tools._local_angles(lang)
 
     candidates: dict[str, dict[str, Any]] = {}
     seed_reports: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     questions: list[dict[str, Any]] = []
-    question_keys: set[str] = set()
+    question_keys: dict[str, dict[str, Any]] = {}
     suspect: list[dict[str, Any]] = []
     filtered_out: list[dict[str, Any]] = []
     ambiguous_seeds: list[str] = []
 
-    # One interest_over_time call gives 12-month trend context for all seeds. It is
-    # enrichment only: a failure here does not start cooling down; a refused
-    # related_queries request does.
-    cooling_down = False
+    # One interest_over_time call gives 12-month trend context for all seeds. A real
+    # source enters cooldown after a 429, so only cached related queries can proceed.
+    stop_reason: str | None = None
     has_cache = getattr(hub.trends, "has_cached_related_queries", None)
 
     directions: dict[str, Any] = {}
@@ -81,16 +90,18 @@ def discover_topics(
         directions = tools.fetch_trend(hub, seeds, TREND_TIMEFRAME, g, cat, gp)["summary"]
     except TrendsError as exc:
         errors.append({"step": "interest_over_time", "error": str(exc)})
+        if tools.source_cooling_after(hub.trends, exc):
+            stop_reason = "rate_limited"
 
     for seed in seeds:
         report: dict[str, Any] = {"seed": seed, "trend": directions.get(seed, {"available": False})}
-        if cooling_down and not (callable(has_cache) and has_cache(seed, tf, g, cat, gp)):
-            report["skipped"] = SKIP_MESSAGE
-            errors.append({"step": f"related_queries:{seed}", "error": "skipped (rate limited)"})
+        if stop_reason and not (callable(has_cache) and has_cache(seed, tf, g, cat, gp)):
+            report["skipped"] = _skip_message(hub, stop_reason)
+            errors.append({"step": f"related_queries:{seed}", "error": f"skipped ({stop_reason})"})
             seed_reports.append(report)
             continue
-        if cooling_down:
-            tools.note_ambiguity_skipped(report)
+        if stop_reason:
+            tools.note_ambiguity_skipped(report, stop_reason)
         elif tools.flag_ambiguity(hub, seed, report, errors, geo=g):
             ambiguous_seeds.append(seed)
         try:
@@ -101,8 +112,7 @@ def discover_topics(
             report["error"] = str(exc)
             errors.append({"step": f"related_queries:{seed}", "error": str(exc)})
             seed_reports.append(report)
-            if exc.retryable:
-                cooling_down = True
+            stop_reason = tools.stop_reason_after(hub.trends, exc)
             continue
 
         rising, flagged = fmt.split_suspects(rising)
@@ -139,11 +149,19 @@ def discover_topics(
             report["suspect_count"] = len(flagged)
         if off_top or off_rising:
             report["off_topic_count"] = len(off_top) + len(off_rising)
-        for q in fmt.extract_questions(("rising", rising), ("top", top), limit=per_seed):
+        for q in fmt.extract_questions(
+            ("rising", rising), ("top", top), limit=per_seed, local_angles=local_angles
+        ):
             norm = fmt.normalise_query(q["question"])
-            if norm not in question_keys:
-                question_keys.add(norm)
-                questions.append({**q, "seed": seed})
+            if local_angles:
+                norm = fmt.strip_accents(norm)
+            if norm in question_keys:
+                if q.get("is_breakout"):
+                    question_keys[norm]["is_breakout"] = True
+                continue
+            entry = {**q, "seed": seed}
+            question_keys[norm] = entry
+            questions.append(entry)
         if not rising and not top:
             report["hint"] = (
                 "No related queries: search volume is too low for this seed. Try a "
@@ -188,7 +206,9 @@ def discover_topics(
     kept: list[dict[str, Any]] = []
     for c in ranked:
         c.pop("momentum", None)
-        c["angle"] = fmt.classify_angle(c["topic"]) or ("news" if c["signal"] == "breakout" else None)
+        c["angle"] = fmt.classify_angle(c["topic"], local_angles) or (
+            "news" if c["signal"] == "breakout" else None
+        )
         coverage: str | None = None
         if site:
             coverage, matched = fmt.site_coverage(c["topic"], site)
@@ -219,7 +239,7 @@ def discover_topics(
             is_rising=c["signal"] == "rising",
             coverage=coverage,
             angle=c["angle"],
-            question_shaped=fmt.is_question(c["topic"]),
+            question_shaped=fmt.is_question(c["topic"], local_angles),
         )
         kept.append(c)
     ranked = kept

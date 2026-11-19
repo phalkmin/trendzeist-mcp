@@ -167,9 +167,9 @@ def test_trend_history_empty_and_populated(tmp_path):
 
     # Three polls of one continuous breakout = 1 episode; a gap then a new one = 2.
     for d in (20, 19, 18):
-        _seed_archive(client.archive, "coffee", "", d, top=["coffee maker"], rising=[("cold brew", "breakout")])
+        _seed_archive(client.archive, "coffee", "", d, top=["coffee maker", "cold brew"], rising=[("cold brew", "breakout")])
     _seed_archive(client.archive, "coffee", "", 10, top=["coffee maker", "cold brew"], rising=[])
-    _seed_archive(client.archive, "coffee", "", 1, top=["coffee maker"], rising=[("cold brew", "breakout")])
+    _seed_archive(client.archive, "coffee", "", 1, top=["coffee maker", "cold brew"], rising=[("cold brew", "breakout")])
     tools.interest_over_time(client, ["cold brew"])  # fake hub: records a 12-m trend snapshot
     tools.interest_over_time(client, ["cold brew"], "today 5-y")  # and a 5-y one: separate timeline
     out = tools.trend_history(client, "Cold Brew", days=400)
@@ -340,7 +340,7 @@ def test_trending_now_topic_filter():
 def test_site_coverage_matching():
     site = ["Espresso Machine", "how to clean an espresso machine", "latte art"]
     assert fmt.site_coverage("espresso machine", site) == ("covered", "Espresso Machine")
-    assert fmt.site_coverage("clean espresso machine", site) == ("covered", "how to clean an espresso machine")
+    assert fmt.site_coverage("clean espresso machine", site) == ("partial", "how to clean an espresso machine")
     assert fmt.site_coverage("latte art tips", site) == ("partial", "latte art")  # 2/3 tokens
     assert fmt.site_coverage("cold brew", site) == ("gap", None)
     assert fmt.site_coverage("anything", []) == ("gap", None)

@@ -148,7 +148,32 @@ class WikipediaSource(Source):
         """Prefer an exact title among the first five hits, otherwise the top hit."""
         # v2 avoids reusing first-hit-only results cached by earlier 0.4.0 builds.
         key = _cache_key("wiki_search_v2", q=topic.lower(), lang=lang)
-        return self._cached(key, self.settings.static_ttl, lambda: self._fetch_search(topic, lang))
+        return self._cached(
+            key,
+            self.settings.static_ttl,
+            lambda: self._fetch_search(topic, lang),
+            validate=self._validate_search_result,
+        )
+
+    @staticmethod
+    def _validate_search_result(result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise TypeError("cached Wikipedia search result must be an object")
+        found = result.get("found")
+        if not isinstance(found, bool):
+            raise TypeError("Wikipedia search found flag must be a boolean")
+        if not found:
+            suggestion = result.get("suggestion")
+            if suggestion is not None and not isinstance(suggestion, str):
+                raise TypeError("Wikipedia search suggestion must be a string")
+            return result
+        if not isinstance(result.get("title"), str):
+            raise TypeError("Wikipedia search result title must be a string")
+        for field in ("pageid", "wordcount"):
+            value = result.get(field)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"Wikipedia search {field} must be an integer")
+        return result
 
     def pageviews(
         self, title: str, lang: str, days: int, *, end: date | None = None
@@ -161,8 +186,28 @@ class WikipediaSource(Source):
             "wiki_views", title=title, lang=lang, start=first.isoformat(), end=last.isoformat()
         )
         return self._cached(
-            key, self.settings.static_ttl, lambda: self._fetch_pageviews(title, lang, first, last)
+            key,
+            self.settings.static_ttl,
+            lambda: self._fetch_pageviews(title, lang, first, last),
+            validate=self._validate_pageviews_result,
         )
+
+    @staticmethod
+    def _validate_pageviews_result(items: Any) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            raise TypeError("cached Wikipedia pageviews result must be a list")
+        for item in items:
+            if not isinstance(item, dict):
+                raise TypeError("Wikipedia pageviews item must be an object")
+            day = item.get("date")
+            if not isinstance(day, str):
+                raise TypeError("Wikipedia pageviews date must be a string")
+            if date.fromisoformat(day).isoformat() != day:
+                raise ValueError("Wikipedia pageviews date must be YYYY-MM-DD")
+            views = item.get("views")
+            if not isinstance(views, int) or isinstance(views, bool):
+                raise TypeError("Wikipedia pageviews views must be an integer")
+        return items
 
     def _fetch_search(self, topic: str, lang: str) -> dict[str, Any]:
         response = self._get(
@@ -176,20 +221,48 @@ class WikipediaSource(Source):
             },
             headers=self._headers,
         )
-        query = response.json().get("query") or {}
-        hits = query.get("search") or []
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise TypeError("Wikipedia search response must be an object")
+        query = payload.get("query")
+        if query is None:
+            query = {}
+        if not isinstance(query, dict):
+            raise TypeError("Wikipedia search query must be an object")
+        hits = query.get("search")
+        if hits is None:
+            hits = []
+        if not isinstance(hits, list):
+            raise TypeError("Wikipedia search results must be a list")
         if not hits:
-            return {"found": False, "suggestion": (query.get("searchinfo") or {}).get("suggestion")}
-        best = next(
-            (hit for hit in hits if normalise_query(hit["title"]) == normalise_query(topic)),
-            hits[0],
+            info = query.get("searchinfo")
+            if info is None:
+                info = {}
+            if not isinstance(info, dict):
+                raise TypeError("Wikipedia search info must be an object")
+            suggestion = info.get("suggestion")
+            if suggestion is not None and not isinstance(suggestion, str):
+                raise TypeError("Wikipedia search suggestion must be a string")
+            return {"found": False, "suggestion": suggestion}
+        shaped = []
+        for hit in hits:
+            if not isinstance(hit, dict):
+                raise TypeError("Wikipedia search result must be an object")
+            title = hit.get("title")
+            if not isinstance(title, str):
+                raise TypeError("Wikipedia search result title must be a string")
+            shaped.append(
+                {
+                    "found": True,
+                    "title": title,
+                    "pageid": int(hit["pageid"]),
+                    "wordcount": int(hit.get("wordcount") or 0),
+                }
+            )
+        return next(
+            (hit for hit in shaped if normalise_query(hit["title"]) == normalise_query(topic)),
+            shaped[0],
         )
-        return {
-            "found": True,
-            "title": str(best["title"]),
-            "pageid": int(best["pageid"]),
-            "wordcount": int(best.get("wordcount") or 0),
-        }
 
     def _fetch_pageviews(
         self, title: str, lang: str, first: date, last: date
@@ -203,14 +276,38 @@ class WikipediaSource(Source):
         response = self._get(url, headers=self._headers, allow=(404,))
         if response.status_code == 404:
             return []  # the article exists but Wikimedia has no view data for the range
-        items = response.json().get("items") or []
-        return [
-            {
-                "date": f"{it['timestamp'][:4]}-{it['timestamp'][4:6]}-{it['timestamp'][6:8]}",
-                "views": int(it["views"]),
-            }
-            for it in items
-        ]
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise TypeError("Wikipedia pageviews response must be an object")
+        items = payload.get("items")
+        if items is None:
+            items = []
+        if not isinstance(items, list):
+            raise TypeError("Wikipedia pageviews items must be a list")
+        out = []
+        for item in items:
+            if not isinstance(item, dict):
+                raise TypeError("Wikipedia pageviews item must be an object")
+            timestamp = item.get("timestamp")
+            if not isinstance(timestamp, str):
+                raise TypeError("Wikipedia pageviews timestamp must be a string")
+            if len(timestamp) != 10 or not timestamp.isdigit():
+                raise ValueError("Wikipedia pageviews timestamp must be YYYYMMDDHH")
+            try:
+                date(int(timestamp[:4]), int(timestamp[4:6]), int(timestamp[6:8]))
+                if int(timestamp[8:]) > 23:
+                    raise ValueError("hour must be in 00..23")
+            except ValueError as exc:
+                raise ValueError(
+                    "Wikipedia pageviews timestamp must be a real YYYYMMDDHH date/hour"
+                ) from exc
+            out.append(
+                {
+                    "date": f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}",
+                    "views": int(item["views"]),
+                }
+            )
+        return out
 
 
 class Hub:

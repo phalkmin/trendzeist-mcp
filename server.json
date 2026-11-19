@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.phalkmin/trendzeist-mcp",
   "title": "Trendzeist – Google Trends for content ideation",
-  "description": "Free, keyless MCP for content ideation and AEO: Google Trends topics and questions, Google News coverage, Wikipedia attention, an AEO opportunity finder and citable-answer briefs. No API key.",
-  "version": "0.6.1",
+  "description": "Keyless MCP for content ideation and AEO: Google Trends, News, Wikipedia and citable-answer briefs.",
+  "version": "0.6.2",
   "websiteUrl": "https://phalkmin.me/en/trendzeist-google-trends-mcp/",
   "repository": {
     "url": "https://github.com/phalkmin/trendzeist-mcp",
@@ -13,16 +13,15 @@
     {
       "registryType": "pypi",
       "identifier": "trendzeist-mcp",
-      "version": "0.6.1",
+      "version": "0.6.2",
       "runtimeHint": "uvx",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         {
           "name": "TRENDZEIST_HL",
-          "description": "Google Trends UI language, e.g. en-US or pt-BR.",
+          "description": "Pin the Google Trends and Autocomplete language, e.g. en-US or pt-BR. When unset, language follows geo.",
           "isRequired": false,
-          "format": "string",
-          "default": "en-US"
+          "format": "string"
         },
         {
           "name": "TRENDZEIST_MIN_INTERVAL",

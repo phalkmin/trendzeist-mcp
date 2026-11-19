@@ -226,17 +226,20 @@ def test_expired_memory_entry_does_not_hide_a_fresher_disk_entry(tmp_path):
     assert ours.get_stale("k")[0] == "fresh"
 
 
-def test_has_cached_related_queries_counts_a_stale_entry_when_fallback_is_on():
+def test_has_cached_related_queries_counts_stale_only_during_trends_cooldown():
     hub = Hub(Settings(min_interval=0, cooldown=60), cache_dir=None)
     key = hub.trends._explore_key("rq", kw="x", tf="today 3-m", geo="", cat=0, gprop="")
     assert hub.trends.has_cached_related_queries("x", "today 3-m", "", 0, "") is False
     hub.cache.set(key, {"top": None, "rising": None}, ttl=0.01)
     time.sleep(0.03)
-    assert hub.trends.has_cached_related_queries("x", "today 3-m", "", 0, "") is True
+    assert hub.trends.has_cached_related_queries("x", "today 3-m", "", 0, "") is False
+    with patch.object(hub.trends, "retry_after", return_value=60):
+        assert hub.trends.has_cached_related_queries("x", "today 3-m", "", 0, "") is True
     hub2 = Hub(Settings(min_interval=0, stale_fallback=False), cache_dir=None)
     hub2.cache.set(key, {"top": None, "rising": None}, ttl=0.01)
     time.sleep(0.03)
-    assert hub2.trends.has_cached_related_queries("x", "today 3-m", "", 0, "") is False
+    with patch.object(hub2.trends, "retry_after", return_value=60):
+        assert hub2.trends.has_cached_related_queries("x", "today 3-m", "", 0, "") is False
 
 
 def test_rate_limit_without_cooldown_is_flagged_but_has_no_retry_after():

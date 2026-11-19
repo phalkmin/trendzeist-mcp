@@ -3,8 +3,8 @@ and where to earn mentions, from Google Trends, Autocomplete, Google News and Wi
 
 Budget per uncached call: 1 interest_over_time + per seed (1 related_queries +
 1 + len(_AEO_PREFIXES) Autocomplete + 1 News + 1-2 Wikipedia). Google requests stop at
-the first retryable error (429 / transport) like discover_topics; Wikipedia runs on
-its own lane and is never skipped because Google is cooling down.
+the first transport failure or active 429 cooldown, like discover_topics; Wikipedia runs
+on its own lane and is never skipped because Google is cooling down.
 """
 
 from __future__ import annotations
@@ -102,19 +102,28 @@ def _seed_context(
     g: str,
     news_geo: str,
     lang: str,
-    cooling: bool,
+    stop_reason: str | None,
     errors: list[dict[str, str]],
     context: Sequence[str] = (),
-) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None, bool, bool, list[str]]:
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    str | None,
+    bool,
+    list[str],
+]:
     """Gather questions, news and Wikipedia context for one seed.
 
-    Returns ``(found_questions, news, wiki, cooling, skipped_google, off_topic_names)``.
+    Returns ``(found_questions, news, wiki, stop_reason, skipped_google, off_topic_names)``.
     """
     found: list[dict[str, Any]] = []
     off_topic_names: list[str] = []
-    skipped = cooling
+    has_cache = getattr(hub.trends, "has_cached_related_queries", None)
+    cached = callable(has_cache) and has_cache(seed, tf, g, 0, "")
+    skipped = stop_reason is not None and not cached
 
-    if not cooling:
+    if stop_reason is None or cached:
         try:
             top, rising = tools.fetch_related(hub, seed, tf, g, 0, "", 25, context=context)
             # Suspect and off-topic items from either list never become questions or breakouts.
@@ -123,7 +132,10 @@ def _seed_context(
             rising, off_rising = fmt.split_off_topic(rising)
             off_topic_names = [it["name"] for it in off_top + off_rising]
             for q in fmt.extract_questions(
-                ("rising", rising), ("top", top), limit=_QUESTIONS_PER_SEED
+                ("rising", rising),
+                ("top", top),
+                limit=_QUESTIONS_PER_SEED,
+                local_angles=tools._local_angles(lang),
             ):
                 found.append(
                     {
@@ -135,9 +147,9 @@ def _seed_context(
                 )
         except TrendsError as exc:
             errors.append({"step": f"related_queries:{seed}", "error": str(exc)})
-            cooling = cooling or exc.retryable
+            stop_reason = tools.stop_reason_after(hub.trends, exc)
 
-    if not cooling:
+    if stop_reason is None:
         # Same budget as _AEO_PREFIXES, in the market's language (issue #3).
         mined = tools.mine_questions(
             hub,
@@ -157,11 +169,10 @@ def _seed_context(
             )
         for e in mined["errors"]:
             errors.append({"step": f"autocomplete:{seed}:{e['prefix']}", "error": e["error"]})
-        if "partial" in mined:
-            cooling = True
+        stop_reason = mined.get("partial_reason")
 
     news: dict[str, Any] | None = None
-    if not cooling:
+    if stop_reason is None:
         try:
             articles = hub.news.articles(seed, news_geo)
             recency = fmt.recency_histogram(articles)
@@ -173,7 +184,7 @@ def _seed_context(
             }
         except TrendsError as exc:
             errors.append({"step": f"news:{seed}", "error": str(exc)})
-            cooling = cooling or exc.retryable
+            stop_reason = tools.stop_reason_after(hub.news, exc)
 
     wiki: dict[str, Any] | None = None
     try:
@@ -195,7 +206,7 @@ def _seed_context(
     except TrendsError as exc:
         errors.append({"step": f"wikipedia:{seed}", "error": str(exc)})
 
-    return found, news, wiki, cooling, skipped, off_topic_names
+    return found, news, wiki, stop_reason, skipped, off_topic_names
 
 
 def aeo_opportunities(
@@ -218,18 +229,19 @@ def aeo_opportunities(
     news_geo = g.split("-")[0] if g else "US"
 
     errors: list[dict[str, str]] = []
-    cooling = False
+    stop_reason: str | None = None
 
     trends: dict[str, Any] = {}
     try:
         trends = tools.fetch_trend(hub, kws, TREND_TIMEFRAME, g)["summary"]
     except TrendsError as exc:
         errors.append({"step": "interest_over_time", "error": str(exc)})
-        # Trend context is enrichment only. Do not enter cooling here: the first
-        # seed's own (lane-paced) requests get a chance, and only their failure
-        # marks the session as rate limited (see _seed_context).
+        # The real Trends source is already cooling after a 429; other Google
+        # sources are skipped consistently while Wikipedia can still respond.
+        if tools.source_cooling_after(hub.trends, exc):
+            stop_reason = "rate_limited"
 
-    seen: set[str] = set()
+    seen: dict[str, dict[str, Any]] = {}
     clusters: dict[tuple[str, str], dict[str, Any]] = {}
     seed_reports: list[dict[str, Any]] = []
     ambiguous_seeds: list[str] = []
@@ -239,24 +251,34 @@ def aeo_opportunities(
         trend = trends.get(seed, {"available": False})
         report: dict[str, Any] = {"seed": seed, "trend": trend}
         # mid_rerun=False: News / Wikipedia / Autocomplete take search text, not a mid.
-        if cooling:
-            tools.note_ambiguity_skipped(report)
+        if stop_reason:
+            tools.note_ambiguity_skipped(report, stop_reason)
         elif tools.flag_ambiguity(hub, seed, report, errors, geo=g, mid_rerun=False):
             ambiguous_seeds.append(seed)
-        found, news, wiki, cooling, skipped, off_topic = _seed_context(
-            hub, seed, tf, g, news_geo, lang, cooling, errors, [s for s in kws if s != seed]
+        found, news, wiki, stop_reason, skipped, off_topic = _seed_context(
+            hub, seed, tf, g, news_geo, lang, stop_reason, errors, [s for s in kws if s != seed]
         )
         if skipped:
-            report["skipped"] = "Google requests skipped: rate limited earlier in this call."
+            report["skipped"] = (
+                "Google requests skipped: rate limited earlier in this call."
+                if stop_reason == "rate_limited"
+                else "Google requests skipped: an upstream request failed earlier in this call."
+            )
         if off_topic:
             report["off_topic_dropped"] = off_topic
 
         added = 0
         for q in found:
             norm = fmt.normalise_query(q["question"])
-            if not norm or norm in seen:
+            if tools._local_angles(lang):
+                norm = fmt.strip_accents(norm)
+            if not norm:
                 continue
-            seen.add(norm)
+            if norm in seen:
+                retained = seen[norm]
+                retained["origins"].add(q["origin"])
+                retained["has_breakout"] = retained["has_breakout"] or q["is_breakout"]
+                continue
             added += 1
             angle = q["angle"] or "how-to"
             cluster = clusters.setdefault(
@@ -272,6 +294,7 @@ def aeo_opportunities(
             cluster["questions"].append(q["question"])
             cluster["origins"].add(q["origin"])
             cluster["has_breakout"] = cluster["has_breakout"] or q["is_breakout"]
+            seen[norm] = cluster
 
         report["questions_found"] = added
         report["news"] = news
@@ -323,7 +346,7 @@ def aeo_opportunities(
         key=lambda c: (-c["score"], kws.index(c["seed"]), _ANGLE_RANK.get(c["angle"], 99))
     )
 
-    per_seed_requests = 2 + (1 + len(_AEO_PREFIXES)) + 2
+    per_seed_requests = 3 + (1 + len(_AEO_PREFIXES)) + 2
     out: dict[str, Any] = {
         "query": {
             "seeds": kws,
@@ -356,6 +379,9 @@ def aeo_opportunities(
             "Google results are cached 15 min / 24 h, Wikipedia 24 h."
         ),
     }
+    language_note = tools.unsupported_language_note(hl)
+    if language_note:
+        out["language_note"] = language_note
     if site:
         out["query"]["site_queries_count"] = len(site)
         out["counts"]["covered"] = (
@@ -363,10 +389,20 @@ def aeo_opportunities(
         )
         out["counts"]["partial"] = sum(1 for c in ranked if c.get("coverage") == "partial")
         out["counts"]["gap"] = sum(1 for c in ranked if c.get("coverage") == "gap")
-    if cooling:
+    if stop_reason:
+        cause = (
+            "Google started rate limiting"
+            if stop_reason == "rate_limited"
+            else "A Google request failed"
+        )
+        wiki_note = (
+            "Wikipedia data is complete."
+            if not any(e["step"].startswith("wikipedia:") for e in errors)
+            else "Some Wikipedia requests also failed; see errors."
+        )
         out["partial"] = (
-            "Google started rate limiting during this call: later seeds have fewer questions "
-            "and no news figures (see seeds[].skipped and errors). Wikipedia data is complete."
+            f"{cause} during this call: later seeds have fewer questions and no news figures "
+            f"(see seeds[].skipped and errors). {wiki_note}"
         )
     notes = [
         v.limit_note(limit, lim),

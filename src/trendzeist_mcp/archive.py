@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     seed        TEXT NOT NULL,
     geo         TEXT NOT NULL,
     timeframe   TEXT NOT NULL,
-    item_count  INTEGER NOT NULL
+    item_count  INTEGER NOT NULL,
+    source_item_count INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_snap_seed ON snapshots (seed, geo, grp, timeframe, observed_at);
 CREATE TABLE IF NOT EXISTS observations (
@@ -150,6 +151,10 @@ class Archive:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
+        if "source_item_count" not in columns:
+            conn.execute("ALTER TABLE snapshots ADD COLUMN source_item_count INTEGER")
+        conn.execute("UPDATE snapshots SET source_item_count=item_count WHERE source_item_count IS NULL")
         conn.commit()
         self._conn = conn
         return conn
@@ -176,7 +181,8 @@ class Archive:
         conn.commit()
 
     def _write(
-        self, group: str, seed: str, geo: str, timeframe: str, rows: Iterable[tuple]
+        self, group: str, seed: str, geo: str, timeframe: str, rows: Iterable[tuple],
+        source_item_count: int | None = None,
     ) -> str | None:
         """Insert one snapshot (header + rows); returns ``snapshot_id`` or ``None``.
 
@@ -186,28 +192,34 @@ class Archive:
         if not self.enabled:
             return None
         observed_at = _now()
-        seed_n = _norm(seed)
         snapshot_id = uuid.uuid4().hex
-        payload = [
-            (snapshot_id, observed_at, geo, seed_n, timeframe, kind, _norm(item), value, rank, status)
-            for kind, item, value, rank, status in rows
-        ]
         try:
+            seed_n = _norm(seed)
+            payload = [
+                (snapshot_id, observed_at, geo, seed_n, timeframe, kind, _norm(item), value, rank, status)
+                for kind, item, value, rank, status in rows
+            ]
+            source_count = len(payload) if source_item_count is None else source_item_count
             with self._lock:
                 conn = self._connect()
                 if conn is None:
                     return None
                 self._prune_locked(conn)
-                conn.execute(
-                    "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?)",
-                    (snapshot_id, observed_at, group, seed_n, geo, timeframe, len(payload)),
-                )
-                if payload:
-                    conn.executemany(
-                        "INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?)", payload
+                try:
+                    conn.execute(
+                        "INSERT INTO snapshots (snapshot_id, observed_at, grp, seed, geo, timeframe, "
+                        "item_count, source_item_count) VALUES (?,?,?,?,?,?,?,?)",
+                        (snapshot_id, observed_at, group, seed_n, geo, timeframe, len(payload), source_count),
                     )
-                conn.commit()
-        except (sqlite3.Error, OSError) as exc:
+                    if payload:
+                        conn.executemany(
+                            "INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?)", payload
+                        )
+                    conn.commit()
+                except (sqlite3.Error, OSError):
+                    conn.rollback()
+                    raise
+        except (sqlite3.Error, OSError, AttributeError, TypeError, ValueError) as exc:
             self._fail("write", exc)
             return None
         return snapshot_id
@@ -246,7 +258,9 @@ class Archive:
                 continue
             status = "breakout" if it.get("is_breakout") else "rising"
             rows.append(("rising_query", it["name"], _num(it.get("value")), rank, status))
-        return self._write(GROUP_RELATED, seed, geo, timeframe, rows)
+        return self._write(
+            GROUP_RELATED, seed, geo, timeframe, rows, source_item_count=len(top) + len(rising_clean)
+        )
 
     def record_trend(
         self, keyword: str, geo: str, timeframe: str, summary: dict[str, Any]
@@ -297,14 +311,14 @@ class Archive:
         since: str | None = None,
         until: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Snapshot headers for a seed, newest first: ``{id, observed_at, item_count}``.
+        """Snapshot headers for a seed, newest first, including clean and source counts.
 
         ``since`` / ``until`` bound ``observed_at`` (inclusive). Ties on the
         second are ordered by insertion, so reversing the list is chronological.
         """
         sql = (
-            "SELECT snapshot_id, observed_at, item_count FROM snapshots WHERE seed=? AND geo=? "
-            "AND grp=? AND timeframe=?"
+            "SELECT snapshot_id, observed_at, item_count, source_item_count FROM snapshots "
+            "WHERE seed=? AND geo=? AND grp=? AND timeframe=?"
         )
         params: list[Any] = [_norm(seed), geo, group, timeframe]
         if since is not None:
@@ -316,27 +330,51 @@ class Archive:
         rows = self._clean_rows(
             self._query(sql + " ORDER BY observed_at DESC, rowid DESC", tuple(params)), (0, 1)
         )
-        return [{"id": i, "observed_at": o, "item_count": n} for i, o, n in rows]
+        return [
+            {"id": i, "observed_at": o, "item_count": n, "source_item_count": source_n}
+            for i, o, n, source_n in rows
+        ]
 
     def observations(self, snapshot_id: str) -> list[dict[str, Any]]:
-        rows = self._query(
-            "SELECT kind, item, value, rank, status FROM observations WHERE snapshot_id=? "
-            "ORDER BY kind, rank",
-            (snapshot_id,),
+        rows = self._clean_rows(
+            self._query(
+                "SELECT kind, item, value, rank, status FROM observations WHERE snapshot_id=? "
+                "ORDER BY kind, rank",
+                (snapshot_id,),
+            ),
+            (0, 1),
         )
+        valid_rows = [r for r in rows if r[4] is None or isinstance(r[4], str)]
+        if len(valid_rows) != len(rows):
+            self._fail("read", ValueError(f"{len(rows) - len(valid_rows)} row(s) with invalid non-null status skipped"))
+        numeric_rows = [
+            r for r in valid_rows
+            if (r[2] is None or isinstance(r[2], (int, float)))
+            and (r[3] is None or isinstance(r[3], (int, float)))
+            and (r[0] not in RELATED_KINDS or isinstance(r[3], (int, float)))
+        ]
+        if len(numeric_rows) != len(valid_rows):
+            self._fail(
+                "read",
+                ValueError(f"{len(valid_rows) - len(numeric_rows)} row(s) with malformed numeric value/rank skipped"),
+            )
         return [
             {"kind": k, "item": i, "value": val, "rank": r, "status": s}
-            for k, i, val, r, s in rows
+            for k, i, val, r, s in numeric_rows
         ]
 
     def latest_and_baseline(
         self, seed: str, geo: str, group: str, timeframe: str, since_days: int
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """Newest snapshot header and the newest one at least ``since_days`` older.
+        """Newest non-future snapshot header and the newest one at least ``since_days`` older.
 
         Snapshots with an unparsable timestamp are skipped (and reported).
         """
-        snaps = [s for s in self.snapshots(seed, geo, group, timeframe) if parse_ts(s["observed_at"])]
+        snaps = [
+            s
+            for s in self.snapshots(seed, geo, group, timeframe, until=_now())
+            if parse_ts(s["observed_at"])
+        ]
         if not snaps:
             return None, None
         latest = snaps[0]
@@ -350,7 +388,11 @@ class Archive:
             "SELECT MIN(observed_at) FROM observations WHERE (item=? OR seed=?) AND geo=?",
             (key, key, geo),
         )
-        return rows[0][0] if rows else None
+        value = rows[0][0] if rows else None
+        if value is not None and not isinstance(value, str):
+            self._fail("read", ValueError("malformed first_seen timestamp skipped"))
+            return None
+        return value
 
     @staticmethod
     def window(days: int, now: datetime | None = None) -> tuple[str, str]:
@@ -364,7 +406,20 @@ class Archive:
 
     def _rows(self, sql: str, params: tuple) -> list[dict[str, Any]]:
         rows = self._clean_rows(self._query(sql, params), (0, 1, 2, 3, 4, 5))
-        return [dict(zip(_OBS_COLS, row)) for row in rows]
+        valid = [
+            r
+            for r in rows
+            if (r[8] is None or isinstance(r[8], str))
+            and (r[6] is None or isinstance(r[6], (int, float)))
+            and (r[7] is None or isinstance(r[7], (int, float)))
+            and (r[4] not in RELATED_KINDS or isinstance(r[7], (int, float)))
+        ]
+        if len(valid) != len(rows):
+            self._fail(
+                "read",
+                ValueError(f"{len(rows) - len(valid)} row(s) with malformed numeric/status data skipped"),
+            )
+        return [dict(zip(_OBS_COLS, row)) for row in valid]
 
     def history(self, keyword: str, geo: str, days: int, until: str | None = None) -> list[dict[str, Any]]:
         """Every observation where the keyword is the seed *or* the item, oldest first."""

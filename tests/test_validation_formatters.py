@@ -342,6 +342,8 @@ def test_publisher_table_and_recency_and_coverage():
 def test_validate_lang():
     assert v.validate_lang(" EN ") == "en" and v.validate_lang("pt") == "pt"
     assert v.validate_lang("zh-yue") == "zh-yue"
+    assert v.validate_lang("zh-min-nan") == "zh-min-nan"
+    assert v.validate_lang("zh-classical") == "zh-classical"
     assert v.validate_lang("simple") == "simple"
     for bad in ("", "e", "en_US", "en.wikipedia.org", "x" * 20):
         with pytest.raises(v.ValidationError):

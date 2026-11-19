@@ -190,15 +190,35 @@ class Settings:
                 raise TrendsError(f"{name} must be a positive integer (got {raw!r}).")
             return value
 
+        def integer(name: str, default: int, *, minimum: int | None = None) -> int:
+            raw = env(name, str(default))
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise TrendsError(f"{name} must be an integer (got {raw!r}).") from exc
+            if minimum is not None and value < minimum:
+                raise TrendsError(f"{name} must be an integer >= {minimum} (got {raw!r}).")
+            return value
+
+        def number(name: str, default: float) -> float:
+            raw = env(name, str(default))
+            try:
+                value = float(raw)
+            except ValueError as exc:
+                raise TrendsError(f"{name} must be a number >= 0 (got {raw!r}).") from exc
+            if not math.isfinite(value) or value < 0:
+                raise TrendsError(f"{name} must be a number >= 0 (got {raw!r}).")
+            return value
+
         return cls(
             hl=hl_env or "en-US",
-            tz=int(env("TRENDZEIST_TZ", "360")),
-            min_interval=float(env("TRENDZEIST_MIN_INTERVAL", "2.0")),
-            retries=int(env("TRENDZEIST_RETRIES", "3")),
-            backoff_factor=float(env("TRENDZEIST_BACKOFF", "1.5")),
+            tz=integer("TRENDZEIST_TZ", 360),
+            min_interval=number("TRENDZEIST_MIN_INTERVAL", 2.0),
+            retries=integer("TRENDZEIST_RETRIES", 3, minimum=0),
+            backoff_factor=number("TRENDZEIST_BACKOFF", 1.5),
             proxies=proxies,
             auto_hl=not hl_env,
-            wiki_min_interval=float(env("TRENDZEIST_WIKI_MIN_INTERVAL", "0.5")),
+            wiki_min_interval=number("TRENDZEIST_WIKI_MIN_INTERVAL", 0.5),
             explore_ttl=positive_int("TRENDZEIST_EXPLORE_TTL", EXPLORE_TTL),
             rss_ttl=positive_int("TRENDZEIST_RSS_TTL", RSS_TTL),
             static_ttl=positive_int("TRENDZEIST_STATIC_TTL", STATIC_TTL),
@@ -207,8 +227,8 @@ class Settings:
             archive_enabled=env("TRENDZEIST_ARCHIVE", "1").strip().lower()
             not in {"0", "false", "no", "off"},
             archive_days=positive_int("TRENDZEIST_ARCHIVE_DAYS", 365),
-            cooldown=float(env("TRENDZEIST_COOLDOWN", "60")),
-            jitter=float(env("TRENDZEIST_JITTER", "0.5")),
+            cooldown=number("TRENDZEIST_COOLDOWN", 60),
+            jitter=number("TRENDZEIST_JITTER", 0.5),
             stale_fallback=env("TRENDZEIST_STALE_FALLBACK", "1").strip().lower()
             not in {"0", "false", "no", "off"},
         )
@@ -600,14 +620,17 @@ class Source:
         a ``Retry-After``; a positive value is clamped to ``[1, COOLDOWN_MAX]``.
         """
         seconds = float(self.settings.cooldown) if retry_after is None else float(retry_after)
-        if seconds <= 0:
-            return 0.0, None
-        seconds = min(max(seconds, 1.0), COOLDOWN_MAX)
-        until = time.time() + seconds
+        seconds = min(max(seconds, 1.0), COOLDOWN_MAX) if seconds > 0 else 0.0
+        now = time.time()
+        requested_until = now + seconds if seconds > 0 else None
         with self._health_lock:
-            self._cooldown_until = max(self._cooldown_until, until)
+            if requested_until is None and self._cooldown_until <= now:
+                return 0.0, None
+            if requested_until is not None:
+                self._cooldown_until = max(self._cooldown_until, requested_until)
             until = self._cooldown_until
-        return seconds, _iso(until)
+        effective = seconds if until == requested_until else until - now
+        return max(0.0, effective), _iso(until)
 
     def _rate_limited(self, exc: BaseException, retry_after: float | None, detail: str = "") -> TrendsError:
         seconds, until = self._enter_cooldown(retry_after)
@@ -678,12 +701,29 @@ class Source:
             self._record(None)
             return result
 
-    def _cached(self, key: str, ttl: float, fn: Callable[[], T]) -> T:
+    def _validate_cached(self, value: T, validate: Callable[[T], T]) -> T:
+        try:
+            return validate(value)
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            mapped = self._map_error(exc)
+            if mapped is None:
+                raise
+            logger.debug("%s cached payload failure: %r", self.label, exc)
+            self._record(str(mapped))
+            raise mapped from exc
+
+    def _cached(
+        self,
+        key: str,
+        ttl: float,
+        fn: Callable[[], T],
+        validate: Callable[[T], T] | None = None,
+    ) -> T:
         hit = self._cache.get(key)
         if hit is not None:
             logger.debug("cache hit %s", key)
             self._stats.count("cache_hits")
-            return hit
+            return self._validate_cached(hit, validate) if validate else hit
 
         def fetch_and_store() -> T:
             # Re-check under the lane lock: a concurrent caller with the same
@@ -692,9 +732,11 @@ class Source:
             if again is not None:
                 logger.debug("cache hit after wait %s", key)
                 self._stats.count("cache_hits")
-                return again
+                return validate(again) if validate else again
             self._stats.count("cache_misses")
             value = fn()
+            if validate:
+                value = validate(value)
             # Only a fetch that *succeeded* is a fresh observation (tools archive on
             # ``fresh``, not on misses: a miss answered stale must not be archived).
             self._stats.count("fresh")
@@ -712,7 +754,7 @@ class Source:
             value, age = stale
             logger.debug("serving stale cache entry %s (%.0f s old): %s", key, age, exc)
             self._stats.stale(age)
-            return value
+            return self._validate_cached(value, validate) if validate else value
 
 
 class _QuietTrendReq(TrendReq):
@@ -797,6 +839,8 @@ class TrendsClient(Source):
                 backoff_factor=self.settings.backoff_factor,
                 proxies=list(self.settings.proxies) or None,
             )
+        self._trend_req.hl = self.settings.hl
+        self._trend_req.headers["accept-language"] = self.settings.hl
         return self._trend_req
 
     def _reset(self) -> None:
@@ -837,14 +881,21 @@ class TrendsClient(Source):
         )
 
     # ------------------------------------------------------------------ public API
+    @staticmethod
+    def _validate_frame(value: Any) -> pd.DataFrame | None:
+        if value is not None and not isinstance(value, pd.DataFrame):
+            raise TypeError("interest response must be a DataFrame or None")
+        return value
+
     def interest_over_time(
         self, keywords: list[str], timeframe: str, geo: str, category: int, gprop: str
-    ) -> pd.DataFrame:
+    ) -> pd.DataFrame | None:
         key = self._explore_key("iot", kw=keywords, tf=timeframe, geo=geo, cat=category, gprop=gprop)
         return self._cached(
             key,
             self.settings.explore_ttl,
             lambda: self._explore(keywords, timeframe, geo, category, gprop).interest_over_time(),
+            validate=self._validate_frame,
         )
 
     def interest_by_region(
@@ -855,7 +906,7 @@ class TrendsClient(Source):
         category: int,
         gprop: str,
         resolution: str,
-    ) -> pd.DataFrame:
+    ) -> pd.DataFrame | None:
         key = self._explore_key(
             "region", kw=keywords, tf=timeframe, geo=geo, cat=category, gprop=gprop, res=resolution
         )
@@ -865,6 +916,7 @@ class TrendsClient(Source):
             lambda: self._explore(keywords, timeframe, geo, category, gprop).interest_by_region(
                 resolution=resolution, inc_low_vol=True, inc_geo_code=True
             ),
+            validate=self._validate_frame,
         )
 
     def has_cached_related_queries(
@@ -872,35 +924,92 @@ class TrendsClient(Source):
     ) -> bool:
         """True when :meth:`related_queries` would be served without hitting Google.
 
-        With the stale fallback on, an expired copy counts too: during a cooldown the
-        request is refused and that copy is what the caller would get (flagged stale).
+        An expired copy counts only while this source is cooling down: that is the
+        only case where ``related_queries`` serves it without first attempting a fetch.
         """
         key = self._explore_key("rq", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
         if self._cache.get(key) is not None:
             return True
-        return bool(self.settings.stale_fallback) and self._cache.get_stale(key) is not None
+        return bool(
+            self.settings.stale_fallback
+            and self.retry_after() is not None
+            and self._cache.get_stale(key) is not None
+        )
+
+    @staticmethod
+    def _validate_related_entry(
+        queries: Any, *, label: str, source_name: str
+    ) -> dict[str, pd.DataFrame | None]:
+        if queries is None:
+            return {"top": None, "rising": None}
+        if not isinstance(queries, dict):
+            raise TypeError(f"{source_name} entry must be an object")
+        if not queries:
+            return {"top": None, "rising": None}
+        for kind in ("top", "rising"):
+            frame = queries.get(kind)
+            if frame is None:
+                continue
+            if not isinstance(frame, pd.DataFrame):
+                raise TypeError(f"{source_name} {kind} must be a DataFrame or None")
+            if label not in frame.columns:
+                if frame.empty:
+                    continue
+                raise ValueError(f"{source_name} {kind} is missing the {label} column")
+            values = frame[label]
+            if not isinstance(values, pd.Series):
+                raise TypeError(f"{source_name} {kind} {label} column must be unique")
+            if not all(isinstance(value, str) for value in values):
+                raise TypeError(f"{source_name} {kind} {label} values must be strings")
+        return queries
+
+    @staticmethod
+    def _validate_related_query_entry(queries: Any) -> dict[str, pd.DataFrame | None]:
+        return TrendsClient._validate_related_entry(
+            queries, label="query", source_name="related queries"
+        )
+
+    @staticmethod
+    def _validate_related_topic_entry(queries: Any) -> dict[str, pd.DataFrame | None]:
+        return TrendsClient._validate_related_entry(
+            queries, label="topic_title", source_name="related topics"
+        )
 
     def related_queries(
         self, keyword: str, timeframe: str, geo: str, category: int, gprop: str
     ) -> dict[str, pd.DataFrame | None]:
         key = self._explore_key("rq", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
 
-        def fetch() -> dict[str, pd.DataFrame | None]:
+        def fetch() -> Any:
             result = self._explore([keyword], timeframe, geo, category, gprop).related_queries()
-            return result.get(keyword) or {"top": None, "rising": None}
+            if not isinstance(result, dict):
+                raise TypeError("related queries response must be an object")
+            return result.get(keyword)
 
-        return self._cached(key, self.settings.explore_ttl, fetch)
+        return self._cached(
+            key,
+            self.settings.explore_ttl,
+            fetch,
+            validate=self._validate_related_query_entry,
+        )
 
     def related_topics(
         self, keyword: str, timeframe: str, geo: str, category: int, gprop: str
     ) -> dict[str, pd.DataFrame | None]:
         key = self._explore_key("rt", kw=keyword, tf=timeframe, geo=geo, cat=category, gprop=gprop)
 
-        def fetch() -> dict[str, pd.DataFrame | None]:
+        def fetch() -> Any:
             result = self._explore([keyword], timeframe, geo, category, gprop).related_topics()
-            return result.get(keyword) or {"top": None, "rising": None}
+            if not isinstance(result, dict):
+                raise TypeError("related topics response must be an object")
+            return result.get(keyword)
 
-        return self._cached(key, self.settings.explore_ttl, fetch)
+        return self._cached(
+            key,
+            self.settings.explore_ttl,
+            fetch,
+            validate=self._validate_related_topic_entry,
+        )
 
     def suggestions(self, keyword: str) -> list[dict[str, Any]]:
         """Entity suggestions as ``[{title, type, mid}]`` with string (or None) fields.
